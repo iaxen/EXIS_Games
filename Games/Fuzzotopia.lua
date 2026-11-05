@@ -2748,6 +2748,7 @@ end
 -- House layout import uses the same owned-interior and HouseAction API as HomeDecorUI.
 ui.layout={version=1,maxItems=500}
 function ui.layout.say(message)
+    message = tostring(message):gsub("^.-:%d+:%s*", "")
     report(message)
     if ui.layout.label then ui.layout.label.Text=message end
 end
@@ -2767,26 +2768,151 @@ function ui.layout.finite(value)
     return type(value)=="number" and value==value and math.abs(value)<math.huge
 end
 function ui.layout.floors(interior)
-    local shell=interior:FindFirstChild("Shell")
-    assert(shell,"Interior shell not loaded. Enter your own house first.")
-    local parts={}
-    for _,part in ipairs(shell:GetChildren()) do
-        if part:IsA("BasePart") and part:GetAttribute("InteriorFloor") and part.CFrame.UpVector.Y>0.98 then parts[#parts+1]=part end
+    local shell = interior:FindFirstChild("Shell")
+    assert(shell, "Interior shell not loaded. Enter your own house first.")
+
+    local parts = {}
+    for _, part in ipairs(shell:GetChildren()) do
+        if part:IsA("BasePart") and part:GetAttribute("InteriorFloor") and part.CFrame.UpVector.Y > 0.98 then
+            parts[#parts + 1] = part
+        end
     end
-    table.sort(parts,function(a,b)
-        if math.abs(a.Position.Y-b.Position.Y)>0.25 then return a.Position.Y<b.Position.Y end
-        local aa,bb=a.Size.X*a.Size.Z,b.Size.X*b.Size.Z
-        if aa~=bb then return aa>bb end
-        return a.Name<b.Name
+
+    table.sort(parts, function(a, b)
+        if math.abs(a.Position.Y - b.Position.Y) > 0.25 then
+            return a.Position.Y < b.Position.Y
+        end
+        local areaA = a.Size.X * a.Size.Z
+        local areaB = b.Size.X * b.Size.Z
+        if areaA ~= areaB then
+            return areaA > areaB
+        end
+        return a.Name < b.Name
     end)
-    local floors={}
-    for _,part in ipairs(parts) do
-        local last=floors[#floors]
-        if not last or math.abs(part.Position.Y-last.Position.Y)>0.5 then floors[#floors+1]=part end
+
+    local floors = {}
+    for _, part in ipairs(parts) do
+        local floor = floors[#floors]
+        if not floor or math.abs(part.Position.Y - floor.base.Position.Y) > 0.5 then
+            floor = { base = part, parts = {} }
+            floors[#floors + 1] = floor
+        end
+        floor.parts[#floor.parts + 1] = part
     end
-    assert(#floors>0,"Interior floors not loaded. Enter your own house first.")
+    assert(#floors > 0, "Interior floors not loaded. Enter your own house first.")
+
+    for index, floor in ipairs(floors) do
+        local base = floor.base
+        local minX, minZ = math.huge, math.huge
+        local maxX, maxZ = -math.huge, -math.huge
+        for _, part in ipairs(floor.parts) do
+            for _, sign in ipairs({ {-1, -1}, {1, -1}, {1, 1}, {-1, 1} }) do
+                local corner = Vector3.new(sign[1] * part.Size.X / 2, 0, sign[2] * part.Size.Z / 2)
+                local point = base.CFrame:PointToObjectSpace(part.CFrame:PointToWorldSpace(corner))
+                minX, maxX = math.min(minX, point.X), math.max(maxX, point.X)
+                minZ, maxZ = math.min(minZ, point.Z), math.max(maxZ, point.Z)
+            end
+        end
+        floor.Name = "Floor " .. index
+        floor.CFrame = base.CFrame * CFrame.new((minX + maxX) / 2, 0, (minZ + maxZ) / 2)
+        floor.Position = floor.CFrame.Position
+        floor.Size = Vector3.new(maxX - minX, base.Size.Y, maxZ - minZ)
+    end
     return floors
 end
+
+function ui.layout.polygonArea(points)
+    local area = 0
+    for index, a in ipairs(points) do
+        local b = points[index % #points + 1]
+        area = area + a.x * b.z - b.x * a.z
+    end
+    return math.abs(area) / 2
+end
+
+function ui.layout.clipHalfPlane(points, a, b, keepInside)
+    local result = {}
+    if #points == 0 then
+        return result
+    end
+    local function distance(point)
+        return (b.x - a.x) * (point.z - a.z) - (b.z - a.z) * (point.x - a.x)
+    end
+    local previous = points[#points]
+    local before = distance(previous)
+    local previousInside = keepInside and before >= 0 or not keepInside and before <= 0
+    for _, current in ipairs(points) do
+        local after = distance(current)
+        local currentInside = keepInside and after >= 0 or not keepInside and after <= 0
+        if currentInside ~= previousInside then
+            local t = before / (before - after)
+            result[#result + 1] = {
+                x = previous.x + (current.x - previous.x) * t,
+                z = previous.z + (current.z - previous.z) * t,
+            }
+        end
+        if currentInside then
+            result[#result + 1] = current
+        end
+        previous, before, previousInside = current, after, currentInside
+    end
+    return result
+end
+
+function ui.layout.subtractSupport(polygon, support)
+    local outside = {}
+    local remaining = polygon
+    for index, a in ipairs(support) do
+        local b = support[index % #support + 1]
+        local piece = ui.layout.clipHalfPlane(remaining, a, b, false)
+        if ui.layout.polygonArea(piece) > 0.000001 then
+            outside[#outside + 1] = piece
+        end
+        remaining = ui.layout.clipHalfPlane(remaining, a, b, true)
+        if #remaining == 0 then
+            break
+        end
+    end
+    return outside
+end
+
+function ui.layout.supported(floor, entry, size, angle)
+    local footprint = {}
+    local cosine, sine = math.cos(angle), math.sin(angle)
+    for _, sign in ipairs({ {-1, -1}, {1, -1}, {1, 1}, {-1, 1} }) do
+        local x, z = sign[1] * size.X / 2, sign[2] * size.Z / 2
+        footprint[#footprint + 1] = {
+            x = entry.x + cosine * x + sine * z,
+            z = entry.z - sine * x + cosine * z,
+        }
+    end
+
+    local uncovered = { footprint }
+    for _, part in ipairs(floor.parts) do
+        local support = {}
+        for _, sign in ipairs({ {-1, -1}, {1, -1}, {1, 1}, {-1, 1} }) do
+            local corner = Vector3.new(sign[1] * (part.Size.X / 2 + 0.05), 0, sign[2] * (part.Size.Z / 2 + 0.05))
+            local point = floor.CFrame:PointToObjectSpace(part.CFrame:PointToWorldSpace(corner))
+            support[#support + 1] = { x = point.X, z = point.Z }
+        end
+        local remaining = {}
+        for _, polygon in ipairs(uncovered) do
+            for _, piece in ipairs(ui.layout.subtractSupport(polygon, support)) do
+                remaining[#remaining + 1] = piece
+            end
+        end
+        uncovered = remaining
+        if #uncovered == 0 then
+            return true
+        end
+    end
+    local area = 0
+    for _, polygon in ipairs(uncovered) do
+        area = area + ui.layout.polygonArea(polygon)
+    end
+    return area <= 0.001
+end
+
 function ui.layout.placed(interior)
     local folder=interior:FindFirstChild("Furniture")
     local result={}
@@ -2862,10 +2988,9 @@ function ui.layout.plan(data)
         local floor=floors[floorIndex]
         local _,floorYaw=floor.CFrame:ToOrientation()
         local angle=math.rad(yaw)-floorYaw
-        local halfX=(math.abs(math.cos(angle))*info.Size.X+math.abs(math.sin(angle))*info.Size.Z)/2
-        local halfZ=(math.abs(math.sin(angle))*info.Size.X+math.abs(math.cos(angle))*info.Size.Z)/2
-        assert(math.abs(entry.x)+halfX<=floor.Size.X/2+0.05 and math.abs(entry.z)+halfZ<=floor.Size.Z/2+0.05,
-            "Item "..index.." is outside floor "..floorIndex.." or too close to its edge.")
+        assert(ui.layout.supported(floor, entry, info.Size, angle),
+            ("Item %d (%s) on floor %d: footprint crosses an edge or stair opening. Floor %.1f x %.1f studs, %d section(s).")
+                :format(index, entry.id, floorIndex, floor.Size.X, floor.Size.Z, #floor.parts))
         rows[#rows+1]={id=entry.id,floor=floorIndex,x=entry.x,z=entry.z,yaw=yaw,size=info.Size,
             position=floor.CFrame:PointToWorldSpace(Vector3.new(entry.x,floor.Size.Y/2,entry.z))}
     end
@@ -2933,7 +3058,7 @@ function ui.layout.export()
     local floors=ui.layout.floors(interior)
     local items=ui.layout.catalog()
     local data={version=1,coordinateSpace="floor-local",name="My house",items={},context={houseLevel=player:GetAttribute("HouseLevel"),floors={},bag={},catalog={}}}
-    for i,floor in ipairs(floors) do data.context.floors[i]={floor=i,surface=floor.Name,width=floor.Size.X,depth=floor.Size.Z} end
+    for i,floor in ipairs(floors) do data.context.floors[i]={floor=i,surface=floor.Name,width=floor.Size.X,depth=floor.Size.Z,sections=#floor.parts} end
     for id,info in pairs(items.Furniture) do
         if info.Size then data.context.catalog[id]={name=info.DisplayName,size={info.Size.X,info.Size.Y,info.Size.Z}} end
         local count=ui.layout.bag(id) if count>0 then data.context.bag[id]=count end
