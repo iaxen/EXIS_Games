@@ -1335,6 +1335,48 @@ local function acorns()
     if value:IsA("IntValue") or value:IsA("NumberValue") then return math.max(0,value.Value) end
     return nil
 end
+local fairyOffers = { prices = {}, candyCost = 0 }
+function fairyOffers.cost(option)
+    if type(option) ~= "table" then return nil end
+    local value = option.CandyCost
+        or (type(option.Cost) == "table" and option.Cost.Candy)
+        or (type(option.Costs) == "table" and option.Costs.Candy)
+    if not value and option.Currency == "Candy" then value = option.Price or option.Cost end
+    if type(value) == "number" and value >= 1 and value % 1 == 0 then return value end
+    local text = tostring(option.Text or ""):lower():gsub(",", "")
+    local amount = text:match("(%d+)%s+candy") or text:match("candy%s*[x:]%s*(%d+)")
+    amount = tonumber(amount)
+    if amount and amount >= 1 then return amount end
+    if text:find("a candy", 1, true) or text:find("one candy", 1, true) then return 1 end
+end
+function fairyOffers.option(menu)
+    for _, option in ipairs(type(menu) == "table" and menu.Options or {}) do
+        local text = tostring(option.Text or ""):lower()
+        if type(option.Id) == "string" and text:find("candy", 1, true)
+            and text:find("fairy dust", 1, true) then
+            return option.Id, fairyOffers.cost(option)
+        end
+    end
+end
+function fairyOffers.required(id)
+    return fairyOffers.prices[id] or (fairyOffers.candyCost > 0 and fairyOffers.candyCost or nil)
+end
+function fairyOffers.affordable(id)
+    local cost = fairyOffers.required(id)
+    return cost ~= nil and inventoryAmount("Candy") >= cost, cost
+end
+function fairyOffers.learnNearby(prompt, id)
+    if fairyOffers.prices[id] then return end
+    local cf = currentPosition()
+    local holder = prompt and prompt.Parent
+    local position = holder and fairyTargets.position(holder)
+    if not cf or not position or (cf.Position - position).Magnitude > (prompt.MaxActivationDistance or 10) then return end
+    local ok, menu = pcall(invoke, "NpcOpen", id)
+    if ok then
+        local _, cost = fairyOffers.option(menu)
+        if cost then fairyOffers.prices[id] = cost configChanged() end
+    end
+end
 local function startFairy()
     if not states.fairy then stop("fairy") return end
     if jobs.fairy then return end
@@ -1347,6 +1389,11 @@ local function startFairy()
             elseif not prompt then fairyReport("WAITING FOR THE FAIRY")
             else
                 if not movement.acquire("fairy") then break end
+                local queuedCount=acorns()
+                if not queuedCount or queuedCount<1 then
+                    movement.release("fairy")
+                    fairyReport("WAITING FOR GOLDEN ACORNS")
+                else
                 fairyOrigin=currentPosition()
                 local trades=0
                 local approachedId=nil
@@ -1374,6 +1421,8 @@ local function startFairy()
                                 fairyReport("GOLDEN ACORNS: "..remaining.." • WAITING FOR MUSHROOM FAIRY • OTHER TASKS WAIT")
                             else
                                 local ok,err=pcall(function()
+                                    local available=acorns()
+                                    if not available or available<1 then return end
                                     if approachedId~=id then
                                         if not approachKeeper("fairy",id,prompt) then return end
                                         approachedId=id
@@ -1416,6 +1465,7 @@ local function startFairy()
                     task.wait(0.25)
                 end
                 fairyCleanup()
+                end
             end
             task.wait(3)
         end
@@ -1990,44 +2040,62 @@ local function startCandyFairy()
             if inventoryAmount("Candy")>0 then
                 for _,prompt in ipairs(fairyPrompts()) do
                     if not enabled("candyFairy") then break end
+                    if inventoryAmount("Candy")<=0 then break end
                     if os.clock()>=(nextCheck[prompt] or 0) then
-                        if not movement.acquire("candyFairy") then return end
-                        activityOwner="candyFairy"
-                        local ok,err=pcall(function()
-                            local id=prompt:GetAttribute("NpcId")
-                            if not approachKeeper("candyFairy",id,prompt) then return end
-                            if not enabled("candyFairy") then return end
-                            local menu=checkedInvoke("NpcOpen",id)
-                            if not enabled("candyFairy") then return end
-                            showShopReply(id,menu)
-                            local choice=offeredChoice(menu,function(text)
-                                return text:find("candy",1,true) and text:find("fairy dust",1,true)
+                        local id=prompt:GetAttribute("NpcId")
+                        fairyOffers.learnNearby(prompt,id)
+                        local affordable,cost=fairyOffers.affordable(id)
+                        if not cost then
+                            candyFairyReport("CANDY PRICE UNKNOWN • VISIT A FAIRY ONCE OR ENTER ITS COST")
+                            nextCheck[prompt]=os.clock()+3
+                        elseif not affordable then
+                            candyFairyReport("WAITING FOR CANDY: "..inventoryAmount("Candy").." / "..cost)
+                        else
+                            if not movement.acquire("candyFairy") then return end
+                            activityOwner="candyFairy"
+                            local ok,err=pcall(function()
+                                -- Inventory can change while this worker waits for its turn.
+                                if not enabled("candyFairy") or not fairyOffers.affordable(id) then return end
+                                if not approachKeeper("candyFairy",id,prompt) then return end
+                                if not enabled("candyFairy") or not fairyOffers.affordable(id) then return end
+                                local menu=checkedInvoke("NpcOpen",id)
+                                if not enabled("candyFairy") then return end
+                                showShopReply(id,menu)
+                                local choice,actualCost=fairyOffers.option(menu)
+                                if actualCost then fairyOffers.prices[id]=actualCost configChanged() end
+                                if not choice then
+                                    candyFairyReport("NO CANDY → FAIRY DUST OFFER AT "..id)
+                                    nextCheck[prompt]=os.clock()+15
+                                    return
+                                end
+                                local canOffer,required=fairyOffers.affordable(id)
+                                if not canOffer then
+                                    candyFairyReport("WAITING FOR CANDY: "..inventoryAmount("Candy").." / "..tostring(required))
+                                    return
+                                end
+                                local beforeCandy=inventoryAmount("Candy")
+                                local beforeDust=inventoryAmount("FairyDust")
+                                if not enabled("candyFairy") then return end
+                                invoke("NpcChoose",id,choice)
+                                local started=os.clock()
+                                repeat task.wait(0.1)
+                                until not enabled("candyFairy") or (inventoryAmount("Candy")<beforeCandy and inventoryAmount("FairyDust")>beforeDust) or os.clock()-started>=4
+                                if inventoryAmount("Candy")<beforeCandy and inventoryAmount("FairyDust")>beforeDust then
+                                    fairyOffers.prices[id]=actualCost or required
+                                    configChanged()
+                                    candyFairyReport("CANDY TRADE CONFIRMED • LEFT: "..inventoryAmount("Candy"))
+                                    nextCheck[prompt]=os.clock()+0.25
+                                else
+                                    candyFairyReport("CANDY TRADE NOT CONFIRMED • SEE NPC REPLY")
+                                    nextCheck[prompt]=os.clock()+15
+                                end
                             end)
-                            if not choice then
-                                candyFairyReport("No Candy → Fairy Dust offer from "..id)
-                                nextCheck[prompt]=os.clock()+15
-                                return
-                            end
-                            local beforeCandy=inventoryAmount("Candy")
-                            local beforeDust=inventoryAmount("FairyDust")
-                            if not enabled("candyFairy") then return end
-                            invoke("NpcChoose",id,choice)
-                            local started=os.clock()
-                            repeat task.wait(0.1)
-                            until not enabled("candyFairy") or (inventoryAmount("Candy")<beforeCandy and inventoryAmount("FairyDust")>beforeDust) or os.clock()-started>=4
-                            if inventoryAmount("Candy")<beforeCandy and inventoryAmount("FairyDust")>beforeDust then
-                                candyFairyReport("Candy trade confirmed at "..id.." • candy left: "..inventoryAmount("Candy"))
-                                nextCheck[prompt]=os.clock()+0.25
-                            else
-                                candyFairyReport("Candy trade not confirmed at "..id.."; see NPC reply")
-                                nextCheck[prompt]=os.clock()+15
-                            end
-                        end)
-                        activityCleanup("candyFairy")
-                        if not ok then candyFairyReport("Candy trade error: "..tostring(err)) nextCheck[prompt]=os.clock()+15 end
+                            activityCleanup("candyFairy")
+                            if not ok then candyFairyReport("CANDY TRADE ERROR: "..tostring(err)) nextCheck[prompt]=os.clock()+15 end
+                        end
                     end
                 end
-            else candyFairyReport("Waiting for Candy") end
+            else candyFairyReport("WAITING FOR CANDY") end
             task.wait(0.5)
         end
         activityCleanup("candyFairy")
@@ -2475,7 +2543,7 @@ function config.snapshot()
     local timers={}
     for _,item in ipairs(itemIds) do timers[item]=deadline(item) end
     return {version=1,userId=player.UserId,placeId=game.PlaceId,toggles=toggles,
-        options={safeSellHalted=safeSales.halted==true,sellLimitText=saleLimit.text,dustSpending=dustCycle.spending,dustMinimum=dustCycle.reserve,plantOrder=planting.order,bedDelay=BED_DELAY,chopHits=chopHits,chopMode=chopMode,returnMode=returnMode,
+        options={candyOfferCost=fairyOffers.candyCost,candyOfferCosts=fairyOffers.prices,safeSellHalted=safeSales.halted==true,sellLimitText=saleLimit.text,dustSpending=dustCycle.spending,dustMinimum=dustCycle.reserve,plantOrder=planting.order,bedDelay=BED_DELAY,chopHits=chopHits,chopMode=chopMode,returnMode=returnMode,
             savedCenter=savedCenter and {savedCenter:GetComponents()} or nil},timers=timers}
 end
 function config.save()
@@ -2499,6 +2567,11 @@ function config.apply(data)
     end
     local options=type(data.options)=="table" and data.options or {}
     safeSales.halted=options.safeSellHalted==true
+    fairyOffers.candyCost=config.validNumber(options.candyOfferCost,0,1000000000) and math.floor(options.candyOfferCost) or 0
+    fairyOffers.prices={}
+    for id,cost in pairs(type(options.candyOfferCosts)=="table" and options.candyOfferCosts or {}) do
+        if type(id)=="string" and #id<=100 and config.validNumber(cost,1,1000000000) and cost%1==0 then fairyOffers.prices[id]=cost end
+    end
     if config.validNumber(options.dustMinimum,1,9007199254740991) then dustCycle.reserve=math.floor(options.dustMinimum) end
     dustCycle.spending=options.dustSpending==true
     local limitOK=pcall(saleLimit.set,type(options.sellLimitText)=="string" and options.sellLimitText or "")
@@ -2523,6 +2596,7 @@ function config.apply(data)
     if config.numbers.delay then config.numbers.delay.Text=tostring(math.floor(BED_DELAY*1000)) end
     if config.numbers.hits then config.numbers.hits.Text=tostring(chopHits) end
     if config.numbers.dustMinimum then config.numbers.dustMinimum.Text=tostring(dustCycle.reserve) end
+    if config.numbers.candyOfferCost then config.numbers.candyOfferCost.Text=tostring(fairyOffers.candyCost) end
     for _,key in ipairs({"quest","orders","mayor","dig","rearrange","harvest","plant","water","dust","seeds","normalSeeds","gears","tend","LuckyCharm","RainbowDew","fairy","candyFairy","sellBoom","houseUpgrade","gardenUpgrade","pickups","wood","fishing"}) do
         if states[key] then ui.dispatch(key) end
     end
@@ -3935,7 +4009,11 @@ ui.text(ui.animals,"Returns to your farm before tending animals that need care. 
 tendLabel=ui.text(ui.animals,"Animal tending: OFF")
 ui.candyFairy=ui.group(ui.fairies,"Candy — Fairies Without a Mushroom House")
 ui.toggle(ui.candyFairy,"Auto Trade Candy With Regular Fairies","candyFairy")
-ui.text(ui.candyFairy,"Trades Candy for Fairy Dust only with fairies without a nearby mushroom house. Confirms the item exchange.")
+ui.text(ui.candyFairy,"Travels only when Candy covers one offer. Learns the price while nearby and saves it.")
+ui.text(ui.candyFairy,"CANDY PER OFFER (0 = LEARN NEARBY)")
+config.numbers.candyOfferCost=ui.number(ui.candyFairy,fairyOffers.candyCost,0,1000000000,function(n)
+    fairyOffers.candyCost=math.floor(n)
+end)
 candyFairyLabel=ui.text(ui.candyFairy,"Candy trades: OFF")
 ui.fairy=ui.group(ui.fairies,"Golden Acorns — Mushroom-house Fairy")
 ui.toggle(ui.fairy,"Trade all Golden Acorns","fairy")
