@@ -3016,18 +3016,26 @@ function ui.layout.plan(data)
             local info=items.Furniture[row.id]
             if bag[row.id]==nil then bag[row.id]=ui.layout.bag(row.id) end
             if bag[row.id]>0 then bag[row.id]=bag[row.id]-1 else missing[row.id]=(missing[row.id] or 0)+1 end
-            assert(not info.HouseLevel or level>=info.HouseLevel,"House level too low for "..row.id)
+            if info.HouseLevel and level < info.HouseLevel then
+                row.blockReason = "HOUSE LEVEL " .. tostring(info.HouseLevel) .. " REQUIRED"
+            end
             if items.WallPieces[row.id] then newWalls=newWalls+1
             elseif not items.FloorPieces[row.id] and row.id~="RoomSign" then newFurniture=newFurniture+1 end
         end
         if row.action=="keep" then keeps=keeps+1 elseif row.action=="move" then moves=moves+1 else places=places+1 end
     end
-    assert(wallCount+newWalls<=items.WallLimit(level),"Layout exceeds your house's partition-wall limit.")
-    assert(furnitureCount+newFurniture<=items.FurnitureLimit(level),"Layout exceeds your house's furniture limit.")
+    -- Capacity is checked per placement so an incomplete layout can still make progress.
+    local warnings = {}
+    if wallCount + newWalls > items.WallLimit(level) then
+        warnings[#warnings + 1] = "Some new walls may exceed the house limit."
+    end
+    if furnitureCount + newFurniture > items.FurnitureLimit(level) then
+        warnings[#warnings + 1] = "Some new furniture may exceed the house limit."
+    end
     local absent={}
     for id,count in pairs(missing) do absent[#absent+1]=id.." x"..count end
     table.sort(absent)
-    return {interior=interior,floors=floors,rows=rows,missing=absent,keeps=keeps,moves=moves,places=places}
+    return {interior=interior,floors=floors,rows=rows,missing=absent,warnings=warnings,keeps=keeps,moves=moves,places=places}
 end
 function ui.layout.clearPreview()
     if ui.layout.preview then ui.layout.preview:Destroy() ui.layout.preview=nil end
@@ -3048,7 +3056,8 @@ function ui.layout.inspect(preview)
         end
     end
     ui.layout.say(("KEEP %d • MOVE %d • PLACE %d"):format(plan.keeps,plan.moves,plan.places)..
-        (#plan.missing>0 and ("\nMISSING: "..table.concat(plan.missing,", ")) or "\nALL REQUIRED ITEMS AVAILABLE"))
+        (#plan.missing>0 and ("\nMISSING: "..table.concat(plan.missing,", ")) or "\nALL REQUIRED ITEMS AVAILABLE")..
+        (#plan.warnings>0 and ("\n"..table.concat(plan.warnings," ")) or ""))
     return plan
 end
 function ui.layout.export()
@@ -3090,63 +3099,166 @@ function ui.layout.cancel()
     ui.layout.say("HOUSE BUILD STOPPED • COMPLETED CHANGES REMAIN")
 end
 sessionOptions.houseCleanup=ui.layout.clearPreview
-function ui.layout.apply()
-    if states.houseLayout then return end
-    local data=ui.layout.decode(ui.layout.input.Text)
-    local plan=ui.layout.plan(data)
-    assert(#plan.missing==0,"Missing furniture: "..table.concat(plan.missing,", "))
-    assert(player:GetAttribute("InHouse")==player.UserId,"Enter your own house and pause farming jobs before Apply.")
-    states.houseLayout=true
-    jobs.houseLayout=task.defer(function()
-        local ok,err=pcall(function()
-            ui.layout.say("HOUSE BUILD QUEUED")
-            if not movement.acquire("houseLayout") then return end
-            ui.layout.clearPreview()
-            plan=ui.layout.plan(data)
-            assert(#plan.missing==0,"Furniture inventory changed; validate again.")
-            for index,row in ipairs(plan.rows) do
-                if not enabled("houseLayout") then return end
-                assert(player:GetAttribute("InHouse")==player.UserId,"Build stopped: you left your own house.")
-                local current=ui.layout.interior()
-                assert(current,"Your house interior unloaded.")
-                if row.action~="keep" then
-                    local existing=nil
-                    local before={}
-                    for _,entry in ipairs(ui.layout.placed(current)) do
-                        before[entry.index]=true
-                        if entry.index==row.sourceIndex and entry.id==row.id then existing=entry.model end
-                    end
-                    if row.action=="move" then
-                        assert(existing,"Placed furniture changed; validate the layout again.")
-                        fire("HouseAction","move",row.sourceIndex,row.position,row.yaw)
-                    else
-                        assert(ui.layout.bag(row.id)>0,"No owned "..row.id.." left to place.")
-                        fire("HouseAction","place",row.id,row.position,row.yaw)
-                    end
-                    local confirmed=false
-                    local started=os.clock()
-                    repeat
-                        task.wait(0.1)
-                        local refreshed=ui.layout.interior()
-                        if refreshed then
-                            for _,entry in ipairs(ui.layout.placed(refreshed)) do
-                                local expected=row.action=="move" and entry.index==row.sourceIndex or row.action=="place" and not before[entry.index]
-                                if expected and entry.id==row.id and ui.layout.atTarget(entry.model,row,plan.floors) then confirmed=true break end
-                            end
-                        end
-                    until confirmed or not enabled("houseLayout") or os.clock()-started>=4
-                    if not enabled("houseLayout") then return end
-                    assert(confirmed,"No placement confirmation for "..row.id..". Build paused; inspect the game response before retrying.")
-                    task.wait(0.15)
-                end
-                ui.layout.say("HOUSE BUILD: "..index.." / "..#plan.rows)
+function ui.layout.roomFor(id, interior)
+    local items = ui.layout.catalog()
+    local level = tonumber(player:GetAttribute("HouseLevel")) or 1
+    local info = items.Furniture[id]
+    if info.HouseLevel and level < info.HouseLevel then
+        return false, "HOUSE LEVEL " .. tostring(info.HouseLevel) .. " REQUIRED"
+    end
+    local walls, furniture = 0, 0
+    for _, entry in ipairs(ui.layout.placed(interior)) do
+        if items.WallPieces[entry.id] then
+            walls = walls + 1
+        elseif not items.FloorPieces[entry.id] and entry.id ~= "RoomSign" then
+            furniture = furniture + 1
+        end
+    end
+    if items.WallPieces[id] and walls >= items.WallLimit(level) then
+        return false, "PARTITION-WALL LIMIT"
+    end
+    if not items.WallPieces[id] and not items.FloorPieces[id] and id ~= "RoomSign"
+        and furniture >= items.FurnitureLimit(level) then
+        return false, "FURNITURE LIMIT"
+    end
+    return true
+end
+
+function ui.layout.placeRow(row, plan)
+    if not enabled("houseLayout") then
+        return false, "STOPPED"
+    end
+    assert(player:GetAttribute("InHouse") == player.UserId, "You left your own house.")
+    local current = ui.layout.interior()
+    assert(current == plan.interior, "Your house interior changed.")
+    local before, existing = {}, nil
+    for _, entry in ipairs(ui.layout.placed(current)) do
+        before[entry.index] = true
+        if entry.index == row.sourceIndex and entry.id == row.id then
+            existing = entry.model
+        end
+        if entry.id == row.id and entry.index == row.confirmedIndex
+            and ui.layout.atTarget(entry.model, row, plan.floors) then
+            return true
+        end
+    end
+    if row.action == "keep" then
+        if existing and ui.layout.atTarget(existing, row, plan.floors) then
+            row.confirmedIndex = row.sourceIndex
+            return true
+        end
+        return false, "EXISTING FURNITURE CHANGED"
+    end
+    if row.action == "move" then
+        if not existing then
+            return false, "SOURCE FURNITURE UNAVAILABLE"
+        end
+        fire("HouseAction", "move", row.sourceIndex, row.position, row.yaw)
+    else
+        if ui.layout.bag(row.id) <= 0 then
+            return false, "MISSING"
+        end
+        local room, reason = ui.layout.roomFor(row.id, current)
+        if not room then
+            return false, reason
+        end
+        fire("HouseAction", "place", row.id, row.position, row.yaw)
+    end
+    local started = os.clock()
+    repeat
+        task.wait(0.1)
+        if not enabled("houseLayout") then
+            return false, "STOPPED"
+        end
+        assert(player:GetAttribute("InHouse") == player.UserId, "You left your own house.")
+        local refreshed = ui.layout.interior()
+        assert(refreshed == plan.interior, "Your house interior changed.")
+        for _, entry in ipairs(ui.layout.placed(refreshed)) do
+            local expected = row.action == "move" and entry.index == row.sourceIndex
+                or row.action == "place" and not before[entry.index]
+            if expected and entry.id == row.id
+                and ui.layout.atTarget(entry.model, row, plan.floors) then
+                row.confirmedIndex = entry.index
+                return true
             end
-            ui.layout.say("LAYOUT APPLIED • UNUSED EXISTING FURNITURE WAS KEPT")
+        end
+    until os.clock() - started >= 4
+    return false, "PLACEMENT NOT CONFIRMED"
+end
+
+function ui.layout.apply()
+    if states.houseLayout then
+        return
+    end
+    local data = ui.layout.decode(ui.layout.input.Text)
+    ui.layout.plan(data)
+    assert(player:GetAttribute("InHouse") == player.UserId, "Enter your own house before Apply.")
+    states.houseLayout = true
+    jobs.houseLayout = task.defer(function()
+        local ok, err = pcall(function()
+            ui.layout.say("HOUSE BUILD QUEUED")
+            if not movement.acquire("houseLayout") then
+                return
+            end
+            ui.layout.clearPreview()
+            local plan = ui.layout.plan(data)
+            local complete, deferred, failures = 0, {}, {}
+            -- First finish all existing moves/keeps and copies currently in the bag.
+            for _, row in ipairs(plan.rows) do
+                if not enabled("houseLayout") then
+                    return
+                end
+                local confirmed, reason = ui.layout.placeRow(row, plan)
+                if confirmed then
+                    complete = complete + 1
+                else
+                    deferred[#deferred + 1] = row
+                    row.pendingReason = reason
+                end
+                ui.layout.say(("OWNED FIRST: %d / %d • PENDING %d")
+                    :format(complete, #plan.rows, #deferred))
+                task.wait(0.15)
+            end
+            -- Retry pending rows once after all owned items have had their turn.
+            -- No purchase request is guessed: only inventory that actually exists is placed.
+            for _, row in ipairs(deferred) do
+                if not enabled("houseLayout") then
+                    return
+                end
+                if row.pendingReason == "MISSING" and ui.layout.bag(row.id) > 0 then
+                    local confirmed, reason = ui.layout.placeRow(row, plan)
+                    if confirmed then
+                        complete = complete + 1
+                        row.pendingReason = nil
+                    else
+                        row.pendingReason = reason
+                    end
+                end
+                if row.pendingReason then
+                    local key = row.id .. " [" .. row.pendingReason .. "]"
+                    failures[key] = (failures[key] or 0) + 1
+                end
+            end
+            local pending = {}
+            for name, amount in pairs(failures) do
+                pending[#pending + 1] = name .. " x" .. amount
+            end
+            table.sort(pending)
+            ui.layout.pending = pending
+            if #pending == 0 then
+                ui.layout.say("LAYOUT APPLIED • UNUSED FURNITURE KEPT")
+            else
+                ui.layout.say(("PLACED / KEPT %d OF %d • REMAINING: ")
+                    :format(complete, #plan.rows) .. table.concat(pending, ", ")
+                    .. "\nBuy missing furniture, then Apply again to finish.")
+            end
         end)
-        states.houseLayout=false
+        states.houseLayout = false
         movement.release("houseLayout")
-        jobs.houseLayout=nil
-        if not ok then ui.layout.say("BUILD STOPPED: "..tostring(err)) end
+        jobs.houseLayout = nil
+        if not ok then
+            ui.layout.say("BUILD STOPPED: " .. tostring(err))
+        end
     end)
 end
 
@@ -3218,7 +3330,7 @@ ui.toggle(ui.returns,"Return when ripe and away","ripeReturn")
 ui.text(ui.returns,"Returns after shopping when enabled. Ripe-crop return runs during the harvest turn only.")
 ui.housePage=ui.page("Home")
 ui.houseImport=ui.group(ui.housePage,"AUTO HOUSE LAYOUT")
-ui.text(ui.houseImport,"Enter your house. Load JSON → validate → preview → apply. Owned items only; unused furniture stays. No auto-buy or clearing.")
+ui.text(ui.houseImport,"Places owned furniture first. Missing or rejected pieces are skipped; unused furniture stays. Buy missing items and Apply again to finish.")
 ui.layout.input=make("TextBox",{Size=UDim2.new(1,0,0,116),MultiLine=true,ClearTextOnFocus=false,
     Text="",PlaceholderText="PASTE HOUSE LAYOUT JSON",TextSize=10,Font=Enum.Font.Code,
     TextColor3=white,PlaceholderColor3=Color3.fromRGB(125,146,173),TextWrapped=true,
@@ -3244,7 +3356,7 @@ end)
 ui.button(ui.houseImport,"VALIDATE LAYOUT",function()ui.layout.inspect(false)end)
 ui.button(ui.houseImport,"PREVIEW FOOTPRINTS",function()ui.layout.inspect(true)end)
 ui.button(ui.houseImport,"HIDE PREVIEW",ui.layout.clearPreview)
-ui.button(ui.houseImport,"APPLY OWNED FURNITURE",ui.layout.apply)
+ui.button(ui.houseImport,"PLACE OWNED / CONTINUE LAYOUT",ui.layout.apply)
 ui.button(ui.houseImport,"STOP HOUSE BUILD",ui.layout.cancel)
 ui.layout.label=ui.text(ui.houseImport,"NO LAYOUT LOADED")
 ui.houseExport=ui.group(ui.housePage,"EXPORT HOUSE DATA")
