@@ -3093,6 +3093,137 @@ function ui.layout.export()
     if type(writefile)=="function" then pcall(writefile,"exi_house_export.json",text) end
     ui.layout.say("HOUSE EXPORTED • COPY THE JSON OR SEND exi_house_export.json WITH YOUR DESIGN")
 end
+-- Read-only export of another player's already replicated interior.
+function ui.layout.interiorFor(ownerId)
+    local village = workspace:FindFirstChild("CozyVillage")
+    local interiors = village and village:FindFirstChild("HouseInteriors")
+    if interiors then
+        for _, model in ipairs(interiors:GetChildren()) do
+            if model:IsA("Model") and tonumber(model:GetAttribute("OwnerUserId")) == ownerId then
+                return model
+            end
+        end
+    end
+end
+
+function ui.layout.refreshVisited()
+    local selected = ui.layout.visitedOwnerId
+    if not selected then
+        local current = tonumber(player:GetAttribute("InHouse"))
+        if current and current ~= player.UserId then
+            selected = current
+            ui.layout.visitedOwnerId = current
+        end
+    end
+    local owner = selected and Players:GetPlayerByUserId(selected)
+    if ui.layout.visitedLabel then
+        ui.layout.visitedLabel.Text = selected
+            and ("SELECTED: " .. (owner and owner.Name or tostring(selected)))
+            or "SELECT A PLAYER OR ENTER THEIR HOUSE"
+    end
+    local list = ui.layout.visitedChoices
+    if not list then
+        return
+    end
+    for _, child in ipairs(list:GetChildren()) do
+        if child:IsA("GuiButton") then
+            child:Destroy()
+        end
+    end
+    local others = {}
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other ~= player then
+            others[#others + 1] = other
+        end
+    end
+    table.sort(others, function(a, b)
+        return a.Name:lower() < b.Name:lower()
+    end)
+    for _, other in ipairs(others) do
+        local ownerId = other.UserId
+        local loaded = ui.layout.interiorFor(ownerId) ~= nil
+        local label = (selected == ownerId and "✓ " or "") .. other.Name
+            .. (loaded and " • LOADED" or " • VISIT FIRST")
+        ui.button(list, label, function()
+            ui.layout.visitedOwnerId = ownerId
+            ui.layout.refreshVisited()
+        end)
+    end
+end
+
+function ui.layout.exportVisited()
+    assert(not states.houseLayout, "Stop building before exporting.")
+    local ownerId = ui.layout.visitedOwnerId or tonumber(player:GetAttribute("InHouse"))
+    assert(ownerId and ownerId ~= player.UserId, "Select another player or enter their house first.")
+    local interior = ui.layout.interiorFor(ownerId)
+    assert(interior, "That house is not loaded. Visit it, wait for furniture to load, then refresh.")
+    local furniture = interior:FindFirstChild("Furniture")
+    assert(furniture, "House furniture has not loaded yet. Wait inside the house, then try again.")
+    local floors = ui.layout.floors(interior)
+    local catalog = ui.layout.catalog()
+    local owner = Players:GetPlayerByUserId(ownerId)
+    local name = owner and owner.Name or tostring(ownerId)
+    local data = {
+        version = 1,
+        coordinateSpace = "floor-local",
+        name = name .. " house",
+        items = {},
+        context = { ownerUserId = ownerId, ownerName = name, snapshot = "loaded-furniture", floors = {} },
+    }
+    for index, floor in ipairs(floors) do
+        data.context.floors[index] = {
+            floor = index, surface = floor.Name, width = floor.Size.X,
+            depth = floor.Size.Z, sections = #floor.parts,
+        }
+    end
+    local skipped = 0
+    for _, entry in ipairs(ui.layout.placed(interior)) do
+        if catalog.Furniture[entry.id] then
+            local cf, size = entry.model:GetBoundingBox()
+            local bottom = cf.Position.Y - size.Y / 2
+            local best, index = math.huge, 1
+            for floorIndex, floor in ipairs(floors) do
+                local distance = math.abs(bottom - (floor.Position.Y + floor.Size.Y / 2))
+                if distance < best then
+                    best, index = distance, floorIndex
+                end
+            end
+            local point = floors[index].CFrame:PointToObjectSpace(entry.model:GetPivot().Position)
+            local yaw = tonumber(entry.model:GetAttribute("Yaw"))
+            if not yaw then
+                local _, angle = entry.model:GetPivot():ToOrientation()
+                yaw = math.deg(angle)
+            end
+            data.items[#data.items + 1] = {
+                id = entry.id, floor = index, x = math.floor(point.X * 100) / 100,
+                z = math.floor(point.Z * 100) / 100, yaw = math.floor(yaw / 45 + 0.5) * 45 % 360,
+            }
+        else
+            skipped = skipped + 1
+        end
+    end
+    assert(#data.items > 0, "No supported furniture is loaded. Wait for the house to load before exporting.")
+    assert(#data.items <= ui.layout.maxItems, "This house exceeds the layout import item limit.")
+    assert(ui.layout.interiorFor(ownerId) == interior, "House unloaded during export. Visit it and try again.")
+    local text = HttpService:JSONEncode(data)
+    assert(#text < 200000, "Export is too large for the layout text box.")
+    ui.layout.input.Text = text
+    local filename = "exi_house_" .. tostring(ownerId) .. "_layout.json"
+    local saved = type(writefile) == "function" and pcall(writefile, filename, text)
+    if type(setclipboard) == "function" then
+        pcall(setclipboard, text)
+    end
+    if saved and ui.layout.path then
+        ui.layout.path.Text = filename
+    end
+    ui.layout.say(("EXPORTED %d LOADED ITEMS FROM %s"):format(#data.items, name)
+        .. (saved and (" • " .. filename) or " • JSON LOADED")
+        .. (skipped > 0 and (" • UNKNOWN ITEMS SKIPPED: " .. skipped) or ""))
+    if ui.layout.visitedLabel then
+        ui.layout.visitedLabel.Text = "EXPORTED: " .. name .. " • " .. #data.items .. " LOADED ITEMS"
+    end
+end
+
 function ui.layout.cancel()
     stop("houseLayout")
     ui.layout.clearPreview()
@@ -3422,6 +3553,22 @@ ui.layout.label=ui.text(ui.houseImport,"NO LAYOUT LOADED")
 ui.houseExport=ui.group(ui.housePage,"EXPORT HOUSE DATA")
 ui.text(ui.houseExport,"Exports floors, furniture, inventory and catalog IDs to exi_house_export.json.")
 ui.button(ui.houseExport,"EXPORT MY HOUSE",ui.layout.export)
+ui.houseVisited=ui.group(ui.housePage,"EXPORT VISITED HOUSE")
+ui.text(ui.houseVisited,"Visit the house and wait for furniture to load. Exports visible furniture layout only; inventory is excluded.")
+ui.layout.visitedLabel=ui.text(ui.houseVisited,"SELECT A PLAYER OR ENTER THEIR HOUSE")
+ui.button(ui.houseVisited,"USE CURRENT VISITED HOUSE",function()
+    local ownerId=tonumber(player:GetAttribute("InHouse"))
+    assert(ownerId and ownerId~=player.UserId,"Enter another player's house first.")
+    ui.layout.visitedOwnerId=ownerId
+    ui.layout.refreshVisited()
+end)
+ui.button(ui.houseVisited,"REFRESH PLAYERS / LOADED HOUSES",ui.layout.refreshVisited)
+ui.layout.visitedSelect=ui.group(ui.houseVisited,"SELECT PLAYER")
+ui.layout.visitedChoices=make("Frame",{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,
+    BackgroundTransparency=1},ui.layout.visitedSelect)
+make("UIListLayout",{Padding=UDim.new(0,3),SortOrder=Enum.SortOrder.LayoutOrder},ui.layout.visitedChoices)
+ui.button(ui.houseVisited,"EXPORT SELECTED HOUSE",ui.layout.exportVisited)
+ui.layout.refreshVisited()
 ui.houseFormat=ui.group(ui.housePage,"LAYOUT FORMAT")
 ui.text(ui.houseFormat,"Floor-local X/Z in studs; floor 1 is lowest. Rotation: 45° steps. Preview footprints are approximate.")
 ui.button(ui.houseFormat,"LOAD SMALL EXAMPLE",function()
