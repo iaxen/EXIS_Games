@@ -3574,11 +3574,11 @@ end
 local grip=make("TextButton", {AnchorPoint=Vector2.new(1,1),Position=UDim2.fromScale(1,1),
     Size=UDim2.fromOffset(25,22),BackgroundTransparency=1,Text="◢",TextColor3=blue,
     TextSize=17,Active=true},panel)
-local icon=make("TextButton",{Name="OpenEXIScript",Size=UDim2.fromOffset(52,30),
+local icon=make("TextButton",{Name="OpenEXIScript",Size=UDim2.fromOffset(32,32),
     Position=UDim2.fromOffset(12,90),BackgroundColor3=Color3.fromRGB(8,15,25),
-    Text="EXIScript",TextColor3=Color3.fromRGB(240,247,255),Font=Enum.Font.BuilderSansBold,TextSize=10,
+    Text="EXIS",TextColor3=Color3.fromRGB(240,247,255),Font=Enum.Font.BuilderSansBold,TextSize=10,
     Visible=false,BorderSizePixel=0},screen)
-corner(icon,10)
+corner(icon,4)
 make("UIStroke",{Color=blue,Thickness=1.5},icon)
 local iconDragged=false
 mini.Activated:Connect(function()
@@ -3721,4 +3721,3 @@ gui.Destroying:Connect(function()
 end)
 selectPage("Main")
 config.load()
-
