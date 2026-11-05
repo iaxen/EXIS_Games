@@ -38,6 +38,8 @@ local function runIslandEscape()
         tweenSpeed = 32,
         routeTimeout = 15,
         autoJump = true,
+        bagLimit = 0,
+        jobTimeout = 90,
     }
     local work = {
         needs = {},
@@ -315,6 +317,8 @@ local function runIslandEscape()
                         "health",
                         "hunger",
                         "fuel",
+                        "bagLimit",
+                        "jobTimeout",
                     }) do
                         local n = tonumber(d.options[k])
                         if n and n == n and n >= 0 and n < 10000 then
@@ -1148,7 +1152,7 @@ local function runIslandEscape()
     local explore = page("Explore")
     local settings = page("Settings")
     local survival = group(main, "SURVIVAL")
-    toggle(survival, "eat", "Auto eat", "Uses selected food when health or hunger is low. Select food below.")
+    toggle(survival, "eat", "Auto eat", "Uses selected food when health or hunger is low. No selection uses food listed in the game config.")
     number(survival, "health", "HEALTH BELOW (%)", 1, 100)
     number(survival, "hunger", "HUNGER BELOW (%)", 1, 100)
     local combat = group(main, "DEFENCE")
@@ -1162,7 +1166,7 @@ local function runIslandEscape()
     local fire = group(camp, "CAMPFIRE")
     toggle(fire, "fuel", "Auto add wood", "Adds wood only below the fuel target.")
     number(fire, "fuel", "FUEL TARGET (WOOD)", 1, 100)
-    toggle(fire, "cook", "Auto cook selected food", "Consumes selected cookable food.")
+    toggle(fire, "cook", "Auto cook food", "Uses selected cookable food. No selection uses all cookable food from the game config.")
     toggle(fire, "cooked", "Auto collect cooked food")
     button(fire, "ADD ONE WOOD / REFRESH FUEL STATE", function()
         assert(built("Campfire"), "Build the campfire first")
@@ -1196,6 +1200,13 @@ local function runIslandEscape()
     toggle(session, "antiAfk", "Anti idle")
     toggle(session, "autoExecute", "Auto execute after teleport", "Reloads EXIScript when entering the match if your executor supports teleport queues.")
     button(session, "SAVE CONFIG", save)
+    button(session, "RECHECK BAG / COLLECTION", function()
+        work.blockedBag = nil
+        work.rejectedPickups = 0
+        due.drops = 0
+        due.gather = 0
+        say("BAG COLLECTION RETRY ENABLED")
+    end)
     local function stopAll()
         motion.manual = nil
         motion.cancel("ALL TASKS STOPPED")
@@ -1222,6 +1233,8 @@ local function runIslandEscape()
     end)
     number(session, "tweenSpeed", "TWEEN SPEED (STUDS / SECOND)", 8, 120)
     number(session, "routeTimeout", "ROUTE TIMEOUT (SECONDS)", 6, 30)
+    number(session, "bagLimit", "BAG CAPACITY OVERRIDE (0 = DETECT)", 0, 10000)
+    number(session, "jobTimeout", "TASK SAFETY TIMEOUT (SECONDS)", 15, 600)
     switch(session, "AUTO JUMP WHEN BLOCKED", function()
         return opts.autoJump
     end, function(v)
@@ -1230,8 +1243,8 @@ local function runIslandEscape()
     end)
     text(session, "Walk uses dry paths, jump waypoints and stuck recovery. Tween follows checked paths. Teleport uses a dry landing; blocked routes are skipped.")
     local jobGroup = group(settings, "TASK PRIORITIES")
-    text(jobGroup, "Survival → escape → campfire → ready quests → needed drops → crafting / construction → processing → puzzles / chests → gathering → fishing.")
-    text(jobGroup, "One action at a time. Critical survival can interrupt travel. Blocked jobs retry later; lower-priority ready jobs gain waiting time.")
+    text(jobGroup, "Survival → campfire → cooking / supplies → tools / construction → quests → escape / exploration → extra gathering → fishing.")
+    text(jobGroup, "The active task keeps its turn until completion or a safety timeout. Priority chooses the next task. Stop, death and unreachable targets cancel safely.")
     local queueLabel = text(jobGroup, "JOB: IDLE")
     for _, category in ipairs({
         {
@@ -1630,6 +1643,151 @@ local function runIslandEscape()
             end)
         end
     end)
+    -- Inventory acknowledgement stays inside the scheduler's active task.
+    function work.inventory()
+        local result = {}
+        for _, tool in ipairs(tools()) do
+            result[tool.Name] = (result[tool.Name] or 0) + (tonumber(tool:GetAttribute("count")) or 1)
+        end
+        return result
+    end
+    function work.signature()
+        local rows = {}
+        for name, amount in pairs(work.inventory()) do
+            rows[#rows + 1] = name .. "=" .. tostring(amount)
+        end
+        table.sort(rows)
+        return table.concat(rows, "|")
+    end
+    function work.running(key, character, serial)
+        return alive and flags[key] == true and player.Character == character
+            and motion.serial == serial and not not root()
+    end
+    function work.await(key, predicate, seconds)
+        local character, serial = player.Character, motion.serial
+        local deadline = os.clock() + (seconds or 3)
+        repeat
+            if not work.running(key, character, serial) then
+                return false
+            end
+            if predicate() then
+                return true
+            end
+            task.wait(0.25)
+        until os.clock() >= deadline
+        return false
+    end
+    function work.request(key, name, action, ...)
+        local before = work.signature()
+        call(name, action, ...)
+        local confirmed = work.await(key, function()
+            return work.signature() ~= before
+        end, 3)
+        note(key, confirmed and "INVENTORY CHANGE CONFIRMED" or "NO INVENTORY CHANGE; RETRY LATER")
+        return confirmed
+    end
+    function work.bagState()
+        local c = config()
+        local used
+        local inventory = module("PlayerInventory")
+        if inventory and type(inventory.getBagItemCount) == "function" then
+            local ok, value = pcall(inventory.getBagItemCount, player)
+            if ok and type(value) == "number" then
+                used = value
+            end
+        end
+        local cap = opts.bagLimit > 0 and opts.bagLimit or nil
+        local bags = c.bag and c.bag.byDisplayName
+        for _, tool in ipairs(tools()) do
+            local row = bags and bags[tool.Name]
+            if row and type(row.cap) == "number" and not cap then
+                cap = row.cap + (tonumber(player:GetAttribute("bagSlotsBonus")) or 0)
+            end
+        end
+        note("inventory", used and ("BAG: " .. tostring(used) .. " / " .. tostring(cap or "?"))
+            or "BAG CAPACITY UNAVAILABLE: COLLECTION ACKNOWLEDGEMENT ENABLED")
+        return used, cap
+    end
+    function work.canCollect()
+        local signature = work.signature()
+        if work.blockedBag and work.blockedBag == signature then
+            return false
+        end
+        work.blockedBag = nil
+        local used, cap = work.bagState()
+        if used and cap and used >= cap then
+            note("inventory", "BAG FULL: PROCESS OR SUBMIT ITEMS FIRST")
+            return false
+        end
+        return true
+    end
+    function work.foodAllowed(kind, id)
+        local food = config().food.byId[id]
+        return food and (selectedEmpty(kind) or allowed(kind, id))
+            and (kind ~= "cook" or food.canCook == true)
+    end
+    function work.cookReady()
+        if not built("Campfire") then
+            return false
+        end
+        for id, item in pairs(config().item.byId) do
+            if work.foodAllowed("cook", id) and count(item.displayName) > 0 then
+                return true
+            end
+        end
+        return false
+    end
+    function work.cook()
+        local rows = config().item.byId
+        local ids = {}
+        for id, item in pairs(rows) do
+            if work.foodAllowed("cook", id) and count(item.displayName) > 0 then
+                ids[#ids + 1] = id
+            end
+        end
+        table.sort(ids, function(a, b)
+            return tostring(a) < tostring(b)
+        end)
+        for _, id in ipairs(ids) do
+            if count(rows[id].displayName) > 0 then
+                if not travel(built("Campfire"), "cook") then
+                    return false
+                end
+                return work.request("cook", "MakeFire", "addFood", id)
+            end
+        end
+        return false
+    end
+    function work.fuelItem()
+        local c = config()
+        local info = c.build.byId.campfire
+        local fuel = info and info.config and info.config["燃料"]
+        return fuel and c.item.byName[fuel]
+    end
+    function work.fuel()
+        local fire = built("Campfire")
+        local item = work.fuelItem()
+        if not fire or not item or count(item.displayName) <= 0 then
+            note("fuel", "NEED CAMPFIRE WOOD")
+            return false
+        end
+        if not travel(fire, "fuel") then
+            return false
+        end
+        local before = campData.campfireWoodCount
+        if before == nil then
+            work.fuelProbe = true
+        end
+        local bagBefore = count(item.displayName)
+        call("MakeFire", "addWood")
+        local confirmed = work.await("fuel", function()
+            return count(item.displayName) < bagBefore
+                or (type(campData.campfireWoodCount) == "number"
+                    and (before == nil or campData.campfireWoodCount > before))
+        end, 3)
+        note("fuel", confirmed and "WOOD ADDED" or "FUEL NOT CONFIRMED")
+        return confirmed
+    end
     local function eat()
         local r, h = root()
         if not r then
@@ -1643,11 +1801,17 @@ local function runIslandEscape()
         local c = config()
         for _, t in ipairs(tools()) do
             local info = c.item.byDisplayName[t.Name]
-            if info and allowed("food", info.id) then
+            if info and work.foodAllowed("food", info.id) then
                 equip(t)
+                local before = work.signature()
+                local health, hungerBefore = h.Health, h:GetAttribute("hunger")
                 t:Activate()
-                note("eat", "FOOD ACTIVATED")
-                return true
+                local confirmed = work.await("eat", function()
+                    return work.signature() ~= before or h.Health > health
+                        or (hungerBefore and (h:GetAttribute("hunger") or 0) > hungerBefore)
+                end, 3)
+                note("eat", confirmed and "FOOD USED" or "FOOD USE NOT CONFIRMED")
+                return confirmed
             end
         end
         note("eat", "SELECT FOOD YOU OWN")
@@ -1679,14 +1843,42 @@ local function runIslandEscape()
         end
         if #mobs > 0 then
             equip(t)
-            RS.Events.meleeHitRemote:FireServer(mobs, {})
-            work.sent = work.sent + 1
-            task.wait(math.max(0.2, tc.useCd or 0.7))
-            say("DEFENDING")
-            return true
+            local target = mobs[1]
+            local humanoid = target:FindFirstChildOfClass("Humanoid")
+            local character, serial = player.Character, motion.serial
+            local deadline = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
+            local misses = 0
+            while target.Parent and humanoid and humanoid.Health > 0
+                and work.running("combat", character, serial) and os.clock() < deadline do
+                local current = root()
+                local point = pos(target)
+                if not current or not point or (point - current.Position).Magnitude > (tc.range or 6) then
+                    note("combat", "ENEMY LEFT DEFENCE RANGE")
+                    return false
+                end
+                local before = humanoid.Health
+                RS.Events.meleeHitRemote:FireServer({ target }, {})
+                work.sent = work.sent + 1
+                task.wait(math.max(0.2, tc.useCd or 0.7))
+                local damaged = work.await("combat", function()
+                    return not target.Parent or humanoid.Health < before
+                end, 1)
+                misses = damaged and 0 or misses + 1
+                if misses >= 3 then
+                    note("combat", "NO DAMAGE CONFIRMED; RETRY LATER")
+                    return false
+                end
+            end
+            local complete = not target.Parent or (humanoid and humanoid.Health <= 0)
+            note("combat", complete and "ENEMY DEFEATED" or "COMBAT STOPPED / TIMED OUT")
+            return complete
         end
     end
     local function pickups()
+        if not work.canCollect() then
+            note("drops", "BAG BLOCKED: WAITING FOR ITEMS TO BE USED / SUBMITTED")
+            return false
+        end
         local w = world()
         local folder = w and w:FindFirstChild("DroppedItems")
         if not folder then
@@ -1709,14 +1901,32 @@ local function runIslandEscape()
             note("drops", "NO ELIGIBLE DROPS")
         end
         if o and travel(o, "drops") then
+            local before = work.signature()
+            local amount = count(o.Name)
             call("ItemCollect", "collect", o)
-            failed[o] = os.clock() + 5
-            note("drops", "COLLECT REQUEST SENT")
-            say("COLLECT: " .. (readable(o.Name) or "ITEM"))
-            return true
+            local confirmed = work.await("drops", function()
+                return count(o.Name) > amount
+            end, 3)
+            failed[o] = os.clock() + (confirmed and 2 or 15)
+            if not confirmed and o.Parent and not o:GetAttribute("collecting")
+                and work.signature() == before then
+                work.rejectedPickups = (work.rejectedPickups or 0) + 1
+                if work.rejectedPickups >= 3 then
+                    work.blockedBag = before
+                    note("inventory", "COLLECTION REJECTED: WAITING FOR INVENTORY CHANGE")
+                end
+            elseif confirmed then
+                work.rejectedPickups = 0
+            end
+            note("drops", confirmed and "ITEM ADDED TO INVENTORY" or "COLLECTION NOT CONFIRMED")
+            return confirmed
         end
     end
     local function gatherResource()
+        if not work.canCollect() then
+            note("gather", "BAG BLOCKED: USE / SUBMIT ITEMS FIRST")
+            return false
+        end
         local w = world()
         local static = w and w:FindFirstChild("Static")
         if not static then
@@ -1725,7 +1935,7 @@ local function runIslandEscape()
         end
         local c = config()
         local best = nearest(static:GetChildren(), function(o)
-            return o:IsA("Model") and o:GetAttribute("resourceId") and (selectedEmpty("resources") or allowed("resources", o:GetAttribute("resourceId"))) and not (failed[o] and failed[o] > os.clock())
+            return o:IsA("Model") and o:GetAttribute("resourceId") and (type(o:GetAttribute("hp")) ~= "number" or o:GetAttribute("hp") > 0) and (next(work.needs) == nil or (work.resourceNeeds[o:GetAttribute("resourceId")] or 0) > 0) and (selectedEmpty("resources") or allowed("resources", o:GetAttribute("resourceId"))) and not (failed[o] and failed[o] > os.clock())
         end, function(o)
             return work.resourceNeeds[o:GetAttribute("resourceId")] or 0
         end)
@@ -1747,26 +1957,47 @@ local function runIslandEscape()
             failed[best] = os.clock() + 5
             return
         end
-        if travel(best, "gather", math.max(1, (tc.range or 6) - 0.5)) then
+        local character, serial = player.Character, motion.serial
+        local deadline = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
+        local noDamage = 0
+        while work.running("gather", character, serial) and os.clock() < deadline do
+            local hp = best:GetAttribute("hp")
+            if not best.Parent or (type(hp) == "number" and hp <= 0) then
+                note("gather", "RESOURCE CHOPPED / DEPLETED")
+                return true
+            end
+            if not tool.Parent then
+                note("gather", "TOOL NO LONGER AVAILABLE")
+                return false
+            end
+            if not travel(best, "gather", math.max(1, (tc.range or 6) - 0.5)) then
+                return false
+            end
             equip(tool)
             local r = root()
             if not r then
-                return
+                return false
             end
             local p = best:GetPivot().Position
             r.CFrame = CFrame.lookAt(r.Position, Vector3.new(p.X, r.Position.Y, p.Z))
-            local hp = best:GetAttribute("hp")
             tool:Activate()
-            task.wait(math.max(0.7, (tc.useCd or 0.7) + 0.15))
-            if not best.Parent or (type(hp) == "number" and type(best:GetAttribute("hp")) == "number" and best:GetAttribute("hp") < hp) then
-                note("gather", "RESOURCE DAMAGE CONFIRMED")
-            else
-                note("gather", "SWING SENT; DAMAGE NOT CONFIRMED")
-                failed[best] = os.clock() + 6
+            task.wait(math.max(0.3, (tc.useCd or 0.7) + 0.15))
+            local damaged = work.await("gather", function()
+                local current = best:GetAttribute("hp")
+                return not best.Parent or (type(current) == "number"
+                    and type(hp) == "number" and current < hp)
+            end, 1.5)
+            noDamage = damaged and 0 or noDamage + 1
+            note("gather", damaged and "CHOPPING SAME RESOURCE" or "WAITING FOR RESOURCE DAMAGE")
+            if noDamage >= 3 then
+                failed[best] = os.clock() + 15
+                note("gather", "NO DAMAGE AFTER 3 SWINGS; RETRY LATER")
+                return false
             end
-            say("GATHER: " .. itemLabel("resource", best:GetAttribute("resourceId"), rc))
-            return true
         end
+        failed[best] = os.clock() + 10
+        note("gather", "STOPPED OR SAFETY TIMEOUT; NOT MARKED COMPLETE")
+        return false
     end
     local function exploreTick(key, kind, service, check, request)
         local w = world()
@@ -1791,9 +2022,11 @@ local function runIslandEscape()
         end
         if travel(obj, key) then
             call(service, request, obj)
-            note(key, "INTERACTION REQUEST SENT")
-            say(request .. ": " .. (readable(obj.Name) or "OBJECT"))
-            return true
+            local confirmed = work.await(key, function()
+                return not obj.Parent or call(service, check, obj) == true
+            end, 4)
+            note(key, confirmed and "INTERACTION CONFIRMED" or "INTERACTION NOT CONFIRMED")
+            return confirmed
         end
     end
     local function escapeTick()
@@ -1844,41 +2077,56 @@ local function runIslandEscape()
         if not area or not drops then
             return
         end
-        local owned = {}
-        for _, o in ipairs(drops:GetChildren()) do
-            if o.Name == info.displayName and o:GetAttribute("ownerName") == player.Name then
-                owned[#owned + 1] = o
+        local character, serial = player.Character, motion.serial
+        local deadline = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
+        local function ownedDrops()
+            local result = {}
+            for _, drop in ipairs(drops:GetChildren()) do
+                if drop.Name == info.displayName and drop:GetAttribute("ownerName") == player.Name then
+                    result[#result + 1] = drop
+                end
+            end
+            return result
+        end
+        while count(info.displayName) < req.count
+            and work.running("quest", character, serial) and os.clock() < deadline do
+            local owned = ownedDrops()
+            local target = nearest(owned, function(drop)
+                return not drop:GetAttribute("collecting")
+            end)
+            if not target or not work.canCollect() then
+                note("quest", "NEED CARRIED ITEMS / BAG SPACE")
+                return false
+            end
+            if not travel(target, "quest") then
+                return false
+            end
+            local before = count(info.displayName)
+            call("ItemCollect", "collect", target)
+            if not work.await("quest", function()
+                return count(info.displayName) > before
+            end, 3) then
+                note("quest", "QUEST ITEM COLLECTION NOT CONFIRMED")
+                return false
             end
         end
-        local held = count(info.displayName)
-        if #owned + held < req.count then
-            return
+        if count(info.displayName) < req.count or not travel(area, "quest", 1.8) then
+            return false
         end
-        if not travel(area, "quest", 1.8) then
-            return
-        end
-        task.wait(0.2)
-        for _, t in ipairs(tools()) do
-            if t.Name == info.displayName then
-                equip(t)
+        for _, tool in ipairs(tools()) do
+            if tool.Name == info.displayName then
+                equip(tool)
                 break
             end
         end
-        for _, o in ipairs(owned) do
-            if o.Parent and pos(o) and (pos(o) - area.Position).Magnitude > 5 then
-                if not travel(o, "quest") then
-                    return
-                end
-                call("ItemCollect", "collect", o)
-                task.wait(0.3)
-                return true
-            end
-        end
-        q.client.submitQuest(owned, revision)
-        note("quest", "SUBMISSION REQUEST SENT")
-        task.wait(1)
-        say("QUEST SUBMITTED")
-        return true
+        q.client.submitQuest(ownedDrops(), revision)
+        local confirmed = work.await("quest", function()
+            local newIndex, newAlt, newRevision = q.client.fetchQuest()
+            return newIndex ~= index or newAlt ~= alt or newRevision ~= revision
+        end, 4)
+        note("quest", confirmed and "QUEST ADVANCE CONFIRMED" or "QUEST ADVANCE NOT CONFIRMED")
+        work.refreshAt = 0
+        return confirmed
     end
     local fish = {
         state = "idle",
@@ -1959,12 +2207,33 @@ local function runIslandEscape()
         if not r or not events then
             return
         end
+        if fish.state ~= "idle" and (not root() or not fish.tool or not fish.tool.Parent) then
+            if fish.mini then
+                fish.mini:cancel()
+                fish.mini = nil
+            end
+            events.fishCancelRemote:FireServer()
+            fish.state = "idle"
+            return false
+        end
         if fish.state == "minigame" then
+            if os.clock() - fish.at > math.clamp(opts.jobTimeout, 15, 600) then
+                if fish.mini then
+                    fish.mini:cancel()
+                    fish.mini = nil
+                end
+                events.fishCancelRemote:FireServer()
+                fish.state = "idle"
+                note("fish", "MINIGAME SAFETY TIMEOUT")
+                return false
+            end
             say("COMPLETE FISH MINIGAME")
             return true
         end
         if fish.state == "reeling" and os.clock() - fish.at > 4 then
             fish.state = "idle"
+            -- Release the cast lock before the scheduler chooses another job.
+            return false
         end
         if fish.state ~= "idle" then
             if os.clock() - fish.at > 45 then
@@ -1972,6 +2241,10 @@ local function runIslandEscape()
                 fish.state = "idle"
             end
             return fish.state ~= "idle"
+        end
+        if not work.canCollect() then
+            note("fish", "BAG BLOCKED: PROCESS ITEMS FIRST")
+            return false
         end
         local c = config()
         local rod
@@ -2016,6 +2289,79 @@ local function runIslandEscape()
         due[key] = os.clock() + seconds
         return safely(key, fn)
     end
+    function work.buildRank(info)
+        local name = tostring(info.assetId):lower()
+        if name == "campfire" then
+            return 0
+        end
+        if name:find("craft") or name:find("workbench") then
+            return 1
+        end
+        return 2
+    end
+    function work.contribute(key, onlySelected)
+        local folder = world() and world():FindFirstChild("Buildings")
+        if not folder then
+            return false
+        end
+        local c = config()
+        local candidates = {}
+        for id, info in pairs(c.build.byId) do
+            if (not onlySelected or allowed("build", id))
+                and folder:FindFirstChild(info.assetId .. "_Construct") then
+                candidates[#candidates + 1] = { id = id, info = info }
+            end
+        end
+        table.sort(candidates, function(a, b)
+            local ar, br = work.buildRank(a.info), work.buildRank(b.info)
+            return ar < br or (ar == br and tostring(a.id) < tostring(b.id))
+        end)
+        for _, entry in ipairs(candidates) do
+            local info = entry.info
+            local blueprint = folder:FindFirstChild(info.assetId .. "_Construct")
+            local function hasMaterial()
+                for field, amount in pairs(c.recipe.byId[info.recipeId] or {}) do
+                    local id = type(field) == "string" and field:match("^require_(.+)$")
+                    local item = id and c.item.byId[id]
+                    if item and type(amount) == "number" and amount > 0
+                        and work.remaining(info, id, amount) > 0 and count(item.displayName) > 0 then
+                        return true
+                    end
+                end
+                return false
+            end
+            if hasMaterial() then
+                local character, serial = player.Character, motion.serial
+                local deadline = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
+                local submitted = false
+                while blueprint.Parent and hasMaterial()
+                    and work.running(key, character, serial) and os.clock() < deadline do
+                    if not travel(blueprint, key) then
+                        return false
+                    end
+                    local before = work.signature()
+                    local progress = work.buildRemaining[info.assetId]
+                    call("BuildBuilding", "build", entry.id)
+                    local confirmed = work.await(key, function()
+                        return not blueprint.Parent or built(info.assetId) ~= nil
+                            or work.signature() ~= before
+                            or work.buildRemaining[info.assetId] ~= progress
+                    end, 4)
+                    if not confirmed then
+                        note(key, "SUBMISSION NOT CONFIRMED; RETRY LATER")
+                        return false
+                    end
+                    submitted = true
+                    work.refreshAt = 0
+                end
+                note(key, not blueprint.Parent and "CONSTRUCTION FINISHED"
+                    or "AVAILABLE MATERIALS SUBMITTED; NEED MORE MATERIALS")
+                return submitted
+            end
+        end
+        note(key, "NO BLUEPRINT WITH USABLE MATERIALS")
+        return false
+    end
     local function craftTick()
         local c = config()
         if selectedEmpty("craft") then
@@ -2025,58 +2371,16 @@ local function runIslandEscape()
         for id in pairs(selected.craft or {}) do
             local i = c.item.byId[id]
             if allowed("craft", id) and i and count(i.displayName) == 0 and recipeReady(i) then
-                call("CraftItems", "craft", id)
-                note("craft", "CRAFT REQUEST SENT")
-                return
+                return work.request("craft", "CraftItems", "craft", id)
             end
         end
         note("craft", "OWNED ALREADY OR NEED MATERIALS")
     end
     local function buildTick()
-        local w = world()
-        local c = config()
-        local b = w and w:FindFirstChild("Buildings")
-        if selectedEmpty("build") then
-            note("build", "SELECT BUILDINGS FIRST")
-            return
-        end
-        for id in pairs(selected.build or {}) do
-            local i = c.build.byId[id]
-            if allowed("build", id) and i and b and b:FindFirstChild(i.assetId .. "_Construct") then
-                call("BuildBuilding", "build", id)
-                note("build", "CONTRIBUTION REQUEST SENT")
-                return
-            end
-        end
-        note("build", "NO SELECTED ACTIVE CONSTRUCTION")
+        return work.contribute("build", true)
     end
     local function buildCurrentTick()
-        local w = world()
-        local folder = w and w:FindFirstChild("Buildings")
-        if not folder then
-            return
-        end
-        local c = config()
-        for _, i in pairs(c.build.byId) do
-            if folder:FindFirstChild(i.assetId .. "_Construct") then
-                local recipe = c.recipe.byId[i.recipeId]
-                local hasMaterial = false
-                for key, n in pairs(recipe or {}) do
-                    local id = type(key) == "string" and key:match("^require_(.+)$")
-                    local item = id and c.item.byId[id]
-                    if item and type(n) == "number" and work.remaining(i, id, n) > 0 and count(item.displayName) > 0 then
-                        hasMaterial = true
-                        break
-                    end
-                end
-                if hasMaterial then
-                    call("BuildBuilding", "build", i.id)
-                    note("buildCurrent", "BLUEPRINT MATERIALS SUBMITTED")
-                    return
-                end
-            end
-        end
-        note("buildCurrent", "NO ACTIVE BLUEPRINT OR NEED MATERIALS")
+        return work.contribute("buildCurrent", false)
     end
     local function foodReady()
         local r, h = root()
@@ -2091,7 +2395,7 @@ local function runIslandEscape()
         local c = config()
         for _, t in ipairs(tools()) do
             local item = c.item.byDisplayName[t.Name]
-            if item and allowed("food", item.id) then
+            if item and work.foodAllowed("food", item.id) then
                 return true
             end
         end
@@ -2205,7 +2509,7 @@ local function runIslandEscape()
         end
     end
     work.waitReasons = {
-        eat = "HEALTH / HUNGER OK OR NO SELECTED FOOD",
+        eat = "HEALTH / HUNGER OK OR NO ELIGIBLE FOOD",
         combat = "NO NEARBY ENEMY OR NO MELEE WEAPON",
         travel = "NO MANUAL TRAVEL REQUEST",
         escape = "BOAT PROMPT NOT AVAILABLE",
@@ -2214,9 +2518,9 @@ local function runIslandEscape()
         build = "SELECT BUILDING / NEED MATERIALS",
         buildCurrent = "NO ACTIVE BLUEPRINT OR NEED MATERIALS",
         craft = "SELECT ITEMS TO CRAFT",
-        cook = "CAMPFIRE MISSING OR NO FOOD SELECTED",
+        cook = "CAMPFIRE MISSING OR NO COOKABLE FOOD OWNED",
         cooked = "NO READY FOOD / CAMPFIRE MISSING",
-        smelt = "BUILD THE FURNACE FIRST",
+        smelt = "FURNACE MISSING OR NEED INGREDIENTS",
         smeltCollect = "NO READY OUTPUT / FURNACE MISSING",
         water = "BUILD THE WATER MAKER FIRST",
     }
@@ -2235,7 +2539,7 @@ local function runIslandEscape()
                 end
                 if ready then
                     work.waiting[job.key] = work.waiting[job.key] or now
-                    local age = job.urgent and 0 or math.min(4, math.max(0, rank - 4), (now - work.waiting[job.key]) / 15)
+                    local age = 0 -- Strict priority applies when the current task finishes.
                     local score = rank - age
                     if not bestScore or score < bestScore then
                         best, bestScore = job, score
@@ -2250,16 +2554,8 @@ local function runIslandEscape()
         end
         return best
     end
-    motion.pulse = function()
-        if flags.combat and os.clock() >= (due.combat or 0) and safely("enemy readiness", enemyReady) == true then
-            return true
-        end
-        if not flags.eat or os.clock() < (due.eat or 0) then
-            return false
-        end
-        local _, h = root()
-        return h and h.Health / h.MaxHealth < 0.3 and safely("food readiness", foodReady) == true
-    end
+    -- Priority is considered between tasks, never during an active route.
+    motion.pulse = nil
     local function blueprintReady(onlySelected)
         local folder = world() and world():FindFirstChild("Buildings")
         if not folder then
@@ -2331,7 +2627,7 @@ local function runIslandEscape()
         },
         {
             key = "escape",
-            priority = 2.5,
+            priority = 9.8,
             cooldown = 4,
             ready = escapeReady,
             run = escapeTick,
@@ -2345,16 +2641,17 @@ local function runIslandEscape()
             end,
             cooldown = 4,
             ready = function()
-                return built("Campfire") and type(campData.campfireWoodCount) == "number" and campData.campfireWoodCount < opts.fuel
+                local item = work.fuelItem()
+                return built("Campfire") and item and count(item.displayName) > 0
+                    and ((campData.campfireWoodCount == nil and not work.fuelProbe)
+                        or (type(campData.campfireWoodCount) == "number" and campData.campfireWoodCount < opts.fuel))
             end,
-            run = function()
-                return call("MakeFire", "addWood")
-            end,
+            run = work.fuel,
         },
         {
             key = "buildCurrent",
             priority = function()
-                return built("Campfire") and 8 or 3.2
+                return built("Campfire") and 6 or 3.2
             end,
             cooldown = 4,
             ready = function()
@@ -2364,7 +2661,7 @@ local function runIslandEscape()
         },
         {
             key = "quest",
-            priority = 4,
+            priority = 6.5,
             cooldown = 3,
             ready = function()
                 local req = work.questRequirement
@@ -2393,25 +2690,26 @@ local function runIslandEscape()
         {
             key = "drops",
             priority = function()
-                return next(work.needs) and 4.8 or 7
+                return next(work.needs) and 7 or 12
             end,
             cooldown = 0.4,
+            ready = work.canCollect,
             run = pickups,
         },
         {
             key = "cooked",
-            priority = 5,
+            priority = 4.5,
             cooldown = 3,
             ready = function()
-                return built("Campfire") and (campData.readyCount or 0) > 0
+                return work.canCollect() and built("Campfire") and (campData.readyCount or 0) > 0
             end,
             run = function()
-                return call("MakeFire", "collectFood")
+                return travel(built("Campfire"), "cooked") and work.request("cooked", "MakeFire", "collectFood")
             end,
         },
         {
             key = "craft",
-            priority = 6,
+            priority = 5,
             cooldown = 3,
             ready = function()
                 return not selectedEmpty("craft")
@@ -2421,7 +2719,7 @@ local function runIslandEscape()
         {
             key = "build",
             priority = function()
-                return built("Campfire") and 8 or 3.3
+                return built("Campfire") and 6 or 3.3
             end,
             cooldown = 4,
             ready = function()
@@ -2431,31 +2729,20 @@ local function runIslandEscape()
         },
         {
             key = "cook",
-            priority = 8,
+            priority = 4,
             cooldown = 4,
-            ready = function()
-                return built("Campfire") and not selectedEmpty("cook")
-            end,
-            run = function()
-                local c = config()
-                for id in pairs(selected.cook or {}) do
-                    local i = c.item.byId[id]
-                    if allowed("cook", id) and i and count(i.displayName) > 0 then
-                        return call("MakeFire", "addFood", id)
-                    end
-                end
-                note("cook", "NO SELECTED FOOD IN BAG")
-            end,
+            ready = work.cookReady,
+            run = work.cook,
         },
         {
             key = "smeltCollect",
             priority = 8.5,
             cooldown = 3,
             ready = function()
-                return built("Furnace") and (furnaceData.readyCount or 0) > 0
+                return work.canCollect() and built("Furnace") and (furnaceData.readyCount or 0) > 0
             end,
             run = function()
-                return call("Furnace", "collectResult")
+                return travel(built("Furnace"), "smeltCollect") and work.request("smeltCollect", "Furnace", "collectResult")
             end,
         },
         {
@@ -2463,21 +2750,21 @@ local function runIslandEscape()
             priority = 9,
             cooldown = 10,
             ready = function()
-                return built("Water Maker") ~= nil
+                return work.canCollect() and built("Water Maker") ~= nil
             end,
             run = function()
-                return call("WaterMaker", "collect")
+                return travel(built("Water Maker"), "water") and work.request("water", "WaterMaker", "collect")
             end,
         },
         {
             key = "smelt",
-            priority = 9.5,
+            priority = 6.2,
             cooldown = 5,
             ready = function()
                 return built("Furnace") ~= nil
             end,
             run = function()
-                return call("Furnace", "addBoth")
+                return travel(built("Furnace"), "smelt") and work.request("smelt", "Furnace", "addBoth")
             end,
         },
         {
@@ -2499,9 +2786,10 @@ local function runIslandEscape()
         {
             key = "gather",
             priority = function()
-                return next(work.needs) and 6.5 or 12
+                return next(work.needs) and 7.5 or 13
             end,
             cooldown = 0.3,
+            ready = work.canCollect,
             run = gatherResource,
         },
         {
@@ -2590,13 +2878,15 @@ local function runIslandEscape()
                     return work.pick(jobsList, now)
                 end)
                 if fish.state ~= "idle" and flags.fish then
-                    -- Do not interrupt an active minigame for routine chores.
-                    local urgent = job and (job.key == "eat" or job.key == "combat" or job.key == "escape" or job.key == "fuel")
-                    if not urgent then
-                        safely("fish", fishTick)
-                        return
+                    -- A cast owns its turn until completion, cancellation or timeout.
+                    work.active = "fish"
+                    queueLabel.Text = "JOB: FISH"
+                    safely("fish", fishTick)
+                    if fish.state == "idle" then
+                        work.active = nil
+                        due.fish = os.clock() + 2
                     end
-                    cancelFishing()
+                    return
                 elseif fish.state ~= "idle" then
                     cancelFishing()
                 end
@@ -2610,13 +2900,17 @@ local function runIslandEscape()
                 note("queue", "ACTIVE: " .. job.key:upper())
                 local before = work.sent
                 local result = safely(job.key, job.run)
-                local acted = result == true or work.sent > before
-                due[job.key] = os.clock() + (acted and job.cooldown or math.max(2, job.cooldown))
+                local acted = result == true
+                local requested = work.sent > before
+                due[job.key] = os.clock() + (acted and job.cooldown or math.max(5, job.cooldown * 2))
+                if requested and not acted then
+                    note("queue", job.key:upper() .. " REQUEST NOT CONFIRMED")
+                end
                 work.waiting[job.key] = nil
                 work.active = nil
                 queueLabel.Text = "LAST JOB: " .. job.key:upper()
                 if not acted then
-                    note("queue", job.key:upper() .. " WAITING; OTHER JOBS CAN RUN")
+                    note("queue", job.key:upper() .. " STOPPED / WAITING / UNCONFIRMED; NEXT READY JOB")
                 end
             end)
             if not ok then
