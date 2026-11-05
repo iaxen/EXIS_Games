@@ -3298,7 +3298,6 @@ function ui.layout.placeRow(row, plan)
     end
     local started = os.clock()
     repeat
-        task.wait(0.1)
         if not enabled("houseLayout") then
             return false, "STOPPED"
         end
@@ -3315,6 +3314,7 @@ function ui.layout.placeRow(row, plan)
                 return true
             end
         end
+        task.wait() -- Resume on the next frame only while confirmation is pending.
     until os.clock() - started >= 4
     return false, "PLACEMENT NOT CONFIRMED"
 end
@@ -3339,7 +3339,6 @@ function ui.layout.buyOne(row, plan)
     fire("HouseAction", "buy", row.id)
     local started = os.clock()
     repeat
-        task.wait(0.1)
         if not enabled("houseLayout") then
             return false, "STOPPED"
         end
@@ -3348,6 +3347,7 @@ function ui.layout.buyOne(row, plan)
         if ui.layout.bag(row.id) > before then
             return true
         end
+        task.wait() -- Resume on the next frame only while confirmation is pending.
     until os.clock() - started >= 4
     return false, "BUY NOT CONFIRMED / UNAVAILABLE OR INSUFFICIENT FUNDS"
 end
@@ -3394,7 +3394,7 @@ function ui.layout.apply(buyMissing)
             local plan = ui.layout.plan(data)
             local complete, deferred, failures, blocked = 0, {}, {}, {}
             -- First finish all existing moves/keeps and copies currently in the bag.
-            for _, row in ipairs(plan.rows) do
+            for index, row in ipairs(plan.rows) do
                 if not enabled("houseLayout") then
                     return
                 end
@@ -3407,10 +3407,12 @@ function ui.layout.apply(buyMissing)
                 end
                 ui.layout.say(("OWNED FIRST: %d / %d • PENDING %d")
                     :format(complete, #plan.rows, #deferred))
-                task.wait(0.15)
+                if index % 20 == 0 then
+                    task.wait() -- Yield during long runs of kept or missing rows.
+                end
             end
             -- Only after the owned pass, buy at most one copy and place it immediately.
-            for _, row in ipairs(deferred) do
+            for index, row in ipairs(deferred) do
                 if not enabled("houseLayout") then
                     return
                 end
@@ -3426,6 +3428,9 @@ function ui.layout.apply(buyMissing)
                 if row.pendingReason then
                     local key = row.id .. " [" .. row.pendingReason .. "]"
                     failures[key] = (failures[key] or 0) + 1
+                end
+                if index % 20 == 0 then
+                    task.wait()
                 end
             end
             local pending = {}
