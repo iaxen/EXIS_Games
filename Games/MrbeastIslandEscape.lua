@@ -11,8 +11,8 @@ local function runIslandEscape()
  local previous=pg:FindFirstChild("EXISIslandEscape")
  if previous then previous:Destroy() end
  local gui=Instance.new("ScreenGui");gui.Name="EXISIslandEscape";gui.ResetOnSpawn=false;gui.DisplayOrder=2147483647;gui.Parent=pg
- local alive=true;local connections={};local flags={};local selected={};local modules={};local failed={};local due={}
- local opts={move="Walk",interval=0.7,health=50,hunger=40,fuel=3}
+ local alive=true;local connections={};local flags={};local selected={};local modules={};local failed={};local due={};local taskStatus={};local recentErrors={}
+ local opts={move="Teleport",interval=0.7,health=50,hunger=40,fuel=3}
  local path="exis_island_"..player.UserId.."_"..game.PlaceId..".json"
  local blue=Color3.fromRGB(83,158,244);local white=Color3.fromRGB(226,234,245)
  local function make(class,props,parent)local o=Instance.new(class);for k,v in pairs(props)do o[k]=v end;o.Parent=parent;return o end
@@ -22,11 +22,42 @@ local function runIslandEscape()
  make("UIStroke",{Color=Color3.fromRGB(45,76,112),Thickness=1},panel)
  local head=make("TextLabel",{Size=UDim2.new(1,-60,0,30),Text="  EXIScript | MrbeastIslandEscape",TextSize=11,Font=Enum.Font.BuilderSansBold,TextColor3=blue,BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left,Active=true},panel)
  local function button(parent,text,fn)
-  local b=make("TextButton",{Size=UDim2.new(1,0,0,27),Text=text:upper(),TextSize=10,Font=Enum.Font.BuilderSansMedium,TextColor3=white,BackgroundColor3=Color3.fromRGB(20,33,50),BorderSizePixel=0},parent);round(b)
+  local b=make("TextButton",{Size=UDim2.new(1,0,0,27),Text=text:upper(),TextSize=11,Font=Enum.Font.BuilderSansMedium,TextColor3=white,BackgroundColor3=Color3.fromRGB(20,33,50),BorderSizePixel=0},parent);round(b)
   b.Activated:Connect(function()local ok,e=pcall(fn);if not ok then warn("EXIScript: "..tostring(e))end end);return b
  end
  local status=make("TextLabel",{Position=UDim2.new(0,90,1,-20),Size=UDim2.new(1,-95,0,18),Text="READY",TextSize=10,TextTruncate=Enum.TextTruncate.AtEnd,Font=Enum.Font.BuilderSans,TextColor3=blue,BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left},panel)
  local function say(s)status.Text=tostring(s)end
+ local function note(key,message)taskStatus[key]=message end
+ local function safely(key,fn)
+  local ok,result=pcall(fn)
+  if not ok then
+   local message=tostring(result):gsub("^.-:%d+: ","")
+   note(key,"ERROR: "..message);say(key:upper()..": "..message)
+   recentErrors[#recentErrors+1]=key..": "..message;if #recentErrors>12 then table.remove(recentErrors,1)end
+   return false
+  end
+  return result
+ end
+ local englishTranslator=nil
+ local labelCache={}
+ task.spawn(function()pcall(function()englishTranslator=game:GetService("LocalizationService"):GetTranslatorForLocaleAsync("en-us")end)end)
+ local function readable(value)
+  if type(value)~="string"or value==""then return end
+  if not value:find("[\128-\255]")and value:find("%a")then return value end
+  if labelCache[value]then return labelCache[value]end
+  if englishTranslator then local ok,t=pcall(function()return englishTranslator:Translate(game,value)end)
+   if ok and type(t)=="string"and t:find("%a")and not t:find("[\128-\255]")then labelCache[value]=t;return t end
+  end
+ end
+ local function itemLabel(kind,id,info,index)
+  local c=modules.Config;local item=c and c.item and c.item.byId and c.item.byId[id]
+  for _,entry in ipairs({info,item or {}})do
+   for _,field in ipairs({"displayName","DisplayName","englishName","enName","name","assetId","id"})do
+    local t=readable(entry[field]);if t then return t end
+   end
+  end
+  return readable(tostring(id))or(kind:upper().." "..string.format("%03d",index or 0))
+ end
  local function save()if type(writefile)=="function"then local ok,e=pcall(function()writefile(path,HTTP:JSONEncode({version=1,flags=flags,selected=selected,options=opts}))end);if not ok then say(e)end end end
  if type(readfile)=="function"then pcall(function()local d=HTTP:JSONDecode(readfile(path));if d.version==1 then
   if type(d.flags)=="table"then for k,v in pairs(d.flags)do if type(v)=="boolean"then flags[k]=v end end end
@@ -35,6 +66,10 @@ local function runIslandEscape()
  end end)end
  local function module(name)
   if modules[name]then return modules[name]end
+  if name=="Config"then
+   local lib=RS:FindFirstChild("Module");local service=lib and lib:FindFirstChild("Service");local cloud=service and service:FindFirstChild("CloudConfig");local remote=cloud and cloud:FindFirstChild("getAllConfigFunction")
+   if remote then local ok,data=pcall(function()return remote:InvokeServer()end);if ok and type(data)=="table"and data.item then modules.Config=data;return data end end
+  end
   if failed[name]and os.clock()-failed[name]<15 then return end
   local engine=RS:FindFirstChild("Engine");local lib=RS:FindFirstChild("Module")
   local source=(engine and engine:FindFirstChild("Service")and engine.Service:FindFirstChild(name))or(lib and lib:FindFirstChild("Service")and lib.Service:FindFirstChild(name))
@@ -42,21 +77,40 @@ local function runIslandEscape()
   local ok,m=pcall(require,source);if ok then modules[name]=m;return m end
   failed[name]=os.clock();say(name.." unavailable")
  end
+ local remoteActions={
+  ItemCollect={collect="collectRemote"},MakeFire={addWood="addWoodRemote",addFood="addFoodRemote",collectFood="collectFoodRemote"},
+  Furnace={addBoth="addTaskRemote",collectResult="collectResultRemote"},WaterMaker={collect="collectRemote"},
+  CraftItems={craft="craftRemote"},BuildBuilding={build="buildRemote"},
+  ChestService={requestOpen="RequestOpenEvent",isOpened="IsOpenedFunction",isLocked="IsLockedFunction"},
+  PuzzlePropService={requestSolve="RequestSolveEvent",isSolved="IsSolvedFunction"},
+  DailyReward={claim="claimRemote"},WeekReward={claim="claimRemote"},PlayTimeReward={claim="claimRemote"},DailyQuest={claim="claimRemote"},
+ }
  local function call(name,action,...)
+  local remoteName=remoteActions[name]and remoteActions[name][action]
+  if remoteName then
+   local source=RS.Engine.Service:FindFirstChild(name)
+   local lib=RS:FindFirstChild("Module");source=source or(lib and lib:FindFirstChild("Service")and lib.Service:FindFirstChild(name))
+   local remote=source and source:FindFirstChild(remoteName)
+   assert(remote,name.." remote unavailable in this server")
+   if remote:IsA("RemoteFunction")then return remote:InvokeServer(...)end
+   if name=="Furnace"and action=="addBoth"then remote:FireServer("both")else remote:FireServer(...)end
+   note(name.."."..action,"REQUEST SENT");return true
+  end
   local m=module(name);assert(m and m.client and type(m.client[action])=="function",name.."."..action.." unavailable")
   return m.client[action](...)
  end
  local function world()return workspace:FindFirstChild("Game")end
  local function root()local c=player.Character;local h=c and c:FindFirstChildOfClass("Humanoid");return h and h.Health>0 and c:FindFirstChild("HumanoidRootPart"),h end
  local function pos(o)if o:IsA("BasePart")then return o.Position elseif o:IsA("Model")then return o:GetPivot().Position end end
- local function travel(o,key)
-  local r,h=root();local p=typeof(o)=="Vector3"and o or pos(o);if not r or not p then return false end
+ local function travel(o,key,radius)
+  local r,h=root();local p=typeof(o)=="Vector3"and o or pos(o);if not r or not p then note(key,"CHARACTER OR TARGET NOT READY");return false end
+  radius=radius or 6
   local distance=(r.Position-p).Magnitude
-  if distance<=6 then return true end
-  if opts.move=="Teleport"then r.CFrame=CFrame.lookAt(p+Vector3.new(3,2,3),p);task.wait(0.2);return alive and flags[key]==true end
-  h:MoveTo(p);local started=os.clock()
-  repeat task.wait(0.1);r,h=root();if not alive or not flags[key]or not r then return false end until (r.Position-p).Magnitude<=6 or os.clock()-started>=2
-  return (r.Position-p).Magnitude<=6
+  if distance<=radius then return true end
+  if opts.move=="Teleport"then r.CFrame=CFrame.lookAt(p+Vector3.new(math.min(2,radius/2),0.5,0),p);task.wait(0.2);return alive and flags[key]==true end
+  note(key,"WALKING TO TARGET");h:MoveTo(p);local started=os.clock()
+  repeat task.wait(0.1);r,h=root();if not alive or not flags[key]or not r then return false end until (r.Position-p).Magnitude<=radius or os.clock()-started>=2
+  return (r.Position-p).Magnitude<=radius
  end
  local function tools()local t={};for _,p in ipairs({player:FindFirstChild("Backpack"),player.Character})do if p then for _,o in ipairs(p:GetChildren())do if o:IsA("Tool")then t[#t+1]=o end end end end;return t end
  local function count(name)local n=0;for _,o in ipairs(tools())do if o.Name==name then n=n+(o:GetAttribute("count")or 1)end end;return n end
@@ -77,7 +131,7 @@ local function runIslandEscape()
   make("UIListLayout",{Padding=UDim.new(0,5)},p);pages[name]=p
   local b=button(nav,name,function()for n,f in pairs(pages)do f.Visible=n==name;tabButtons[n].TextColor3=n==name and blue or white end end);tabButtons[name]=b;return p
  end
- local function text(p,t)return make("TextLabel",{Size=UDim2.new(1,-4,0,0),AutomaticSize=Enum.AutomaticSize.Y,Text=t,TextSize=10,TextWrapped=true,Font=Enum.Font.BuilderSans,TextColor3=Color3.fromRGB(164,181,202),BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left},p)end
+ local function text(p,t)return make("TextLabel",{Size=UDim2.new(1,-4,0,0),AutomaticSize=Enum.AutomaticSize.Y,Text=t,TextSize=11,TextWrapped=true,Font=Enum.Font.BuilderSans,TextColor3=Color3.fromRGB(164,181,202),BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left},p)end
  local function group(p,name)
   local f=make("Frame",{Size=UDim2.new(1,-4,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundColor3=Color3.fromRGB(16,24,35),BorderSizePixel=0},p);round(f);make("UIStroke",{Color=Color3.fromRGB(35,53,76),Thickness=1},f);make("UIListLayout",{},f)
   local body=make("Frame",{LayoutOrder=1,Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,Visible=false,BackgroundTransparency=1},f);make("UIListLayout",{Padding=UDim.new(0,3)},body);make("UIPadding",{PaddingLeft=UDim.new(0,5),PaddingRight=UDim.new(0,5),PaddingBottom=UDim.new(0,5)},body)
@@ -87,9 +141,18 @@ local function runIslandEscape()
   local entry={frame=f,body=body,button=b,name=name:upper()};groups[#groups+1]=entry;b.LayoutOrder=0
   return body,entry
  end
+ local function switch(p,label,get,set)
+  local b=button(p,"",function()set(not get());save()end)
+  make("TextLabel",{Position=UDim2.fromOffset(7,0),Size=UDim2.new(1,-47,1,0),Text=label:upper(),TextSize=11,
+   TextWrapped=true,Font=Enum.Font.BuilderSans,TextColor3=white,BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left},b)
+  local track=make("Frame",{Position=UDim2.new(1,-33,0.5,-6),Size=UDim2.fromOffset(25,12),BorderSizePixel=0},b);round(track)
+  local knob=make("Frame",{Size=UDim2.fromOffset(8,8),BackgroundColor3=white,BorderSizePixel=0},track);round(knob)
+  local function render()track.BackgroundColor3=get()and blue or Color3.fromRGB(47,59,75);knob.Position=UDim2.fromOffset(get()and 15 or 2,2)end
+  b.Activated:Connect(render);render();return render
+ end
  local function toggle(p,key,label,description)
-  local b=button(p,"",function()flags[key]=not flags[key];toggles[key]();save()end)
-  toggles[key]=function()b.Text=(flags[key]and"●  "or"○  ")..label:upper();b.TextColor3=flags[key]and blue or white end;toggles[key]();if description then text(p,description)end
+  toggles[key]=switch(p,label,function()return flags[key]==true end,function(value)flags[key]=value;note(key,value and "ENABLED"or"OFF");toggles[key]()end)
+  if description then text(p,description)end
  end
  local function number(p,key,label,min,max)
   text(p,label);local b=make("TextBox",{Size=UDim2.new(1,0,0,26),Text=tostring(opts[key]),ClearTextOnFocus=false,TextSize=11,Font=Enum.Font.BuilderSans,TextColor3=white,BackgroundColor3=Color3.fromRGB(21,32,47)},p);round(b)
@@ -97,14 +160,14 @@ local function runIslandEscape()
  end
  local main=page("Main");local resources=page("Gather");local camp=page("Camp");local craft=page("Craft");local questPage=page("Quests");local explore=page("Explore");local settings=page("Settings")
  local survival=group(main,"SURVIVAL")
- toggle(survival,"eat","Auto eat","Uses selected food below when health or hunger is low. No food selected = disabled.")
+ toggle(survival,"eat","Auto eat","Uses selected food when health or hunger is low. Select food below.")
  number(survival,"health","HEALTH BELOW (%)",1,100);number(survival,"hunger","HUNGER BELOW (%)",1,100)
  local combat=group(main,"DEFENCE")
  toggle(combat,"combat","Auto defend against nearby enemies","Uses your equipped melee tool on nearby NPCs. Never targets players.")
  local fishing=group(main,"FISHING")
- toggle(fishing,"fish","Auto cast and reel","Equip a rod and face water. Casts and reels automatically; complete the fish minigame normally. Pauses movement jobs.")
+ toggle(fishing,"fish","Auto cast and reel","Equip a rod and face water. Casts and reels automatically; complete the fish minigame normally. Movement pauses only during an active cast.")
  local gather=group(resources,"RESOURCE FARMING")
- toggle(gather,"gather","Auto gather selected resources","Uses a matching owned tool. Choose resources below.")
+ toggle(gather,"gather","Auto gather selected resources","Uses a matching owned tool. No selection = all available resources.")
  local drops=group(resources,"DROPPED ITEMS")
  toggle(drops,"drops","Auto collect drops","All unprotected drops when no items are selected below. Respects owner protection.")
  local fire=group(camp,"CAMPFIRE")
@@ -130,8 +193,14 @@ local function runIslandEscape()
  local moveButton;moveButton=button(session,"MOVE: "..opts.move,function()opts.move=opts.move=="Walk"and"Teleport"or"Walk";moveButton.Text="MOVE: "..opts.move:upper();save()end)
  number(session,"interval","ACTION DELAY (SECONDS)",0.2,5)
  local diag=group(settings,"DIAGNOSTICS");button(diag,"CHECK GAME SERVICES",function()local ready={};for _,n in ipairs({"Config","ItemCollect","MakeFire","Furnace","CraftItems","BuildBuilding","MrbeastQuest","ChestService"})do ready[#ready+1]=n..": "..(module(n)and"OK"or"UNAVAILABLE")end;say(table.concat(ready," | "))end)
+ local diagnosticText=text(diag,"NO ERRORS RECORDED")
+ local function refreshDiagnostics()
+  local lines={};for key in pairs(toggles)do lines[#lines+1]=key:upper()..": "..(flags[key]and(taskStatus[key]or"WAITING")or"OFF")end;table.sort(lines)
+  diagnosticText.Text=table.concat(lines,"\n").."\n\nRECENT ERRORS\n"..(#recentErrors>0 and table.concat(recentErrors,"\n")or"NONE")
+ end
+ button(diag,"COPY DIAGNOSTICS",function()refreshDiagnostics();assert(type(setclipboard)=="function","Clipboard unavailable");setclipboard(diagnosticText.Text);say("DIAGNOSTICS COPIED")end)
  local clockLabel=text(main,"DAY / PHASE: WAITING")
- local launcher=button(gui,"EXIS",function()panel.Visible=true end);launcher.Size=UDim2.fromOffset(46,28);launcher.Position=UDim2.fromOffset(12,90);launcher.Visible=false
+ local launcher=button(gui,"EXIS",function()panel.Visible=true;launcher.Visible=false end);launcher.Size=UDim2.fromOffset(32,32);launcher.TextSize=10;launcher.Font=Enum.Font.BuilderSansBold;launcher:FindFirstChildOfClass("UICorner").CornerRadius=UDim.new(0,4);launcher.Position=UDim2.fromOffset(12,90);launcher.Visible=false
  local mini=button(panel,"−",function()panel.Visible=false;launcher.Visible=true end);mini.Position=UDim2.new(1,-55,0,3);mini.Size=UDim2.fromOffset(24,24)
  local close=button(panel,"×",function()stopAll();gui:Destroy()end);close.Position=UDim2.new(1,-28,0,3);close.Size=UDim2.fromOffset(24,24)
  local dragging,start,origin
@@ -149,7 +218,12 @@ local function runIslandEscape()
     local g=group(parent,"SELECT "..kind)
     selected[kind]=selected[kind]or{}
     local ids={};for id,info in pairs(rows or{})do if type(info)=="table"and(not predicate or predicate(info))then ids[#ids+1]=id end end;table.sort(ids,function(a,b)return tostring(a)<tostring(b)end)
-    for _,id in ipairs(ids)do local item=rows[id];local key=id;local b;b=button(g,"",function()selected[kind][key]=not selected[kind][key];b.Text=(selected[kind][key]and"●  "or"○  ")..tostring(item.displayName or item.name or key):upper();save()end);b.Text=(selected[kind][key]and"●  "or"○  ")..tostring(item.displayName or item.name or key):upper()end
+    local renders={}
+    button(g,"SELECT ALL",function()for _,id in ipairs(ids)do selected[kind][id]=true end;for _,r in ipairs(renders)do r()end;save()end)
+    button(g,"CLEAR SELECTION",function()selected[kind]={};for _,r in ipairs(renders)do r()end;save()end)
+    for index,id in ipairs(ids)do local item=rows[id];local key=id
+     renders[#renders+1]=switch(g,itemLabel(kind,id,item,index),function()return selected[kind][key]==true end,function(v)selected[kind][key]=v end)
+    end
    end
    choices(resources,"resources",c.worldResource.byId)
    choices(resources,"drops",c.item.byId)
@@ -157,25 +231,22 @@ local function runIslandEscape()
    choices(camp,"cook",c.food.byId,function(i)return i.canCook==true end)
    choices(craft,"craft",c.item.byId,function(i)return i.recipeId and(i.type=="tool"or i.type=="armour")end)
    choices(craft,"build",c.build.byId)
-   for _,info in ipairs(c.build.list or{})do local name=info.assetId;if type(name)=="string"then button(destination,"GO TO "..name,function()flags.travel=true;task.spawn(function()local w=world();local b=w and w:FindFirstChild("Buildings");local target=b and(b:FindFirstChild(name)or b:FindFirstChild(name.."_Construct"));if target then travel(target,"travel")else say("BUILDING NOT LOADED")end;flags.travel=false end)end)end end
+   for _,info in ipairs(c.build.list or{})do local name=info.assetId;if type(name)=="string"then button(destination,"GO TO "..itemLabel("building",info.id or name,info),function()flags.travel=true;task.spawn(function()local w=world();local b=w and w:FindFirstChild("Buildings");local target=b and(b:FindFirstChild(name)or b:FindFirstChild(name.."_Construct"));if target then travel(target,"travel")else say("BUILDING NOT LOADED")end;flags.travel=false end)end)end end
   end);if not ok then say(e)end
  end)
  -- Reward data is read from the game's real replicated state.
  local rewardData={};local campData={};local furnaceData={}
- task.spawn(function()pcall(function()call("DailyReward","onSync",function(v)rewardData.daily=v end)end);pcall(function()call("WeekReward","onSync",function(v)rewardData.week=v end)end);pcall(function()call("PlayTimeReward","sync",function(v)rewardData.play=v end)end);pcall(function()call("DailyQuest","sync",function(v)rewardData.quest=v end)end)
+ for _,binding in ipairs({{"DailyReward","onSync","daily"},{"WeekReward","onSync","week"},{"PlayTimeReward","sync","play"},{"DailyQuest","sync","quest"}})do
+  task.spawn(function()safely("sync "..binding[1],function()call(binding[1],binding[2],function(v)rewardData[binding[3]]=v end)end)end)
+ end
+ task.spawn(function()
  local function syncRemote(name,fn)local m=RS:FindFirstChild("Engine");m=m and m:FindFirstChild("Service");m=m and m:FindFirstChild(name);local e=m and m:FindFirstChild("syncRemote");if e then connections[#connections+1]=e.OnClientEvent:Connect(fn)end end
  syncRemote("MakeFire",function(v)if type(v)=="table"then campData=v end end);syncRemote("Furnace",function(v)if type(v)=="table"then furnaceData=v end end)
  end)
- local function rewardTick()
-  if flags.daily and rewardData.daily=="canClaim"then call("DailyReward","claim")end
-  if flags.weekly and type(rewardData.week)=="table"then for i,v in pairs(rewardData.week.days or{})do if v=="Claim"then call("WeekReward","claim",i);break end end end
-  if flags.playtime and type(rewardData.play)=="table"then for id,v in pairs(rewardData.play.rewards or{})do if v.canClaim and not v.claimed then call("PlayTimeReward","claim",id);break end end end
-  if flags.dailyQuest and type(rewardData.quest)=="table"then for _,v in pairs(rewardData.quest.list or{})do if v.completed and not v.claimed then call("DailyQuest","claim",v.id);break end end end
- end
  local function eat()
   local r,h=root();if not r then return end;local hunger=h:GetAttribute("hunger");local max=h:GetAttribute("maxHunger")or 100
   if h.Health/h.MaxHealth*100>opts.health and(not hunger or hunger/max*100>opts.hunger)then return end
-  local c=config();for _,t in ipairs(tools())do local info=c.item.byDisplayName[t.Name];if info and allowed("food",info.id)then equip(t);t:Activate();return end end
+  local c=config();for _,t in ipairs(tools())do local info=c.item.byDisplayName[t.Name];if info and allowed("food",info.id)then equip(t);t:Activate();note("eat","FOOD ACTIVATED");return end end;note("eat","SELECT FOOD YOU OWN")
  end
  local function defend()
   local r,h=root();if not r then return end
@@ -194,15 +265,16 @@ local function runIslandEscape()
    if owner and owner~=player.Name and protected>workspace:GetServerTimeNow()then return false end
    local info=c.item.byDisplayName[x.Name];return not x:GetAttribute("collecting")and info and(selectedEmpty("drops")or allowed("drops",info.id))and not(failed[x]and failed[x]>os.clock())
   end)
-  if o and travel(o,"drops")then call("ItemCollect","collect",o);failed[o]=os.clock()+5;say("COLLECT: "..o.Name);return true end
+  if not o then note("drops","NO ELIGIBLE DROPS")end
+  if o and travel(o,"drops")then call("ItemCollect","collect",o);failed[o]=os.clock()+5;note("drops","COLLECT REQUEST SENT");say("COLLECT: "..(readable(o.Name)or"ITEM"));return true end
  end
  local function gatherResource()
-  local w=world();if not w then return end;local c=config();local best=nearest(w:GetDescendants(),function(o)return o:IsA("Model")and allowed("resources",o:GetAttribute("resourceId"))end)
-  if not best then return end
+  local w=world();if not w then return end;local c=config();local best=nearest(w:GetDescendants(),function(o)return o:IsA("Model")and o:GetAttribute("resourceId") and (selectedEmpty("resources") or allowed("resources",o:GetAttribute("resourceId"))) and not(failed[o]and failed[o]>os.clock())end)
+  if not best then note("gather","NO LOADED MATCHING RESOURCES");return end
   local rc=c.worldResource.byId[best:GetAttribute("resourceId")];local tool,tc
   for _,t in ipairs(tools())do local info=c.tool.byDisplayName[t.Name];if info and(rc.requireToolType=="any"or info.toolType==rc.requireToolType)and(not tc or(info.useDmg or 0)>(tc.useDmg or 0))then tool,tc=t,info end end
-  if not tool then say("MATCHING TOOL REQUIRED: "..best.Name);return end
-  if travel(best,"gather")then equip(tool);local r=root();local p=best:GetPivot().Position;r.CFrame=CFrame.lookAt(r.Position,Vector3.new(p.X,r.Position.Y,p.Z));local e=RS:FindFirstChild("Events");e=e and e:FindFirstChild("meleeHitRemote");if e then e:FireServer({},{best});task.wait(math.max(0.2,tc.useCd or 0.7));say("GATHER: "..best.Name)end;return true end
+  if not tool then note("gather","MATCHING TOOL REQUIRED");say("GATHER: MATCHING TOOL REQUIRED");failed[best]=os.clock()+5;return end
+  if travel(best,"gather",math.max(1,(tc.range or 6)-0.5))then equip(tool);local r=root();local p=best:GetPivot().Position;r.CFrame=CFrame.lookAt(r.Position,Vector3.new(p.X,r.Position.Y,p.Z));local e=RS:FindFirstChild("Events");e=e and e:FindFirstChild("meleeHitRemote");if e then e:FireServer({},{best});task.wait(math.max(0.2,tc.useCd or 0.7));note("gather","HIT REQUEST SENT");say("GATHER: "..itemLabel("resource",best:GetAttribute("resourceId"),rc))end;return true end
  end
  local function exploreTick(key,kind,service,check,request)
   local w=world();if not w then return end;local c=config();local rows=kind=="chest"and c.chest.byId or c.mapProp.byCnId
@@ -210,7 +282,7 @@ local function runIslandEscape()
   if not obj then return end;failed[obj]=os.clock()+20
   if call(service,check,obj)then return end
   if kind=="chest"and call(service,"isLocked",obj)then return end
-  if travel(obj,key)then call(service,request,obj);say(request..": "..obj.Name);return true end
+  if travel(obj,key)then call(service,request,obj);note(key,"INTERACTION REQUEST SENT");say(request..": "..(readable(obj.Name)or"OBJECT"));return true end
  end
  local function escapeTick()
   local w=world();if not w then return end
@@ -225,9 +297,10 @@ local function runIslandEscape()
   end
  end
  local function questTick()
+  local scene=world();if not scene or not scene:FindFirstChild("Mrbeast",true)then note("quest","QUEST AREA NOT LOADED");return end
   local q=module("MrbeastQuest");if not q then return end;local index,alt,revision=q.client.fetchQuest();local req=index and q.getQuestRequirement(index,alt)
   if not req then questInfo.Text="NO ACTIVE QUEST";return end
-  local c=config();local info=c.item.byId[req.itemId];questInfo.Text="NEEDS: "..tostring(req.count).." "..tostring(info and info.displayName or req.itemId)
+  local c=config();local info=c.item.byId[req.itemId];questInfo.Text="NEEDS: "..tostring(req.count).." "..itemLabel("quest item",req.itemId,info or{})
   if not info then return end
   local w=world();local mr=w and w:FindFirstChild("Mrbeast",true);local area=mr and mr:FindFirstChild("SuckArea");local drops=w and w:FindFirstChild("DroppedItems");if not area or not drops then return end
   local owned={};for _,o in ipairs(drops:GetChildren())do if o.Name==info.displayName and o:GetAttribute("ownerName")==player.Name then owned[#owned+1]=o end end
@@ -238,7 +311,7 @@ local function runIslandEscape()
   for _,o in ipairs(owned)do if o.Parent and pos(o)and(pos(o)-area.Position).Magnitude>5 then
    if not travel(o,"quest")then return end;call("ItemCollect","collect",o);task.wait(0.3);return true
   end end
-  q.client.submitQuest(owned,revision);task.wait(1);say("QUEST SUBMITTED");return true
+  q.client.submitQuest(owned,revision);note("quest","SUBMISSION REQUEST SENT");task.wait(1);say("QUEST SUBMITTED");return true
  end
  local fish={state="idle",at=0,tool=nil,mini=nil}
  local events=RS:FindFirstChild("Events")
@@ -258,45 +331,68 @@ local function runIslandEscape()
  end)
  local function fishTick()
   local r=root();if not r or not events then return end
-  if fish.state=="minigame"then say("COMPLETE FISH MINIGAME");return end
+  if fish.state=="minigame"then say("COMPLETE FISH MINIGAME");return true end
   if fish.state=="reeling"and os.clock()-fish.at>4 then fish.state="idle"end
-  if fish.state~="idle"then if os.clock()-fish.at>45 then events.fishCancelRemote:FireServer();fish.state="idle"end;return end
+  if fish.state~="idle"then if os.clock()-fish.at>45 then events.fishCancelRemote:FireServer();fish.state="idle"end;return fish.state~="idle"end
   local c=config();local rod
   for _,t in ipairs(tools())do local info=c.tool.byDisplayName[t.Name];if info and info.toolType=="鱼竿"then rod=t;break end end
-  if not rod then say("FISHING ROD REQUIRED");return end
+  if not rod then note("fish","FISHING ROD REQUIRED");return false end
   equip(rod);fish.tool=rod
   local direction=r.CFrame.LookVector*Vector3.new(1,0,1);local p=r.Position+direction.Unit*18
   local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include;params.FilterDescendantsInstances={workspace.Terrain,world().Tiles};params.IgnoreWater=false
   local hit=workspace:Raycast(p+Vector3.new(0,50,0),Vector3.new(0,-200,0),params)
-  if not hit or hit.Material~=Enum.Material.Water then say("FACE WATER TO CAST");return end
-  events.fishVisualRemote:FireServer("castBegin",rod.Name);events.fishCastRemote:FireServer(rod,hit.Position+Vector3.new(0,0.05,0));fish.state="waiting";fish.at=os.clock();say("FISHING: WAITING FOR BITE")
+  if not hit or hit.Material~=Enum.Material.Water then note("fish","FACE WATER TO CAST");return false end
+  events.fishVisualRemote:FireServer("castBegin",rod.Name);events.fishCastRemote:FireServer(rod,hit.Position+Vector3.new(0,0.05,0));fish.state="waiting";fish.at=os.clock();say("FISHING: WAITING FOR BITE");return true
  end
+ local function limited(key,seconds,fn)
+  if not flags[key]or(due[key]and os.clock()<due[key])then return end
+  due[key]=os.clock()+seconds
+  return safely(key,fn)
+ end
+ local movementTurn=0
+ local function craftTick()
+  local c=config();if selectedEmpty("craft")then note("craft","SELECT ITEMS FIRST");return end
+  for id in pairs(selected.craft or{})do local i=c.item.byId[id];if allowed("craft",id)and i and count(i.displayName)==0 and recipeReady(i)then call("CraftItems","craft",id);note("craft","CRAFT REQUEST SENT");return end end
+  note("craft","OWNED ALREADY OR NEED MATERIALS")
+ end
+ local function buildTick()
+  local w=world();local c=config();local b=w and w:FindFirstChild("Buildings")
+  if selectedEmpty("build")then note("build","SELECT BUILDINGS FIRST");return end
+  for id in pairs(selected.build or{})do local i=c.build.byId[id];if allowed("build",id)and i and b and b:FindFirstChild(i.assetId.."_Construct")then call("BuildBuilding","build",id);note("build","CONTRIBUTION REQUEST SENT");return end end
+  note("build","NO SELECTED ACTIVE CONSTRUCTION")
+ end
+ local moves={
+  {"quest",questTick},{"escape",escapeTick},
+  {"chests",function()return exploreTick("chests","chest","ChestService","isOpened","requestOpen")end},
+  {"puzzles",function()return exploreTick("puzzles","puzzle","PuzzlePropService","isSolved","requestSolve")end},
+  {"drops",pickups},{"gather",gatherResource},
+ }
  task.spawn(function()
   while alive do
-   local ok,e=pcall(function()
-    local w=world();if w then local d=w:FindFirstChild("Day");local phase=w:FindFirstChild("Phase");clockLabel.Text="DAY "..tostring(d and d.Value or"—").."  |  "..tostring(phase and phase.Value or"—")end
-    if not due.rewards or os.clock()>due.rewards then due.rewards=os.clock()+10;rewardTick()end
-    if flags.eat then eat()end
-    if flags.combat then defend()end
-    if flags.fish then fishTick();return elseif fish.state~="idle"then if fish.mini then fish.mini:cancel();fish.mini=nil end;if events and events:FindFirstChild("fishCancelRemote")then events.fishCancelRemote:FireServer()end;fish.state="idle"end
-    if flags.travel then return end
-    if flags.escape and(not due.escape or os.clock()>due.escape)and escapeTick()then return end
-    if flags.quest and(not due.quest or os.clock()>due.quest)then due.quest=os.clock()+4;if questTick()then return end end
-    if flags.fuel and(not due.fuel or os.clock()>due.fuel)then due.fuel=os.clock()+4;if type(campData.campfireWoodCount)=="number"and campData.campfireWoodCount<opts.fuel then call("MakeFire","addWood")end end
-    if flags.cooked and(campData.readyCount or 0)>0 then call("MakeFire","collectFood")end
-    if flags.cook and(not due.cook or os.clock()>due.cook)then due.cook=os.clock()+4;local c=config();for id in pairs(selected.cook or{})do local info=c.item.byId[id];if allowed("cook",id)and info and count(info.displayName)>0 then call("MakeFire","addFood",id);break end end end
-    if flags.smeltCollect and(furnaceData.readyCount or 0)>0 then call("Furnace","collectResult")end
-    if flags.smelt and(not due.smelt or os.clock()>due.smelt)then due.smelt=os.clock()+5;call("Furnace","addBoth")end
-    if flags.water and(not due.water or os.clock()>due.water)then due.water=os.clock()+10;call("WaterMaker","collect")end
-    local c=config()
-    if flags.craft then for id in pairs(selected.craft or{})do local i=c.item.byId[id];if allowed("craft",id)and i and count(i.displayName)==0 and recipeReady(i)then call("CraftItems","craft",id);task.wait(0.5);return end end end
-    if flags.build and(not due.build or os.clock()>due.build)then due.build=os.clock()+5;local b=w and w:FindFirstChild("Buildings");for id in pairs(selected.build or{})do local i=c.build.byId[id];if allowed("build",id)and i and b and b:FindFirstChild(i.assetId.."_Construct")then call("BuildBuilding","build",id);return end end end
-    if flags.chests and exploreTick("chests","chest","ChestService","isOpened","requestOpen")then return end
-    if flags.puzzles and exploreTick("puzzles","puzzle","PuzzlePropService","isSolved","requestSolve")then return end
-    if flags.drops and pickups()then return end
-    if flags.gather then gatherResource()end
-   end)
-   if not ok then say(tostring(e));warn("EXIScript Island: "..tostring(e))end
+   safely("clock",function()local w=world();if w then local d=w:FindFirstChild("Day");local phase=w:FindFirstChild("Phase");clockLabel.Text="DAY "..tostring(d and d.Value or"—").." | "..tostring(phase and phase.Value or"—")end end)
+   limited("eat",2,eat);limited("combat",opts.interval,defend)
+   -- Failed reward calls cannot abort camp jobs or movement workers.
+   limited("daily",10,function()if rewardData.daily=="canClaim"then call("DailyReward","claim")else note("daily","NOT CLAIMABLE")end end)
+   limited("weekly",10,function()for i,v in pairs((rewardData.week or{}).days or{})do if v=="Claim"then call("WeekReward","claim",i);return end end;note("weekly","NOT CLAIMABLE")end)
+   limited("playtime",10,function()for id,v in pairs((rewardData.play or{}).rewards or{})do if v.canClaim and not v.claimed then call("PlayTimeReward","claim",id);return end end;note("playtime","NOT CLAIMABLE")end)
+   limited("dailyQuest",10,function()for _,v in pairs((rewardData.quest or{}).list or{})do if v.completed and not v.claimed then call("DailyQuest","claim",v.id);return end end;note("dailyQuest","NO COMPLETED REWARDS")end)
+   limited("fuel",4,function()if type(campData.campfireWoodCount)~="number"then note("fuel","WAITING FOR CAMPFIRE STATE")elseif campData.campfireWoodCount<opts.fuel then call("MakeFire","addWood")else note("fuel","FUEL TARGET REACHED")end end)
+   limited("cooked",3,function()if(campData.readyCount or 0)>0 then call("MakeFire","collectFood")else note("cooked","NO READY FOOD / WAITING FOR STATE")end end)
+   limited("cook",4,function()local c=config();for id in pairs(selected.cook or{})do local i=c.item.byId[id];if allowed("cook",id)and i and count(i.displayName)>0 then call("MakeFire","addFood",id);return end end;note("cook","SELECT COOKABLE FOOD YOU OWN")end)
+   limited("smeltCollect",3,function()if(furnaceData.readyCount or 0)>0 then call("Furnace","collectResult")else note("smeltCollect","NO READY OUTPUT / WAITING FOR STATE")end end)
+   limited("smelt",5,function()call("Furnace","addBoth")end)
+   limited("water",10,function()call("WaterMaker","collect")end)
+   limited("craft",3,craftTick);limited("build",5,buildTick)
+   local fishingActive=false
+   if flags.fish then fishingActive=safely("fish",fishTick)==true
+   elseif fish.state~="idle"then safely("fish",function()if fish.mini then fish.mini:cancel();fish.mini=nil end;if events and events:FindFirstChild("fishCancelRemote")then events.fishCancelRemote:FireServer()end;fish.state="idle"end)end
+   if not fishingActive and not flags.travel then
+    -- One bounded movement action per loop; every enabled worker gets a turn.
+    for _=1,#moves do movementTurn=movementTurn%#moves+1;local job=moves[movementTurn]
+     if flags[job[1]]then safely(job[1],job[2]);break end
+    end
+   end
+   refreshDiagnostics()
    task.wait(math.max(0.2,opts.interval))
   end
  end)
