@@ -2940,7 +2940,8 @@ function ui.layout.atTarget(model,row,floors)
     local bottom=cf.Position.Y-size.Y/2
     local closest,best=nil,math.huge
     for index,floor in ipairs(floors) do
-        local distance=math.abs(bottom-(floor.Position.Y+floor.Size.Y/2))
+        local surface = floor.Position.Y + floor.Size.Y / 2
+        local distance = math.min(math.abs(bottom - surface), math.abs(position.Y - surface))
         if distance<best then closest,best=index,distance end
     end
     if closest~=row.floor then return false end
@@ -3229,7 +3230,13 @@ function ui.layout.cancel()
     ui.layout.clearPreview()
     ui.layout.say("HOUSE BUILD STOPPED • COMPLETED CHANGES REMAIN")
 end
-sessionOptions.houseCleanup=ui.layout.clearPreview
+sessionOptions.houseCleanup=function()
+    ui.layout.clearPreview()
+    if ui.layout.feedbackConnection then
+        ui.layout.feedbackConnection:Disconnect()
+        ui.layout.feedbackConnection=nil
+    end
+end
 function ui.layout.roomFor(id, interior)
     local items = ui.layout.catalog()
     local level = tonumber(player:GetAttribute("HouseLevel")) or 1
@@ -3255,207 +3262,271 @@ function ui.layout.roomFor(id, interior)
     return true
 end
 
-function ui.layout.placeRow(row, plan)
-    if not enabled("houseLayout") then
-        return false, "STOPPED"
+function ui.layout.balance(name)
+    for _, folderName in ipairs({"leaderstats", "Inventory"}) do
+        local folder = player:FindFirstChild(folderName)
+        local value = folder and folder:FindFirstChild(name)
+        if value and (value:IsA("IntValue") or value:IsA("NumberValue")) then
+            return value.Value
+        end
     end
+end
+
+function ui.layout.purchaseReady(row, plan)
+    local room, reason = ui.layout.roomFor(row.id, plan.interior)
+    if not room then return false, reason end
+    local info = ui.layout.catalog().Furniture[row.id]
+    if info.Robux then return false, "ROBUX PURCHASE REQUIRED" end
+    if info.Event and workspace:GetAttribute("Festival") ~= info.Event then
+        return false, "EVENT UNAVAILABLE: " .. tostring(info.Event)
+    end
+    for _, name in ipairs({"Coins", "Wood", "Candy"}) do
+        local price = tonumber(info[name]) or 0
+        if price > 0 then
+            local balance = ui.layout.balance(name)
+            if balance == nil then return false, name:upper() .. " NOT LOADED" end
+            if balance < price then
+                return false, ("NEED %s %s; HAVE %s"):format(price, name:upper(), balance)
+            end
+        end
+    end
+    return true
+end
+
+function ui.layout.live(plan)
+    if not enabled("houseLayout") then return false end
     assert(player:GetAttribute("InHouse") == player.UserId, "You left your own house.")
-    local current = ui.layout.interior()
-    assert(current == plan.interior, "Your house interior changed.")
-    local before, existing, bagBefore = {}, nil, nil
-    for _, entry in ipairs(ui.layout.placed(current)) do
-        before[entry.index] = true
-        if entry.index == row.sourceIndex and entry.id == row.id then
-            existing = entry.model
-        end
-        if entry.id == row.id and entry.index == row.confirmedIndex
+    assert(ui.layout.interior() == plan.interior, "Your house interior changed.")
+    return true
+end
+
+function ui.layout.reason(fallback, serial)
+    if (ui.layout.feedbackSerial or 0) > (serial or 0) and ui.layout.feedbackText then
+        return fallback .. ": " .. ui.layout.feedbackText
+    end
+    return fallback
+end
+
+function ui.layout.send(plan, ...)
+    while os.clock() - (plan.lastSent or -math.huge) < (plan.retryPace or 0) do
+        if not ui.layout.live(plan) then return false end
+        task.wait()
+    end
+    if not ui.layout.live(plan) then return false end
+    plan.lastSent = os.clock()
+    fire("HouseAction", ...)
+    return true
+end
+
+function ui.layout.receipt(row, plan, request)
+    plan.claimed = plan.claimed or {}
+    for _, entry in ipairs(ui.layout.placed(plan.interior)) do
+        local expected = request.action == "move" and entry.index == row.sourceIndex
+            or request.action == "place" and not request.before[entry.index]
+        if expected and entry.id == row.id and (not plan.claimed[entry.index] or plan.claimed[entry.index] == row)
             and ui.layout.atTarget(entry.model, row, plan.floors) then
+            row.confirmedIndex = entry.index
+            plan.claimed[entry.index] = row
+            row.request = nil
             return true
         end
     end
+    return false
+end
+
+function ui.layout.placeRow(row, plan)
+    if not ui.layout.live(plan) then return false, "STOPPED" end
+    plan.claimed = plan.claimed or {}
+    for _, entry in ipairs(ui.layout.placed(plan.interior)) do
+        if entry.index == row.confirmedIndex and entry.id == row.id
+            and ui.layout.atTarget(entry.model, row, plan.floors) then
+            plan.claimed[entry.index] = row
+            return true
+        end
+    end
+    local request = row.request
+    if request and ui.layout.receipt(row, plan, request) then return true end
     if row.action == "keep" then
-        if existing and ui.layout.atTarget(existing, row, plan.floors) then
-            row.confirmedIndex = row.sourceIndex
-            return true
-        end
-        return false, "EXISTING FURNITURE CHANGED"
-    end
-    if row.action == "move" then
-        if not existing then
-            return false, "SOURCE FURNITURE UNAVAILABLE"
-        end
-        fire("HouseAction", "move", row.sourceIndex, row.position, row.yaw)
-    else
-        bagBefore = ui.layout.bag(row.id)
-        if bagBefore <= 0 then
-            return false, "MISSING"
-        end
-        local room, reason = ui.layout.roomFor(row.id, current)
-        if not room then
-            return false, reason
-        end
-        fire("HouseAction", "place", row.id, row.position, row.yaw)
-    end
-    local started = os.clock()
-    repeat
-        if not enabled("houseLayout") then
-            return false, "STOPPED"
-        end
-        assert(player:GetAttribute("InHouse") == player.UserId, "You left your own house.")
-        local refreshed = ui.layout.interior()
-        assert(refreshed == plan.interior, "Your house interior changed.")
-        for _, entry in ipairs(ui.layout.placed(refreshed)) do
-            local expected = row.action == "move" and entry.index == row.sourceIndex
-                or row.action == "place" and not before[entry.index]
-            if expected and entry.id == row.id
-                and ui.layout.atTarget(entry.model, row, plan.floors)
-                and (row.action ~= "place" or ui.layout.bag(row.id) < bagBefore) then
+        for _, entry in ipairs(ui.layout.placed(plan.interior)) do
+            if entry.index == row.sourceIndex and entry.id == row.id
+                and ui.layout.atTarget(entry.model, row, plan.floors) then
                 row.confirmedIndex = entry.index
+                plan.claimed[entry.index] = row
                 return true
             end
         end
-        task.wait() -- Resume on the next frame only while confirmation is pending.
+        return false, "EXISTING FURNITURE CHANGED"
+    end
+    if request and request.action == "place" and ui.layout.bag(row.id) < request.bagBefore then
+        -- Inventory was charged: keep reconciling this request instead of placing/buying another copy.
+        return false, ui.layout.reason("INVENTORY USED; PLACEMENT STILL PENDING", request.serial)
+    end
+    if request and request.attempts >= 3 then
+        return false, ui.layout.reason("PLACEMENT RETRY LIMIT", request.serial)
+    end
+    local before, existing = {}, nil
+    for _, entry in ipairs(ui.layout.placed(plan.interior)) do
+        before[entry.index] = true
+        if entry.index == row.sourceIndex and entry.id == row.id then existing = entry.model end
+    end
+    if row.action == "move" and not existing then return false, "SOURCE FURNITURE UNAVAILABLE" end
+    local bagBefore = ui.layout.bag(row.id)
+    if row.action == "place" then
+        if bagBefore <= 0 then return false, "MISSING" end
+        if plan.pendingBuys then plan.pendingBuys[row.id] = nil end
+        local room, reason = ui.layout.roomFor(row.id, plan.interior)
+        if not room then return false, reason end
+    end
+    request = {
+        action = row.action, before = request and request.before or before,
+        bagBefore = request and request.bagBefore or bagBefore,
+        attempts = (request and request.attempts or 0) + 1,
+        serial = ui.layout.feedbackSerial or 0,
+    }
+    row.request = request
+    if row.action == "move" then
+        if not ui.layout.send(plan, "move", row.sourceIndex, row.position, row.yaw) then return false, "STOPPED" end
+    else
+        if not ui.layout.send(plan, "place", row.id, row.position, row.yaw) then return false, "STOPPED" end
+    end
+    local started = os.clock()
+    repeat
+        if not ui.layout.live(plan) then return false, "STOPPED" end
+        if ui.layout.receipt(row, plan, request) then return true end
+        task.wait()
     until os.clock() - started >= 4
-    return false, "PLACEMENT NOT CONFIRMED"
+    plan.retryPace = math.min(0.5, (plan.retryPace or 0) + 0.1)
+    return false, ui.layout.reason("PLACEMENT NOT CONFIRMED", request.serial)
 end
 
 function ui.layout.buyOne(row, plan)
-    if not enabled("houseLayout") then
-        return false, "STOPPED"
-    end
-    assert(player:GetAttribute("InHouse") == player.UserId, "You left your own house.")
-    local current = ui.layout.interior()
-    assert(current == plan.interior, "Your house interior changed.")
+    if not ui.layout.live(plan) then return false, "STOPPED" end
+    plan.pendingBuys = plan.pendingBuys or {}
     if ui.layout.bag(row.id) > 0 then
+        plan.pendingBuys[row.id] = nil
         return true
     end
-    local room, reason = ui.layout.roomFor(row.id, current)
-    if not room then
-        return false, reason
+    local request = plan.pendingBuys[row.id]
+    if request and request.lastPass == (plan.pass or 0) then
+        return false, ui.layout.reason("BUY STILL PENDING", request.serial)
     end
-    local before = ui.layout.bag(row.id)
-    ui.layout.say("BUYING: " .. row.id)
-    -- Verified by the supplied Cobalt log: HouseAction("buy", furnitureId).
-    fire("HouseAction", "buy", row.id)
+    if not request then
+        local ready, reason = ui.layout.purchaseReady(row, plan)
+        if not ready then return false, reason end
+        request = { before = ui.layout.bag(row.id), serial = ui.layout.feedbackSerial or 0 }
+        plan.pendingBuys[row.id] = request
+        ui.layout.say("BUYING: " .. row.id)
+        if not ui.layout.send(plan, "buy", row.id) then return false, "STOPPED" end
+    end
+    -- Reconcile an unanswered buy; never send a duplicate paid request on a timeout.
+    request.lastPass = plan.pass or 0
     local started = os.clock()
     repeat
-        if not enabled("houseLayout") then
-            return false, "STOPPED"
-        end
-        assert(player:GetAttribute("InHouse") == player.UserId, "You left your own house.")
-        assert(ui.layout.interior() == plan.interior, "Your house interior changed.")
-        if ui.layout.bag(row.id) > before then
+        if not ui.layout.live(plan) then return false, "STOPPED" end
+        if ui.layout.bag(row.id) > request.before then
+            plan.pendingBuys[row.id] = nil
             return true
         end
-        task.wait() -- Resume on the next frame only while confirmation is pending.
+        task.wait()
     until os.clock() - started >= 4
-    return false, "BUY NOT CONFIRMED / UNAVAILABLE OR INSUFFICIENT FUNDS"
+    plan.retryPace = math.min(0.5, (plan.retryPace or 0) + 0.1)
+    return false, ui.layout.reason("BUY NOT CONFIRMED", request.serial)
 end
 
-function ui.layout.finishRow(row, plan, buyMissing, blocked)
-    -- Recheck inventory before purchasing; a delayed owned copy may now be available.
+function ui.layout.finishRow(row, plan, buyMissing)
+    plan.reserved = plan.reserved or {}
+    if plan.reserved[row.id] and plan.reserved[row.id] ~= row then
+        return false, "WAITING FOR EARLIER COPY"
+    end
     local confirmed, reason = ui.layout.placeRow(row, plan)
-    if confirmed or reason ~= "MISSING" or not buyMissing then
-        return confirmed, reason
+    if confirmed then
+        if plan.reserved[row.id] == row then plan.reserved[row.id] = nil end
+        return true
     end
-    if blocked[row.id] then
-        return false, blocked[row.id]
-    end
+    if reason ~= "MISSING" or not buyMissing or row.request then return false, reason end
     local bought, buyReason = ui.layout.buyOne(row, plan)
-    if not bought then
-        blocked[row.id] = buyReason
-        return false, buyReason
-    end
-    -- Finish this purchased copy before considering another purchase.
-    ui.layout.say("PLACING: " .. row.id)
+    if not bought then return false, buyReason end
+    plan.reserved[row.id] = row
     confirmed, reason = ui.layout.placeRow(row, plan)
-    if not confirmed then
-        blocked[row.id] = "PURCHASED COPY NOT PLACED: " .. tostring(reason)
-    end
+    if confirmed then plan.reserved[row.id] = nil end
     return confirmed, reason
 end
 
 function ui.layout.apply(buyMissing)
-    if states.houseLayout then
-        return
-    end
+    if states.houseLayout then return end
     buyMissing = buyMissing == true
     local data = ui.layout.decode(ui.layout.input.Text)
     ui.layout.plan(data)
     assert(player:GetAttribute("InHouse") == player.UserId, "Enter your own house before Apply.")
     states.houseLayout = true
     jobs.houseLayout = task.defer(function()
+        local feedbackConnection
         local ok, err = pcall(function()
             ui.layout.say("HOUSE BUILD QUEUED")
-            if not movement.acquire("houseLayout") then
-                return
-            end
+            if not movement.acquire("houseLayout") then return end
             ui.layout.clearPreview()
-            local plan = ui.layout.plan(data)
-            local complete, deferred, failures, blocked = 0, {}, {}, {}
-            -- First finish all existing moves/keeps and copies currently in the bag.
-            for index, row in ipairs(plan.rows) do
-                if not enabled("houseLayout") then
-                    return
-                end
-                local confirmed, reason = ui.layout.placeRow(row, plan)
-                if confirmed then
-                    complete = complete + 1
-                else
-                    deferred[#deferred + 1] = row
-                    row.pendingReason = reason
-                end
-                ui.layout.say(("OWNED FIRST: %d / %d • PENDING %d")
-                    :format(complete, #plan.rows, #deferred))
-                if index % 20 == 0 then
-                    task.wait() -- Yield during long runs of kept or missing rows.
-                end
-            end
-            -- Only after the owned pass, buy at most one copy and place it immediately.
-            for index, row in ipairs(deferred) do
-                if not enabled("houseLayout") then
-                    return
-                end
-                if row.pendingReason == "MISSING" then
-                    local confirmed, reason = ui.layout.finishRow(row, plan, buyMissing, blocked)
-                    if confirmed then
-                        complete = complete + 1
-                        row.pendingReason = nil
-                    else
-                        row.pendingReason = reason
+            ui.layout.feedbackText = nil
+            ui.layout.feedbackSerial = 0
+            local feedback = Remotes:FindFirstChild("GardenFeedback")
+            if feedback and feedback:IsA("RemoteEvent") then
+                feedbackConnection = feedback.OnClientEvent:Connect(function(message)
+                    if type(message) == "string" then
+                        ui.layout.feedbackSerial = ui.layout.feedbackSerial + 1
+                        ui.layout.feedbackText = message
                     end
-                end
-                if row.pendingReason then
-                    local key = row.id .. " [" .. row.pendingReason .. "]"
-                    failures[key] = (failures[key] or 0) + 1
-                end
-                if index % 20 == 0 then
-                    task.wait()
-                end
+                end)
+                ui.layout.feedbackConnection = feedbackConnection
             end
-            local pending = {}
-            for name, amount in pairs(failures) do
-                pending[#pending + 1] = name .. " x" .. amount
+            local plan = ui.layout.plan(data)
+            local complete, pending = 0, {}
+            for index, row in ipairs(plan.rows) do
+                if not ui.layout.live(plan) then return end
+                local confirmed, reason = ui.layout.placeRow(row, plan)
+                if confirmed then complete = complete + 1
+                else row.pendingReason = reason pending[#pending + 1] = row end
+                ui.layout.say(("OWNED FIRST: %d / %d • PENDING %d"):format(complete, #plan.rows, #pending))
+                if index % 20 == 0 then task.wait() end
             end
-            table.sort(pending)
-            ui.layout.pending = pending
-            if #pending == 0 then
-                ui.layout.say("LAYOUT APPLIED • UNUSED FURNITURE KEPT")
-            else
-                ui.layout.say(("PLACED / KEPT %d OF %d • REMAINING: ")
-                    :format(complete, #plan.rows) .. table.concat(pending, ", ")
-                    .. (buyMissing and "\nUnavailable items skipped. Retry when stock, funds or house space change."
-                        or "\nUse BUILD + BUY MISSING to purchase the remaining pieces."))
+            for pass = 1, 3 do
+                if #pending == 0 then break end
+                plan.pass = pass
+                local nextPending = {}
+                for index, row in ipairs(pending) do
+                    if not ui.layout.live(plan) then return end
+                    local confirmed, reason = ui.layout.finishRow(row, plan, buyMissing)
+                    if confirmed then complete = complete + 1 row.pendingReason = nil
+                    else row.pendingReason = reason nextPending[#nextPending + 1] = row end
+                    ui.layout.say(("BUILD / RECOVERY %d: %d / %d • PENDING %d")
+                        :format(pass, complete, #plan.rows, #nextPending))
+                    if index % 20 == 0 then task.wait() end
+                end
+                pending = nextPending
             end
+            ui.layout.pending = {}
+            local log = {("BUILT / KEPT %d OF %d; REMAINING %d"):format(complete, #plan.rows, #pending)}
+            for _, row in ipairs(pending) do
+                local line = row.id .. " • " .. tostring(row.pendingReason)
+                ui.layout.pending[#ui.layout.pending + 1] = line
+                log[#log + 1] = line
+            end
+            if ui.layout.feedbackText then log[#log + 1] = "LATEST GAME MESSAGE: " .. ui.layout.feedbackText end
+            ui.layout.buildLog = table.concat(log, "\n")
+            local preview = {}
+            for index = 1, math.min(3, #pending) do preview[#preview + 1] = ui.layout.pending[index] end
+            ui.layout.say(log[1] .. (#pending > 0 and ("\n" .. table.concat(preview, "\n") .. "\nCOPY BUILD LOG for all details.") or " • COMPLETE"))
         end)
+        if feedbackConnection then feedbackConnection:Disconnect() end
+        ui.layout.feedbackConnection = nil
         states.houseLayout = false
         movement.release("houseLayout")
         jobs.houseLayout = nil
         if not ok then
-            ui.layout.say("BUILD STOPPED: " .. tostring(err))
+            ui.layout.buildLog = "BUILD STOPPED: " .. tostring(err)
+            ui.layout.say(ui.layout.buildLog)
         end
     end)
 end
+
 
 -- Main contains the actual farming grind, with no duplicate navigation rows.
 ui.main=ui.page("Main")
@@ -3554,6 +3625,11 @@ ui.button(ui.houseImport,"HIDE PREVIEW",ui.layout.clearPreview)
 ui.button(ui.houseImport,"BUILD + BUY MISSING",function()ui.layout.apply(true)end)
 ui.button(ui.houseImport,"PLACE OWNED ONLY",function()ui.layout.apply(false)end)
 ui.button(ui.houseImport,"STOP HOUSE BUILD",ui.layout.cancel)
+ui.button(ui.houseImport,"COPY BUILD LOG",function()
+    assert(type(setclipboard)=="function","Clipboard is unavailable.")
+    setclipboard(ui.layout.buildLog or "No completed build log yet.")
+    ui.layout.say("BUILD LOG COPIED")
+end)
 ui.layout.label=ui.text(ui.houseImport,"NO LAYOUT LOADED")
 ui.houseExport=ui.group(ui.housePage,"EXPORT HOUSE DATA")
 ui.text(ui.houseExport,"Exports floors, furniture, inventory and catalog IDs to exi_house_export.json.")
@@ -4170,3 +4246,4 @@ gui.Destroying:Connect(function()
 end)
 selectPage("Main")
 config.load()
+
