@@ -3228,7 +3228,7 @@ end
 function ui.layout.cancel()
     stop("houseLayout")
     ui.layout.clearPreview()
-    ui.layout.say("HOUSE BUILD STOPPED • COMPLETED CHANGES REMAIN")
+    ui.layout.clearSay("HOUSE JOB STOPPED • COMPLETED CHANGES REMAIN")
 end
 sessionOptions.houseCleanup=function()
     ui.layout.clearPreview()
@@ -3452,6 +3452,99 @@ function ui.layout.finishRow(row, plan, buyMissing)
     return confirmed, reason
 end
 
+function ui.layout.clearSay(message)
+    ui.layout.say(message)
+    if ui.layout.clearLabel then ui.layout.clearLabel.Text = message end
+end
+
+function ui.layout.pickupOne(entry, plan)
+    local beforeCount = #ui.layout.placed(plan.interior)
+    local serial = ui.layout.feedbackSerial or 0
+    for attempt = 1, 3 do
+        if not ui.layout.live(plan) then return false, "STOPPED" end
+        local current = ui.layout.placed(plan.interior)
+        if #current < beforeCount then return true end
+        local target
+        for _, candidate in ipairs(current) do
+            if candidate.model == entry.model and candidate.index == entry.index then
+                target = candidate
+                break
+            end
+        end
+        if not target then return false, "FURNITURE CHANGED; REFRESH AND TRY AGAIN" end
+        -- The native HomeDecorUI pickup action returns the item; no sell/delete action is sent.
+        if not ui.layout.send(plan, "pickup", target.index) then return false, "STOPPED" end
+        local started = os.clock()
+        repeat
+            if not ui.layout.live(plan) then return false, "STOPPED" end
+            if #ui.layout.placed(plan.interior) < beforeCount then return true end
+            task.wait()
+        until os.clock() - started >= 4
+        plan.retryPace = math.min(0.5, (plan.retryPace or 0) + 0.1)
+    end
+    return false, ui.layout.reason("PICKUP NOT CONFIRMED", serial)
+end
+
+function ui.layout.clearHouse()
+    assert(not states.houseLayout, "Stop the current house job before clearing.")
+    assert(player:GetAttribute("InHouse") == player.UserId, "Enter your own house before clearing.")
+    local interior = ui.layout.interior()
+    assert(interior and interior:FindFirstChild("Furniture"), "Your house furniture has not loaded.")
+    states.houseLayout = true
+    jobs.houseLayout = task.defer(function()
+        local feedbackConnection
+        local ok, err = pcall(function()
+            ui.layout.clearSay("HOUSE CLEAR QUEUED")
+            if not movement.acquire("houseLayout") then return end
+            ui.layout.clearPreview()
+            local plan = { interior = interior }
+            if not ui.layout.live(plan) then return end
+            ui.layout.feedbackText = nil
+            ui.layout.feedbackSerial = 0
+            local feedback = Remotes:FindFirstChild("GardenFeedback")
+            if feedback and feedback:IsA("RemoteEvent") then
+                feedbackConnection = feedback.OnClientEvent:Connect(function(message)
+                    if type(message) == "string" then
+                        ui.layout.feedbackSerial = ui.layout.feedbackSerial + 1
+                        ui.layout.feedbackText = message
+                    end
+                end)
+                ui.layout.feedbackConnection = feedbackConnection
+            end
+            local picked = 0
+            while ui.layout.live(plan) do
+                local placed = ui.layout.placed(interior)
+                if #placed == 0 then
+                    ui.layout.buildLog = "HOUSE CLEARED • " .. picked .. " PICKED UP"
+                    ui.layout.clearSay(ui.layout.buildLog .. " • LOAD YOUR NEXT LAYOUT")
+                    return
+                end
+                -- Highest live index first; refresh after every pickup so index shifts stay safe.
+                local entry = placed[#placed]
+                ui.layout.clearSay(("CLEARING: %s • %d PICKED UP • %d REMAINING")
+                    :format(entry.id, picked, #placed))
+                local confirmed, reason = ui.layout.pickupOne(entry, plan)
+                if not confirmed then
+                    ui.layout.buildLog = ("CLEAR PAUSED • %d PICKED UP • %d REMAINING\n%s: %s")
+                        :format(picked, #ui.layout.placed(interior), entry.id, tostring(reason))
+                    ui.layout.clearSay(ui.layout.buildLog)
+                    return
+                end
+                picked = picked + 1
+            end
+        end)
+        if feedbackConnection then feedbackConnection:Disconnect() end
+        ui.layout.feedbackConnection = nil
+        states.houseLayout = false
+        movement.release("houseLayout")
+        jobs.houseLayout = nil
+        if not ok then
+            ui.layout.buildLog = "CLEAR STOPPED: " .. tostring(err)
+            ui.layout.clearSay(ui.layout.buildLog)
+        end
+    end)
+end
+
 function ui.layout.apply(buyMissing)
     if states.houseLayout then return end
     buyMissing = buyMissing == true
@@ -3631,6 +3724,11 @@ ui.button(ui.houseImport,"COPY BUILD LOG",function()
     ui.layout.say("BUILD LOG COPIED")
 end)
 ui.layout.label=ui.text(ui.houseImport,"NO LAYOUT LOADED")
+ui.houseClear=ui.group(ui.housePage,"CLEAR HOUSE")
+ui.text(ui.houseClear,"Picks up all placed furniture, walls and floor decorations into inventory. Keeps your loaded layout and house upgrades.")
+ui.button(ui.houseClear,"PICK UP ALL FURNITURE",ui.layout.clearHouse)
+ui.button(ui.houseClear,"STOP CLEARING",ui.layout.cancel)
+ui.layout.clearLabel=ui.text(ui.houseClear,"ENTER YOUR OWN HOUSE TO CLEAR")
 ui.houseExport=ui.group(ui.housePage,"EXPORT HOUSE DATA")
 ui.text(ui.houseExport,"Exports floors, furniture, inventory and catalog IDs to exi_house_export.json.")
 ui.button(ui.houseExport,"EXPORT MY HOUSE",ui.layout.export)
