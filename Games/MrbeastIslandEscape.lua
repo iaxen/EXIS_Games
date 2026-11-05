@@ -2232,6 +2232,8 @@ local function runIslandEscape()
         end
         if fish.state == "reeling" and os.clock() - fish.at > 4 then
             fish.state = "idle"
+            -- Release the cast lock before the scheduler chooses another job.
+            return false
         end
         if fish.state ~= "idle" then
             if os.clock() - fish.at > 45 then
