@@ -56,7 +56,7 @@ local function runIslandEscape()
     local t=readable(entry[field]);if t then return t end
    end
   end
-  return readable(tostring(id))or(kind:upper().." "..string.format("%03d",index or 0))
+  return ({["木板1"]="Wooden Planks",["原始部落宝箱"]="Tribal Chest",["森林守护者宝箱"]="Forest Guardian Chest"})[id]or readable(tostring(id))or(kind:upper().." "..string.format("%03d",index or 0))
  end
  local function save()if type(writefile)=="function"then local ok,e=pcall(function()writefile(path,HTTP:JSONEncode({version=1,flags=flags,selected=selected,options=opts}))end);if not ok then say(e)end end end
  if type(readfile)=="function"then pcall(function()local d=HTTP:JSONDecode(readfile(path));if d.version==1 then
@@ -100,6 +100,15 @@ local function runIslandEscape()
   return m.client[action](...)
  end
  local function world()return workspace:FindFirstChild("Game")end
+ local function serverMode()
+  local lib=RS:FindFirstChild("Module");local service=lib and lib:FindFirstChild("Service");local source=service and service:FindFirstChild("GetServerType");local cache=source and source:FindFirstChild("cache")
+  if cache and cache:IsA("StringValue")and cache.Value~=""then return cache.Value=="ReservedServer"and"match"or"lobby"end
+  local w=world();return w and w:FindFirstChild("Static")and w:FindFirstChild("Day")and"match"or"loading"
+ end
+ local function built(name)
+  local w=world();local folder=w and w:FindFirstChild("Buildings")
+  return folder and folder:FindFirstChild(name)
+ end
  local function root()local c=player.Character;local h=c and c:FindFirstChildOfClass("Humanoid");return h and h.Health>0 and c:FindFirstChild("HumanoidRootPart"),h end
  local function pos(o)if o:IsA("BasePart")then return o.Position elseif o:IsA("Model")then return o:GetPivot().Position end end
  local function travel(o,key,radius)
@@ -174,11 +183,13 @@ local function runIslandEscape()
  toggle(fire,"fuel","Auto add wood","Adds wood only below the fuel target.");number(fire,"fuel","FUEL TARGET (WOOD)",1,100)
  toggle(fire,"cook","Auto cook selected food","Consumes selected cookable food.")
  toggle(fire,"cooked","Auto collect cooked food")
+ button(fire,"ADD ONE WOOD / REFRESH FUEL STATE",function()assert(built("Campfire"),"Build the campfire first");call("MakeFire","addWood")end)
  local furnace=group(camp,"FURNACE")
  toggle(furnace,"smelt","Auto feed furnace","Consumes smelting ingredients.");toggle(furnace,"smeltCollect","Auto collect results")
  local water=group(camp,"WATER MAKER");toggle(water,"water","Auto collect coconuts")
  local crafting=group(craft,"TOOLS AND ARMOUR");toggle(crafting,"craft","Auto craft selected items","Crafts one missing selected item when materials are available.")
  local building=group(craft,"CONSTRUCTION");toggle(building,"build","Auto contribute selected buildings","Spends recipe materials on selected unfinished buildings.")
+ toggle(building,"buildCurrent","Auto build active blueprints","Uses owned materials on available unfinished buildings, including the first campfire. No selection required.")
  local questBody=group(questPage,"MRBEAST QUESTS");toggle(questBody,"quest","Auto deliver required items","Moves owned matching drops or carried items into the quest area. Submits the current revision only.")
  local questInfo=text(questBody,"QUEST: WAITING")
  local rewards=group(questPage,"REWARDS");toggle(rewards,"daily","Auto daily reward");toggle(rewards,"weekly","Auto weekly reward");toggle(rewards,"playtime","Auto playtime rewards");toggle(rewards,"dailyQuest","Claim completed daily quests")
@@ -187,7 +198,9 @@ local function runIslandEscape()
  toggle(escape,"escape","Auto use available escape boat","Uses the boat interaction when its prompt is enabled. Ends your run.")
  local destination=group(explore,"BUILDING TRAVEL")
  local session=group(settings,"SESSION")
- toggle(session,"antiAfk","Anti idle");button(session,"SAVE CONFIG",save)
+ toggle(session,"antiAfk","Anti idle")
+ toggle(session,"autoExecute","Auto execute after teleport","Reloads EXIScript when entering the match if your executor supports teleport queues.")
+ button(session,"SAVE CONFIG",save)
  local function stopAll()for k in pairs(flags)do flags[k]=false end;for _,render in pairs(toggles)do render()end;local r,h=root();if r and h then h:MoveTo(r.Position)end;save();say("ALL TASKS STOPPED")end
  button(session,"STOP ALL",stopAll)
  local moveButton;moveButton=button(session,"MOVE: "..opts.move,function()opts.move=opts.move=="Walk"and"Teleport"or"Walk";moveButton.Text="MOVE: "..opts.move:upper();save()end)
@@ -199,7 +212,14 @@ local function runIslandEscape()
   diagnosticText.Text=table.concat(lines,"\n").."\n\nRECENT ERRORS\n"..(#recentErrors>0 and table.concat(recentErrors,"\n")or"NONE")
  end
  button(diag,"COPY DIAGNOSTICS",function()refreshDiagnostics();assert(type(setclipboard)=="function","Clipboard unavailable");setclipboard(diagnosticText.Text);say("DIAGNOSTICS COPIED")end)
+ local modeLabel=text(main,"SERVER: CHECKING")
  local clockLabel=text(main,"DAY / PHASE: WAITING")
+ connections[#connections+1]=player.OnTeleport:Connect(function(state)
+  if not flags.autoExecute or state~=Enum.TeleportState.Started then return end
+  local queue=queue_on_teleport or queueonteleport or(syn and syn.queue_on_teleport)
+  if type(queue)~="function"then say("TELEPORT QUEUE NOT SUPPORTED");return end
+  save();queue('loadstring(game:HttpGet("https://raw.githubusercontent.com/iaxen/EXIScript/main/EXIScript.lua"))()')
+ end)
  local launcher=button(gui,"EXIS",function()panel.Visible=true;launcher.Visible=false end);launcher.Size=UDim2.fromOffset(32,32);launcher.TextSize=10;launcher.Font=Enum.Font.BuilderSansBold;launcher:FindFirstChildOfClass("UICorner").CornerRadius=UDim.new(0,4);launcher.Position=UDim2.fromOffset(12,90);launcher.Visible=false
  local mini=button(panel,"−",function()panel.Visible=false;launcher.Visible=true end);mini.Position=UDim2.new(1,-55,0,3);mini.Size=UDim2.fromOffset(24,24)
  local close=button(panel,"×",function()stopAll();gui:Destroy()end);close.Position=UDim2.new(1,-28,0,3);close.Size=UDim2.fromOffset(24,24)
@@ -269,16 +289,25 @@ local function runIslandEscape()
   if o and travel(o,"drops")then call("ItemCollect","collect",o);failed[o]=os.clock()+5;note("drops","COLLECT REQUEST SENT");say("COLLECT: "..(readable(o.Name)or"ITEM"));return true end
  end
  local function gatherResource()
-  local w=world();if not w then return end;local c=config();local best=nearest(w:GetDescendants(),function(o)return o:IsA("Model")and o:GetAttribute("resourceId") and (selectedEmpty("resources") or allowed("resources",o:GetAttribute("resourceId"))) and not(failed[o]and failed[o]>os.clock())end)
+  local w=world();local static=w and w:FindFirstChild("Static");if not static then note("gather","MATCH RESOURCES NOT LOADED");return end;local c=config();local best=nearest(static:GetChildren(),function(o)return o:IsA("Model")and o:GetAttribute("resourceId") and (selectedEmpty("resources") or allowed("resources",o:GetAttribute("resourceId"))) and not(failed[o]and failed[o]>os.clock())end)
   if not best then note("gather","NO LOADED MATCHING RESOURCES");return end
   local rc=c.worldResource.byId[best:GetAttribute("resourceId")];local tool,tc
   for _,t in ipairs(tools())do local info=c.tool.byDisplayName[t.Name];if info and(rc.requireToolType=="any"or info.toolType==rc.requireToolType)and(not tc or(info.useDmg or 0)>(tc.useDmg or 0))then tool,tc=t,info end end
   if not tool then note("gather","MATCHING TOOL REQUIRED");say("GATHER: MATCHING TOOL REQUIRED");failed[best]=os.clock()+5;return end
-  if travel(best,"gather",math.max(1,(tc.range or 6)-0.5))then equip(tool);local r=root();local p=best:GetPivot().Position;r.CFrame=CFrame.lookAt(r.Position,Vector3.new(p.X,r.Position.Y,p.Z));local e=RS:FindFirstChild("Events");e=e and e:FindFirstChild("meleeHitRemote");if e then e:FireServer({},{best});task.wait(math.max(0.2,tc.useCd or 0.7));note("gather","HIT REQUEST SENT");say("GATHER: "..itemLabel("resource",best:GetAttribute("resourceId"),rc))end;return true end
+  if travel(best,"gather",math.max(1,(tc.range or 6)-0.5))then
+   equip(tool);local r=root();if not r then return end
+   local p=best:GetPivot().Position;r.CFrame=CFrame.lookAt(r.Position,Vector3.new(p.X,r.Position.Y,p.Z))
+   local hp=best:GetAttribute("hp");tool:Activate();task.wait(math.max(0.7,(tc.useCd or 0.7)+0.15))
+   if not best.Parent or(type(hp)=="number"and type(best:GetAttribute("hp"))=="number"and best:GetAttribute("hp")<hp)then
+    note("gather","RESOURCE DAMAGE CONFIRMED")
+   else note("gather","SWING SENT; DAMAGE NOT CONFIRMED")end
+   say("GATHER: "..itemLabel("resource",best:GetAttribute("resourceId"),rc));return true
+  end
  end
  local function exploreTick(key,kind,service,check,request)
   local w=world();if not w then return end;local c=config();local rows=kind=="chest"and c.chest.byId or c.mapProp.byCnId
-  local obj=nearest(w:GetDescendants(),function(o)return o:IsA("Model")and rows[o.Name]and not(failed[o]and failed[o]>os.clock())end)
+  local search=kind=="chest"and w:FindFirstChild("Chest")or w
+  local obj=nearest(search and search:GetDescendants()or{},function(o)return o:IsA("Model")and rows[o.Name]and not(failed[o]and failed[o]>os.clock())end)
   if not obj then return end;failed[obj]=os.clock()+20
   if call(service,check,obj)then return end
   if kind=="chest"and call(service,"isLocked",obj)then return end
@@ -361,6 +390,20 @@ local function runIslandEscape()
   for id in pairs(selected.build or{})do local i=c.build.byId[id];if allowed("build",id)and i and b and b:FindFirstChild(i.assetId.."_Construct")then call("BuildBuilding","build",id);note("build","CONTRIBUTION REQUEST SENT");return end end
   note("build","NO SELECTED ACTIVE CONSTRUCTION")
  end
+ local function buildCurrentTick()
+  local w=world();local folder=w and w:FindFirstChild("Buildings");if not folder then return end
+  local c=config()
+  for _,i in pairs(c.build.byId)do
+   if folder:FindFirstChild(i.assetId.."_Construct")then
+    local recipe=c.recipe.byId[i.recipeId];local hasMaterial=false
+    for key,n in pairs(recipe or{})do local id=type(key)=="string"and key:match("^require_(.+)$");local item=id and c.item.byId[id]
+     if item and type(n)=="number"and n>0 and count(item.displayName)>0 then hasMaterial=true;break end
+    end
+    if hasMaterial then call("BuildBuilding","build",i.id);note("buildCurrent","BLUEPRINT MATERIALS SUBMITTED");return end
+   end
+  end
+  note("buildCurrent","NO ACTIVE BLUEPRINT OR NEED MATERIALS")
+ end
  local moves={
   {"quest",questTick},{"escape",escapeTick},
   {"chests",function()return exploreTick("chests","chest","ChestService","isOpened","requestOpen")end},
@@ -370,19 +413,23 @@ local function runIslandEscape()
  task.spawn(function()
   while alive do
    safely("clock",function()local w=world();if w then local d=w:FindFirstChild("Day");local phase=w:FindFirstChild("Phase");clockLabel.Text="DAY "..tostring(d and d.Value or"—").." | "..tostring(phase and phase.Value or"—")end end)
-   limited("eat",2,eat);limited("combat",opts.interval,defend)
+   local mode=serverMode();modeLabel.Text=mode=="match"and"SERVER: MATCH"or(mode=="lobby"and"SERVER: LOBBY - ENTER A MATCH"or"SERVER: LOADING")
+   if mode=="match"then limited("eat",2,eat);limited("combat",opts.interval,defend)end
    -- Failed reward calls cannot abort camp jobs or movement workers.
    limited("daily",10,function()if rewardData.daily=="canClaim"then call("DailyReward","claim")else note("daily","NOT CLAIMABLE")end end)
    limited("weekly",10,function()for i,v in pairs((rewardData.week or{}).days or{})do if v=="Claim"then call("WeekReward","claim",i);return end end;note("weekly","NOT CLAIMABLE")end)
    limited("playtime",10,function()for id,v in pairs((rewardData.play or{}).rewards or{})do if v.canClaim and not v.claimed then call("PlayTimeReward","claim",id);return end end;note("playtime","NOT CLAIMABLE")end)
    limited("dailyQuest",10,function()for _,v in pairs((rewardData.quest or{}).list or{})do if v.completed and not v.claimed then call("DailyQuest","claim",v.id);return end end;note("dailyQuest","NO COMPLETED REWARDS")end)
-   limited("fuel",4,function()if type(campData.campfireWoodCount)~="number"then note("fuel","WAITING FOR CAMPFIRE STATE")elseif campData.campfireWoodCount<opts.fuel then call("MakeFire","addWood")else note("fuel","FUEL TARGET REACHED")end end)
-   limited("cooked",3,function()if(campData.readyCount or 0)>0 then call("MakeFire","collectFood")else note("cooked","NO READY FOOD / WAITING FOR STATE")end end)
-   limited("cook",4,function()local c=config();for id in pairs(selected.cook or{})do local i=c.item.byId[id];if allowed("cook",id)and i and count(i.displayName)>0 then call("MakeFire","addFood",id);return end end;note("cook","SELECT COOKABLE FOOD YOU OWN")end)
-   limited("smeltCollect",3,function()if(furnaceData.readyCount or 0)>0 then call("Furnace","collectResult")else note("smeltCollect","NO READY OUTPUT / WAITING FOR STATE")end end)
-   limited("smelt",5,function()call("Furnace","addBoth")end)
-   limited("water",10,function()call("WaterMaker","collect")end)
-   limited("craft",3,craftTick);limited("build",5,buildTick)
+   if mode=="match"then
+   limited("fuel",4,function()
+    if not built("Campfire")then note("fuel","BUILD THE CAMPFIRE FIRST");return end
+    if type(campData.campfireWoodCount)~="number"then note("fuel","WAITING FOR CAMPFIRE STATE")elseif campData.campfireWoodCount<opts.fuel then call("MakeFire","addWood")else note("fuel","FUEL TARGET REACHED")end end)
+   limited("cooked",3,function()if not built("Campfire")then note("cooked","BUILD THE CAMPFIRE FIRST");return end;if(campData.readyCount or 0)>0 then call("MakeFire","collectFood")else note("cooked","NO READY FOOD / WAITING FOR STATE")end end)
+   limited("cook",4,function()if not built("Campfire")then note("cook","BUILD THE CAMPFIRE FIRST");return end;local c=config();for id in pairs(selected.cook or{})do local i=c.item.byId[id];if allowed("cook",id)and i and count(i.displayName)>0 then call("MakeFire","addFood",id);return end end;note("cook","SELECT COOKABLE FOOD YOU OWN")end)
+   limited("smeltCollect",3,function()if not built("Furnace")then note("smeltCollect","BUILD THE FURNACE FIRST");return end;if(furnaceData.readyCount or 0)>0 then call("Furnace","collectResult")else note("smeltCollect","NO READY OUTPUT / WAITING FOR STATE")end end)
+   limited("smelt",5,function()if not built("Furnace")then note("smelt","BUILD THE FURNACE FIRST");return end;call("Furnace","addBoth")end)
+   limited("water",10,function()if not built("Water Maker")then note("water","BUILD THE WATER MAKER FIRST");return end;call("WaterMaker","collect")end)
+   limited("craft",3,craftTick);limited("build",5,buildTick);limited("buildCurrent",4,buildCurrentTick)
    local fishingActive=false
    if flags.fish then fishingActive=safely("fish",fishTick)==true
    elseif fish.state~="idle"then safely("fish",function()if fish.mini then fish.mini:cancel();fish.mini=nil end;if events and events:FindFirstChild("fishCancelRemote")then events.fishCancelRemote:FireServer()end;fish.state="idle"end)end
@@ -391,6 +438,9 @@ local function runIslandEscape()
     for _=1,#moves do movementTurn=movementTurn%#moves+1;local job=moves[movementTurn]
      if flags[job[1]]then safely(job[1],job[2]);break end
     end
+   end
+   else
+    for _,key in ipairs({"eat","combat","fuel","cook","cooked","smelt","smeltCollect","water","craft","build","buildCurrent","quest","escape","chests","puzzles","drops","gather","fish"})do if flags[key]then note(key,"ENTER A MATCH FIRST")end end
    end
    refreshDiagnostics()
    task.wait(math.max(0.2,opts.interval))
