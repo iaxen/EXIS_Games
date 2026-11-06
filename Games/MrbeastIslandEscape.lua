@@ -965,7 +965,7 @@ local function runIslandEscape()
         for _, o in ipairs(list) do
             if o.Parent and not (motion.blocked[o] and motion.blocked[o] > os.clock()) and predicate(o) then
                 local p = pos(o)
-                if p then
+                if p and work.insideBorder(p) then
                     local n = (p - r.Position).Magnitude / (1 + math.max(0, score and score(o) or 0) * 0.05)
                     if n < d then
                         best, d = o, n
@@ -1898,6 +1898,7 @@ local function runIslandEscape()
         syncRemote("MakeFire", function(v)
             if type(v) == "table" then
                 campData = v
+                work.refreshAt = 0
             end
         end)
         syncRemote("Furnace", function(v)
@@ -2040,29 +2041,87 @@ local function runIslandEscape()
         local fuel = info and info.config and info.config["燃料"]
         return fuel and c.item.byName[fuel]
     end
-    function work.fuel()
-        local fire = built("Campfire")
-        local item = work.fuelItem()
-        if not fire or not item or count(item.displayName) <= 0 then
-            note("fuel", "NEED CAMPFIRE WOOD")
-            return false
+    function work.fireState()
+        local fire, scene, c = built("Campfire"), world(), config()
+        if not fire then return end
+        local rain = scene and scene:FindFirstChild("IsRaining")
+        local level = tonumber(fire:GetAttribute("CampfireMeshLevel")) or tonumber(campData.campfireLevel) or 1
+        local row
+        for _, info in ipairs(c.campfire and c.campfire.list or {}) do if info.lvl == level then row = info break end end
+        if not row or not tonumber(row.woodBurnSec) or row.woodBurnSec <= 0 then return end
+        local cap = tonumber(campData.campfireLevelCapMins)
+        if campData.campfireLevel ~= level or not cap or cap <= 0 then
+            local caps, players = row.capMinsPlayerCount, scene and scene:FindFirstChild("PlayerCount")
+            cap = type(caps) == "table" and #caps > 0 and tonumber(caps[math.clamp(players and players.Value or 1, 1, #caps)]) or nil
         end
-        if not travel(fire, "fuel") then
-            return false
+        local on = fire:GetAttribute("onFire")
+        if type(on) ~= "boolean" then on = campData.isOnFire end
+        local remaining
+        if on == false then remaining = 0
+        elseif on == true and tonumber(campData.fuelEndTime) and campData.fuelEndTime > 0 then
+            remaining = math.max(0, campData.fuelEndTime - workspace:GetServerTimeNow())
+        elseif on == true and cap and cap > 0 then
+            -- A late-loaded script may have missed the initial sync. Read the game's
+            -- existing replicated fuel display without changing its UI or state.
+            local bar = fire:FindFirstChild("FireBar")
+            local frame = bar and bar:FindFirstChild("Frame")
+            local label = frame and frame:FindFirstChild("progressLabel")
+            local percent = label and tonumber(label.Text:match(":%s*(%d+)%s*/%s*100"))
+            if percent then remaining = math.clamp(percent, 0, 100) / 100 * cap * 60 end
         end
-        local before = campData.campfireWoodCount
-        if before == nil then
-            work.fuelProbe = true
-        end
-        local bagBefore = count(item.displayName)
+        return {fire = fire, level = level, burn = row.woodBurnSec,
+            cap = cap and cap > 0 and cap * 60 or nil, remaining = remaining,
+            on = on, raining = rain and rain.Value == true, wood = campData.campfireWoodCount}
+    end
+    function work.fireReceipt(before, after)
+        return after and (after.level > before.level
+            or (after.on == true and before.on == false)
+            or (after.remaining and before.remaining and after.remaining > before.remaining + 0.05)
+            or (type(after.wood) == "number" and type(before.wood) == "number" and after.wood > before.wood)) or false
+    end
+    function work.firePendingReady()
+        local pending = work.fuelPending
+        if not pending then return true end
+        if work.fireReceipt(pending.state, work.fireState()) then work.fuelPending = nil return true end
+        -- An inventory deduction alone does not prove the server added fuel.
+        if count(pending.item.displayName) < pending.stock then return false end
+        if os.clock() - pending.at >= 3 then work.fuelPending = nil return true end
+        return false
+    end
+    function work.maintenanceGoal()
+        local state, item = work.fireState(), work.fuelItem()
+        if not state or state.raining or not item or not work.firePendingReady() then return end
+        if state.remaining == nil then return end
+        local reserve = math.max(1, tonumber(opts.fuel) or 3) * state.burn
+        if state.cap then reserve = math.min(reserve, state.cap) end
+        if state.on ~= false and state.remaining > reserve * 0.5 then return end
+        local room = state.cap and math.max(0, state.cap - state.remaining) or state.burn
+        if room < state.burn * 0.5 then return end
+        local amount = math.max(1, math.ceil((reserve - state.remaining) / state.burn))
+        return {key = "fire:upkeep", kind = "fuel", maintenance = true, level = state.level,
+            rank = state.on == false and -0.1 or -0.05, name = "KEEP CAMPFIRE LIT",
+            amounts = {[item.id] = amount}}
+    end
+    function work.addFireWood(key)
+        local item, state = work.fuelItem(), work.fireState()
+        if not item or not state or state.raining or count(item.displayName) <= 0
+            or not work.firePendingReady() then return false end
+        if state.remaining == nil or (state.cap and state.remaining >= state.cap - 0.05) then return false end
+        if not travel(state.fire, key) then return false end
+        state = work.fireState()
+        if not state or state.raining or state.remaining == nil
+            or (state.cap and state.remaining >= state.cap - 0.05) then return false end
+        local pending = {state = state, item = item, stock = count(item.displayName), at = os.clock()}
+        work.fuelPending = pending
         call("MakeFire", "addWood")
-        local confirmed = work.await("fuel", function()
-            return count(item.displayName) < bagBefore
-                or (type(campData.campfireWoodCount) == "number"
-                    and (before == nil or campData.campfireWoodCount > before))
-        end, 3)
-        note("fuel", confirmed and "WOOD ADDED" or "FUEL NOT CONFIRMED")
+        local confirmed = work.await(key, function() return work.fireReceipt(state, work.fireState()) end, 3)
+        if confirmed then work.fuelPending = nil work.refreshAt = 0 end
+        note(key, confirmed and "CAMPFIRE FUEL CONFIRMED" or "WAITING FOR CAMPFIRE FUEL CONFIRMATION")
         return confirmed
+    end
+    function work.fuel()
+        if not work.maintenanceGoal() then return false end
+        return work.addFireWood("fuel")
     end
     local function eat()
         local r, h = root()
@@ -2322,8 +2381,53 @@ local function runIslandEscape()
             work.evadeIntent = nil
         end
     end
-    function work.safeWorkPoint(point, margin)
+    function work.borderState()
+        -- The server expands this ring when the campfire's wall level changes.
+        local wall = workspace:FindFirstChild("Wall")
+        if wall then
+            local center, radius = wall:GetAttribute("Center"), tonumber(wall:GetAttribute("Radius"))
+            if typeof(center) == "Vector3" and radius and radius > 0 then return center, radius end
+        end
+        local scene, c = world(), config()
+        local fire = built("Campfire")
+        local level = fire and tonumber(fire:GetAttribute("CampfireMeshLevel")) or tonumber(campData.campfireLevel) or 1
+        local progress = 1
+        for _, row in ipairs(c.campfire and c.campfire.list or {}) do
+            if row.lvl == level then progress = tonumber(row.wall_lvl) or 1 break end
+        end
+        local onlyLevelOne = c.campfire and #c.campfire.list == 1 and c.campfire.list[1].lvl == 1
+        local unlocked = onlyLevelOne and fire and (fire:GetAttribute("onFire") == true or campData.isOnFire == true)
+        if not wall and (progress >= 5 or unlocked) then return Vector3.new(0, 0, 0), math.huge end
+        local tiles = scene and scene:FindFirstChild("Tiles")
+        local base = tiles and tiles:FindFirstChild("Basic Block")
+        local center = base and pos(base)
+        local names = {"开局圈", "神器1条带", "神器2条带", "神器3条带", "外圈条带"}
+        local band = c.mapBand and c.mapBand.byCn and c.mapBand.byCn[names[progress]]
+        local length = scene and tonumber(scene:GetAttribute("IslandLength"))
+        if center and band and length and length > 0 and tonumber(band.rateMax) then
+            return center, band.rateMax * length
+        end
+        -- Unknown / still streaming is not permission to leave the unlocked area.
+        return nil
+    end
+    function work.insideBorder(point, margin)
         if not point then return false end
+        local center, radius = work.borderState()
+        if not center then return false end
+        local dx, dz = point.X - center.X, point.Z - center.Z
+        return dx * dx + dz * dz <= math.max(0, radius - (margin or 2)) ^ 2
+    end
+    function work.meleeClearance(target, stats)
+        local reach = work.enemyReach(target) + opts.combatMargin
+        -- Short tools cannot provide invulnerability. Use their outer attack edge,
+        -- keep other enemies away, and retain the damage / low-health retreat.
+        if stats and (stats.range or 6) <= reach + 0.1 then
+            return math.max(0.5, (stats.range or 6) - 0.65)
+        end
+        return reach
+    end
+    function work.safeWorkPoint(point, margin)
+        if not work.insideBorder(point) then return false end
         for _, row in ipairs(work.hostiles()) do
             if row.model.Parent and row.human.Health > 0 then
                 local radius = opts.avoidEnemies and opts.dangerRadius + (margin or 0) or 0
@@ -2552,7 +2656,17 @@ local function runIslandEscape()
             if enemyPoint and r.Position.Y - enemyPoint.Y > opts.enemyReach + opts.combatMargin then return end
         end
         local fighting = work.active == "combat" or work.active == "hunt"
-        if not fighting then return target end
+        if not fighting then
+            if (flags.combat or flags.aura) and human.Health / human.MaxHealth * 100 > opts.retreatHealth
+                and os.clock() >= (work.damageUntil or 0) then
+                local _, stats = work.meleeWeapon()
+                if stats and (work.stanceScore(r.Position, target, stats) or work.combatClear(r.Position)) then
+                    local candidate = work.attackPlan("combat", stats)
+                    if candidate then return end
+                end
+            end
+            return target
+        end
         local _, stats = work.meleeWeapon()
         if human.Health / human.MaxHealth * 100 <= opts.retreatHealth
             or os.clock() < (work.damageUntil or 0) then return target end
@@ -2596,6 +2710,7 @@ local function runIslandEscape()
         return best
     end
     function work.safeDestination(point, key)
+        if not work.insideBorder(point) then return false end
         local owner = work.active or key
         local risk = work.danger(point, opts.dangerRadius)
         if owner == "evade" or work.escapeMove then
@@ -2607,16 +2722,20 @@ local function runIslandEscape()
         return work.safeWorkPoint(point, 0)
     end
     function work.combatClear(point)
+        if not work.insideBorder(point) then return false end
         for _, row in ipairs(work.hostiles()) do
             if row.model.Parent and row.human.Health > 0 then
                 local delta = point - row.point
                 local elevatedTarget = row.model == work.attackTarget and delta.Y >= opts.combatHeight
-                if not elevatedTarget and delta.Magnitude < work.enemyReach(row.model) + opts.combatMargin then return false end
+                local clearance = row.model == work.attackTarget and work.meleeClearance(row.model, work.attackStats) or work.enemyReach(row.model) + opts.combatMargin
+                if not elevatedTarget and delta.Magnitude < clearance then return false end
             end
         end
         return true
     end
     function work.safeRoute(a, b, key)
+        -- A circle is convex: an inside-to-inside segment cannot cross the ring.
+        if not work.insideBorder(a) or not work.insideBorder(b) then return false end
         if (motion.mode or opts.move) == "Teleport" then return work.safeDestination(b, key) end
         local delta, owner = b - a, work.active or key
         local length2 = delta:Dot(delta)
@@ -2632,7 +2751,8 @@ local function runIslandEscape()
                     if radius > 0 and ((initial < radius and distance + 0.1 < initial) or (initial >= radius and distance < radius)) then return false end
                 elseif owner == "combat" or owner == "hunt" then
                     local elevated = row.model == work.attackTarget and closest.Y - row.point.Y >= opts.combatHeight
-                    if not elevated and distance < work.enemyReach(row.model) + opts.combatMargin then return false end
+                    local clearance = row.model == work.attackTarget and work.meleeClearance(row.model, work.attackStats) or work.enemyReach(row.model) + opts.combatMargin
+                    if not elevated and distance < clearance then return false end
                 elseif radius > 0 and distance < radius and math.abs(closest.Y - row.point.Y) < 18 then return false end
             end
         end
@@ -2655,7 +2775,7 @@ local function runIslandEscape()
             local ground = motion.floor(probe, nil, math.max(10, (opts.hoverHeight or 8) + 12), 5)
             if not ground then return end
             local candidate = ground + Vector3.new(0, lift, 0)
-            if not motion.clearSegment(r.Position, candidate, nil) then return end
+            if not work.insideBorder(candidate) or not motion.clearSegment(r.Position, candidate, nil) then return end
             local risk = work.danger(candidate, radius)
             if risk >= currentRisk then return end
             local score = -risk * 100 - (candidate - r.Position).Magnitude
@@ -2683,7 +2803,7 @@ local function runIslandEscape()
         local best, distance
         for _, row in ipairs(work.hostiles()) do
             local d = (row.point - r.Position).Magnitude
-            if row.attackable and row.model.Parent and row.human.Health > 0 and d <= radius
+            if row.attackable and row.model.Parent and row.human.Health > 0 and work.insideBorder(row.point) and d <= radius
                 and not (failed[row.model] and failed[row.model] > os.clock())
                 and (not distance or d < distance) then best, distance = row.model, d end
         end
@@ -2709,11 +2829,11 @@ local function runIslandEscape()
     end
     function work.stanceScore(point, target, stats)
         local p = pos(target)
-        if not p then return end
+        if not p or not work.insideBorder(p) or not work.insideBorder(point) then return end
         local distance = (point - p).Magnitude
         if distance > (stats.range or 6) - 0.1 or not work.lineOfSight(point, target) then return end
         local elevated = point.Y - p.Y >= opts.combatHeight
-        local outside = distance >= work.enemyReach(target) + opts.combatMargin
+        local outside = distance >= work.meleeClearance(target, stats)
         if opts.safeCombat and not elevated and not outside then return end
         local sum, neighbours = Vector3.new(0, 0, 0), 0
         local clearance = 30
@@ -2769,7 +2889,7 @@ local function runIslandEscape()
         for _, row in ipairs(work.hostiles()) do
             local d = (row.point - r.Position).Magnitude
             local baseDistance = center and (row.point - center).Magnitude or math.huge
-            if row.attackable and row.model.Parent and row.human.Health > 0
+            if row.attackable and row.model.Parent and row.human.Health > 0 and work.insideBorder(row.point)
                 and not (failed[row.model] and failed[row.model] > os.clock())
                 and ((key == "combat" and ((flags.combat and baseDistance <= opts.baseRadius) or d <= opts.guardRadius))
                     or (key == "hunt" and d <= opts.huntRadius and (flags.hunt or work.mobDropsFood(row.model)))) then
@@ -2839,7 +2959,7 @@ local function runIslandEscape()
             end
             if not work.strike(tool, stats, targets, {}, key) then return defeated end
             local damaged = work.await(key, function() return not target.Parent or enemyHuman.Health < before end,
-                math.max(0.15, math.min(0.5, tonumber(stats.useCd) or 0.7)))
+                math.max(0.2, math.min(tonumber(stats.windup) or 0, tonumber(stats.useCd) or 0.7) + 0.25))
             if work.preempted then return defeated end
             misses = damaged and 0 or misses + 1
             for _, attacked in ipairs(targets) do work.recordGuard(attacked) end
@@ -3616,7 +3736,7 @@ local function runIslandEscape()
         return false
     end
     local function enemyReady()
-        return work.meleeWeapon() ~= nil and (work.baseThreat() ~= nil or work.enemy(opts.guardRadius) ~= nil)
+        return work.meleeWeapon() ~= nil and ((flags.combat and work.baseThreat() ~= nil) or work.enemy(opts.guardRadius) ~= nil)
     end
     function work.needItem(id, amount, priority)
         local c = config()
@@ -3671,12 +3791,15 @@ local function runIslandEscape()
         local item = work.fuelItem()
         if not row or not higher or not item or not tonumber(row.woodBurnSec) or row.woodBurnSec <= 0 then return end
         local cap = tonumber(campData.campfireLevelCapMins)
-        if not cap and type(row.capMinsPlayerCount) == "table" and #row.capMinsPlayerCount > 0 then
+        if (not cap or cap <= 0) and type(row.capMinsPlayerCount) == "table" and #row.capMinsPlayerCount > 0 then
             local players = w and w:FindFirstChild("PlayerCount")
             cap = row.capMinsPlayerCount[math.clamp(players and players.Value or 1, 1, #row.capMinsPlayerCount)]
         end
         if not cap or cap <= 0 then return end
-        local remaining = campData.isOnFire and math.max(0, (campData.fuelEndTime or 0) - workspace:GetServerTimeNow()) or 0
+        local state = work.fireState()
+        if not state or state.remaining == nil or not work.firePendingReady() then return end
+        local remaining = state.remaining
+        if remaining >= cap * 60 - 0.05 then return end
         local amount = math.max(1, math.ceil((cap * 60 - remaining) / row.woodBurnSec))
         return {key = "campfire:" .. level, kind = "fuel", level = level, rank = 2 + (level - 1) * 2,
             name = "CAMPFIRE LEVEL " .. (level + 1), amounts = {[item.id] = amount}}
@@ -3702,7 +3825,9 @@ local function runIslandEscape()
         end
         local bag = work.bagGoal()
         if bag then bag.rank = math.min(bag.rank, 0.08) result[#result + 1] = bag end
-        local fire = (flags.buildCamp or flags.progression) and work.campfireGoal()
+        local upkeep = flags.fuel and work.maintenanceGoal()
+        if upkeep then result[#result + 1] = upkeep end
+        local fire = not upkeep and (flags.buildCamp or flags.progression) and work.campfireGoal()
         if fire then
             if campData.isOnFire == false then fire.rank = 0.02
             elseif work.bagNeedsFire then fire.rank = 0.25 end
@@ -3803,16 +3928,15 @@ local function runIslandEscape()
             if not next(missing) or full then acted = work.stationTick(goal) end
         elseif goal.kind == "fuel" then
             local item = work.fuelItem()
-            if item and count(item.displayName) > 0 and (not next(missing) or full) then
-                if travel(built("Campfire"), "progression") then
-                    local amount = math.min(count(item.displayName), goal.amounts[item.id])
-                    for _ = 1, amount do
-                        if not work.running("progression", player.Character, motion.serial)
-                            or os.clock() >= deadline
-                            or (tonumber(campData.campfireLevel) or 0) > goal.level then break end
-                        if not work.request("progression", "MakeFire", "addWood") then break end
-                        acted = true
-                    end
+            if item and count(item.displayName) > 0 then
+                local amount = math.min(count(item.displayName), goal.amounts[item.id])
+                for _ = 1, amount do
+                    if not work.running("progression", player.Character, motion.serial)
+                        or os.clock() >= deadline then break end
+                    if goal.maintenance and not work.maintenanceGoal() then break end
+                    if not goal.maintenance and (work.fireState() or {}).level ~= goal.level then break end
+                    if not work.addFireWood("progression") then break end
+                    acted = true
                 end
             end
         elseif goal.kind == "build" then
@@ -3954,7 +4078,7 @@ local function runIslandEscape()
         if key == "tidyBag" or key == "bagUpgrade" then return 4 end
         if key == "progression" then
             local goal = work.objective
-            if goal and goal.kind == "fuel" and campData.isOnFire == false then return 3 end
+            if goal and goal.kind == "fuel" and (goal.maintenance or campData.isOnFire == false) then return 3 end
             if goal and goal.kind == "bag" then return 4.1 end
             if goal and goal.kind == "quest" then return 6.2 end
             if goal and goal.id and goal.id == work.boatId() then return 9 end
@@ -4030,7 +4154,12 @@ local function runIslandEscape()
                 or (r.Position - pos(model)).Magnitude > (stats.range or 6) then return false end
         end
         work.nextStrikeAt = os.clock() + math.max(0, tonumber(stats.useCd) or 0.7)
-        RS.Events.meleeHitRemote:FireServer(targets, resources)
+        if #targets > 0 then
+            -- Use the game-bound Tool so its windup, hit window and hit selection run.
+            tool:Activate()
+        else
+            RS.Events.meleeHitRemote:FireServer(targets, resources)
+        end
         work.sent = work.sent + 1
         return true
     end
@@ -4077,7 +4206,7 @@ local function runIslandEscape()
     work.counts = {felled = 0, picked = 0, guarded = 0, escapes = 0}
     work.artifactNames = {Compass = true, Map = true, ["Plastic Bucket"] = true, Radio = true}
     function work.progressionEnabled()
-        return flags.progression or flags.toolLadder or flags.buildCamp or flags.buildBoat or flags.tidyBag
+        return flags.progression or flags.toolLadder or flags.buildCamp or flags.buildBoat or flags.tidyBag or flags.fuel
     end
     function work.isNight()
         local scene = world()
@@ -4261,7 +4390,12 @@ local function runIslandEscape()
     function work.tidyBag()
         local used, cap = work.bagState()
         if used < cap then return false end
-        local req = work.questRequirement
+        -- Keep recovery contexts intact while freeing slots through useful actions.
+        local item = work.fuelItem()
+        if flags.fuel and item and count(item.displayName) > 0 and work.maintenanceGoal() then
+            return work.addFireWood("tidyBag")
+        end
+        local req = flags.quest and work.questRequirement
         if req then
             local item = config().item.byId[req.itemId]
             if item and count(item.displayName) > 0 then return questTick("tidyBag") end
@@ -4275,7 +4409,19 @@ local function runIslandEscape()
             end
         end
         local goal = work.bagGoal()
-        if goal then return work.stationTick(goal, "tidyBag") end
+        if goal then
+            for id in pairs(goal.recipe or {}) do
+                local item = config().item.byId[id]
+                if item and count(item.displayName) > 0 then return work.stationTick(goal, "tidyBag") end
+            end
+        end
+        if flags.smelt and built("Furnace") then
+            local c = config()
+            local a, b = c.item.byId[c.misc.furnaceMatter1Id], c.item.byId[c.misc.furnaceMatter2Id]
+            if a and b and (count(a.displayName) > 0 or count(b.displayName) > 0) then
+                return travel(built("Furnace"), "tidyBag") and work.request("tidyBag", "Furnace", "addBoth")
+            end
+        end
         note("tidyBag", "NO SAFE SUBMISSION AVAILABLE; ITEMS KEPT")
         return false
     end
@@ -4538,7 +4684,12 @@ local function runIslandEscape()
             run = work.collectHuntedFood,
         },
         {
-            key = "tidyBag", priority = 4, cooldown = 0,
+            key = "tidyBag", priority = 4, cooldown = 0.15,
+            enabled = function()
+                return flags.tidyBag or work.progressionEnabled() or flags.gather or flags.chopTrees
+                    or flags.mineStone or flags.mineIron or flags.drops or work.treeDrops ~= nil
+                    or (work.dropQueue and #work.dropQueue > 0)
+            end,
             ready = function() local used, cap = work.bagState() return used >= cap end,
             run = work.tidyBag,
         },
@@ -4649,9 +4800,7 @@ local function runIslandEscape()
             cooldown = 4,
             ready = function()
                 local item = work.fuelItem()
-                return built("Campfire") and item and count(item.displayName) > 0
-                    and ((campData.campfireWoodCount == nil and not work.fuelProbe)
-                        or (type(campData.campfireWoodCount) == "number" and campData.campfireWoodCount < opts.fuel))
+                return item and count(item.displayName) > 0 and work.maintenanceGoal() ~= nil
             end,
             run = work.fuel,
         },
@@ -5005,5 +5154,3 @@ local function runIslandEscape()
     say("ISLAND ESCAPE LOADED • LONG RUN MODE • CONFIG SAVED PER GAME")
 end
 runIslandEscape()
-
-
