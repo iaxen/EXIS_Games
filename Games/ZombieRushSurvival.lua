@@ -406,7 +406,7 @@ local function run()
     local cfg = {version = 1, enabled = true, autoSkip = false, buyClasses = {}, upgradeClasses = {},
         buyWeapons = {}, upgradeWeapons = {}, loadout = {}, autoLoadout = false,
         health = false, gun = false, melee = false, autoPlace = false, defenseTypes = {},
-        regions = {}, maxDefenses = 18, reserveCash = 0, fight = false, fly = true,
+        regions = {}, maxDefenses = 18, reserveCash = 0, fight = false, fly = false, turretLeash = 20,
         headAim = true, bossFirst = true, clearance = 14, moveMode = "Smooth", placeSpawnArea = false, fireInput = "Mobile", flyHeight = 14, orbitRadius = 16, flySpeed = 32}
     local file = storage.path("EXIS_ZombieRushSurvival_" .. player.UserId .. ".json")
     if type(readfile) == "function" then
@@ -415,7 +415,9 @@ local function run()
             for key, value in pairs(data) do if type(value) == type(cfg[key]) then cfg[key] = value end end
         end
     end
-    for key, limits in pairs({maxDefenses = {1, 48}, reserveCash = {0, 1e12}, flyHeight = {5, 50},
+    -- Migrate old hover saves: combat now uses grounded dodging.
+    cfg.fly, cfg.moveMode = false, "Ground"
+    for key, limits in pairs({turretLeash = {8, 60}, maxDefenses = {1, 48}, reserveCash = {0, 1e12}, flyHeight = {5, 50},
         orbitRadius = {6, 90}, flySpeed = {8, 100}, clearance = {8, 60}}) do
         local value = cfg[key]
         cfg[key] = Core.finite(value) and math.clamp(value, limits[1], limits[2]) or limits[1]
@@ -750,6 +752,19 @@ local function run()
         state.layer, state.floors = layer, floors
         return true
     end
+    function app.stepMapLayer(direction)
+        local state = app.mapView
+        if not state or state.loading then return false end
+        local best, distance
+        for _, part in ipairs(state.parts) do
+            if part.Parent and part.Transparency < 1 and part.CFrame.UpVector.Y >= 0.65 then
+                local top = part.CFrame:PointToWorldSpace(Vector3.new(0, part.Size.Y / 2, 0)).Y
+                local delta = (top - state.layer) * direction
+                if delta > 0.5 and (not distance or delta < distance) then best, distance = top, delta end
+            end
+        end
+        return best ~= nil and app.mapLayer(best) or false
+    end
     function app.cloneMapPart(source)
         local changed = {}
         local all = {source}
@@ -819,7 +834,19 @@ local function run()
             if app.mapView ~= state then return end
             state.loading = false
             if state.failed > 0 then app.note("replica", "COPY FAILED FOR " .. state.failed .. " MAP PARTS") end
-            if not app.mapLayer(state.layer) then app.editorMessage = "CHOOSE A FLOOR LAYER" end
+            if not app.mapLayer(state.layer) then
+                -- Saved hover height is not a floor. Recover the closest visible
+                -- upward surface rather than leaving every map tap unselectable.
+                local nearest, distance
+                for _, part in ipairs(state.parts) do
+                    if part.Parent and part.Transparency < 1 and part.CFrame.UpVector.Y >= 0.65 then
+                        local top = part.CFrame:PointToWorldSpace(Vector3.new(0, part.Size.Y / 2, 0))
+                        local delta = math.abs(top.Y - state.layer)
+                        if not distance or delta < distance then nearest, distance = top.Y, delta end
+                    end
+                end
+                if not nearest or not app.mapLayer(nearest) then app.editorMessage = "NO SELECTABLE FLOOR; TRY ANOTHER LAYER" end
+            end
         end)
         return true
     end
@@ -852,6 +879,7 @@ local function run()
         local direction = state.camera.CFrame:VectorToWorldSpace(Vector3.new(x, y, z)).Unit
         local params = RaycastParams.new()
         params.FilterType, params.FilterDescendantsInstances = Enum.RaycastFilterType.Include, state.floors
+        params.RespectCanCollide = false -- Replica parts are non-colliding but queryable.
         return state.world:Raycast(state.camera.CFrame.Position, direction * (state.height * 3 + 200), params)
     end
     function app.navigation()
@@ -892,10 +920,34 @@ local function run()
         local root = app.root()
         if not root then return true end
         local params = RaycastParams.new()
-        params.FilterType, params.FilterDescendantsInstances = Enum.RaycastFilterType.Include, app.navigation().filters
+        local filters = {}
+        for _, folder in ipairs(app.navigation().filters) do filters[#filters + 1] = folder end
+        local defenses = workspace:FindFirstChild("Deployables")
+        if defenses then filters[#filters + 1] = defenses end
+        params.FilterType, params.FilterDescendantsInstances = Enum.RaycastFilterType.Include, filters
         params.RespectCanCollide, params.CollisionGroup = true, root.CollisionGroup
         -- Sweep a character-sized volume, not just a ray through its center.
         return workspace:Blockcast(CFrame.new(origin), Vector3.new(3, 4, 3), direction, params)
+    end
+    function app.groundRoute(a, b)
+        local cached = app.groundRouteCache
+        if cached and os.clock() < cached.untilTime and (cached.a - a).Magnitude < 1
+            and (cached.b - b).Magnitude < 1 then return cached.ok end
+        local root, human = app.root()
+        if not root then return false end
+        local delta, lift = b - a, human.HipHeight + root.Size.Y / 2
+        local steps = math.ceil(delta.Magnitude / 4)
+        local ok = steps <= 32
+        if ok then
+            for i = 0, math.max(1, steps) do
+                local point = a + delta * (i / math.max(1, steps))
+                local hit = app.raycast(point + Vector3.new(0, 4, 0), Vector3.new(0, -12, 0), app.mapFilters())
+                if not hit or hit.Material == Enum.Material.Water or hit.Normal.Y < 0.65
+                    or math.abs(hit.Position.Y - (point.Y - lift)) > 3.5 then ok = false break end
+            end
+        end
+        app.groundRouteCache = {a = a, b = b, ok = ok, untilTime = os.clock() + 0.2}
+        return ok
     end
     function app.placementRegion()
         if not cfg.placeSpawnArea then return app.region() end
@@ -930,12 +982,14 @@ local function run()
     function app.routeHop(goal)
         local root = app.root()
         if not root or not app.inPlayableMap(goal) then return nil end
-        if app.airRoute(root.Position, goal) and not app.travelHit(root.Position, goal - root.Position) then return goal end
+        if app.airRoute(root.Position, goal) and app.groundRoute(root.Position, goal)
+            and not app.travelHit(root.Position, goal - root.Position) then return goal end
         local cached = app.routeCache
         if cached and os.clock() < cached.untilTime and (cached.goal - goal).Magnitude < 1
             and (cached.from - root.Position).Magnitude < 3 then
             if not cached.hop then return nil end
-            if app.airRoute(root.Position, cached.hop) and not app.travelHit(root.Position, cached.hop - root.Position) then return cached.hop end
+            if app.airRoute(root.Position, cached.hop) and app.groundRoute(root.Position, cached.hop)
+                and not app.travelHit(root.Position, cached.hop - root.Position) then return cached.hop end
         end
         local cache = {goal = goal, from = root.Position, untilTime = os.clock() + 0.18}
         app.routeCache = cache
@@ -951,7 +1005,8 @@ local function run()
             if app.airRisk(point) == 0 then
                 local hop = app.flightPoint(point)
                 if hop and (hop - root.Position).Magnitude > 3 and app.airRoute(root.Position, hop)
-                    and app.airRoute(hop, goal) and not app.travelHit(root.Position, hop - root.Position)
+                    and app.airRoute(hop, goal) and app.groundRoute(root.Position, hop) and app.groundRoute(hop, goal)
+                    and not app.travelHit(root.Position, hop - root.Position)
                     and not app.travelHit(hop, goal - hop) then cache.hop = hop return hop end
             end
         end
@@ -1295,24 +1350,10 @@ local function run()
             if state.human.Parent then state.human.AutoRotate = state.autoRotate end
         end
     end
-    function app.ensureFlight(root, human)
-        if app.flight and app.flight.root == root then return end
-        app.stopFlight()
-        local attachment = Instance.new("Attachment")
-        attachment.Name, attachment.Parent = "EXIS_FLIGHT", root
-        local velocity = Instance.new("LinearVelocity")
-        velocity.Name, velocity.Attachment0 = "EXIS_FLIGHT_VELOCITY", attachment
-        velocity.RelativeTo, velocity.MaxForce = Enum.ActuatorRelativeTo.World, math.huge
-        velocity.VectorVelocity, velocity.Parent = Vector3.new(0, 0, 0), root
-        app.flight = {root = root, human = human, attachment = attachment, velocity = velocity, autoRotate = human.AutoRotate}
-        human.AutoRotate = false
-    end
     function app.move(goal, dt)
+        app.stopFlight()
         local root, human = app.root()
-        if not root or not goal then
-            if app.flight then app.flight.velocity.VectorVelocity = Vector3.new(0, 0, 0) end
-            return
-        end
+        if not root or not goal then app.stopWalk() return end
         local hop = app.routeHop(goal)
         if not hop then
             app.routeBlockedSince = app.routeBlockedSince or os.clock()
@@ -1321,42 +1362,24 @@ local function run()
                 if app.matchMix and app.placementKey then Core.finishChoice(app.matchMix, app.placementKey) end
                 app.placementTask, app.placementKey, app.buildGoal = nil, nil, nil
             end
-            if app.flight then app.flight.velocity.VectorVelocity = Vector3.new(0, 0, 0) end
+            human:MoveTo(root.Position)
+            app.walkGoal = nil
             app.airGoal = nil
             return
         end
         app.routeBlockedSince = nil
-        goal = hop
-        if cfg.moveMode == "Teleport" and cfg.fly then
-            app.ensureFlight(root, human)
-            app.flight.velocity.VectorVelocity = Vector3.new(0, 0, 0)
-            if os.clock() >= (app.next.teleport or 0) then
-                app.next.teleport = os.clock() + 0.15
-                root.CFrame = CFrame.new(goal) * root.CFrame.Rotation
-                root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            end
-            return
+        -- Preserve native gravity, collisions and WalkSpeed. Revalidate routes
+        -- every tick but avoid spamming the same Humanoid movement command.
+        if not app.walkGoal or (app.walkGoal - hop).Magnitude > 1
+            or os.clock() >= (app.next.walk or 0) then
+            app.walkGoal, app.next.walk = hop, os.clock() + 0.2
+            human:MoveTo(hop)
         end
-        if not cfg.fly then app.stopFlight() human:MoveTo(goal) return end
-        app.ensureFlight(root, human)
-        local delta = goal - root.Position
-        local direction = delta.Magnitude > 0.2 and delta.Unit * math.min(cfg.flySpeed, delta.Magnitude * 4) or Vector3.new(0, 0, 0)
-        if direction.Magnitude > 0 then
-            local probe = direction.Unit * math.min(5, delta.Magnitude)
-            local hit = app.travelHit(root.Position, probe)
-            if hit then
-                local slide = direction - hit.Normal * math.min(0, direction:Dot(hit.Normal))
-                direction = slide.Magnitude > 0.5 and slide.Unit * math.min(cfg.flySpeed, slide.Magnitude) or Vector3.new(0, 0, 0)
-            end
-        end
-        local rate = math.min(1, dt * 12)
-        local velocity = app.flight.velocity.VectorVelocity:Lerp(direction, rate)
-        local probe = root.Position + velocity * math.max(dt, 0.12)
-        if not app.airRoute(root.Position, probe) or app.travelHit(root.Position, probe - root.Position) then
-            velocity = Vector3.new(0, 0, 0)
-            app.airGoal = nil
-        end
-        app.flight.velocity.VectorVelocity = velocity
+    end
+    function app.stopWalk()
+        local root, human = app.root()
+        if app.walkGoal and root and human then human:MoveTo(root.Position) end
+        app.walkGoal, app.groundRouteCache = nil, nil
     end
     function app.enemyRows()
         if app.enemyCache and os.clock() < app.enemyCache.untilTime then return app.enemyCache.rows end
@@ -1391,75 +1414,96 @@ local function run()
         if not root then return nil end
         local lift = human.HipHeight + root.Size.Y / 2
         local base = hit.Position + Vector3.new(0, lift, 0)
-        local ceiling = app.raycast(base, Vector3.new(0, cfg.flyHeight + 3, 0), app.mapFilters())
-        local y = hit.Position.Y + cfg.flyHeight
-        if ceiling then y = math.min(y, ceiling.Position.Y - lift - 0.5) end
-        if y < base.Y then return nil end
-        return Vector3.new(point.X, y, point.Z)
+        return base
+    end
+    function app.turretAnchor()
+        local cached = app.turretCache
+        if cached and os.clock() < cached.untilTime and cached.model.Parent
+            and cached.model:GetAttribute("Destroyed") ~= true
+            and (cached.model:GetAttribute("Health") or 1) > 0 then return cached end
+        local root = app.root()
+        if not root then return end
+        local folder, best, bestScore = workspace:FindFirstChild("Deployables"), nil, nil
+        for _, model in ipairs(folder and folder:GetChildren() or {}) do
+            local name = model:GetAttribute("TypeName")
+            local info, primary = name and defs.Types[name], model.PrimaryPart
+            if model:IsA("Model") and model:GetAttribute("OwnerUserId") and primary and info
+                and Core.role(name, info) == "turret" and model:GetAttribute("Destroyed") ~= true
+                and (model:GetAttribute("Health") or 1) > 0
+                and math.abs(primary.Position.Y - root.Position.Y) < 12 then
+                local distance = (primary.Position - root.Position).Magnitude
+                local score = distance + (model:GetAttribute("OwnerUserId") == player.UserId and 0 or 12)
+                if not bestScore or score < bestScore then
+                    bestScore = score
+                    best = {model = model, point = primary.Position,
+                        radius = math.max(6, math.min(cfg.turretLeash or 20, (info.Targeting and info.Targeting.Range or 30) - 3)),
+                        untilTime = os.clock() + 0.5}
+                end
+            end
+        end
+        app.turretCache = best
+        return best
     end
     function app.safeAirGoal(target)
         local root = app.root()
         if not root then return nil end
-        local anchor = target and app.head(target.model) or root.Position
-        if not anchor then return nil end
-        local unsafe = app.airRisk(root.Position) > 0
-        local angle = os.clock() * 0.3 * (app.orbitDirection or 1)
-        local best, bestScore
-        local radius = math.max(cfg.orbitRadius, cfg.clearance + 4)
-        for _, row in ipairs(app.enemyRows()) do if target and row.model == target.model then radius = math.max(radius, (row.range or 3) + 7) end end
+        local turret = app.turretAnchor()
+        local anchor = turret and turret.point or root.Position
+        local initialRisk = app.airRisk(root.Position)
+        local unsafe = initialRisk > 0 or os.clock() < (app.damageEvadeUntil or 0)
+        if not turret and not unsafe then return root.Position end
+        -- Already safely covered by a turret: hold position and keep shooting.
+        local toAnchor = Vector3.new(root.Position.X - anchor.X, 0, root.Position.Z - anchor.Z).Magnitude
+        if turret and not unsafe and toAnchor <= turret.radius and toAnchor >= 5 then return root.Position end
         local candidates = {}
-        for _, distance in ipairs({radius, radius + 18, radius + 38}) do
-            for i = 0, 11 do
-                local a = angle + i * math.pi / 6
-                local point = anchor + Vector3.new(math.cos(a) * distance, 0, math.sin(a) * distance)
-                if app.inPlayableMap(point) and app.airRisk(point) == 0 then
-                    local cost = (point - root.Position).Magnitude
-                    if os.clock() < (app.damageEvadeUntil or 0) and cost < 12 then cost = cost + 100 end
-                    candidates[#candidates + 1] = {point = point, cost = cost + distance * 0.2}
-                end
-            end
-        end
-        table.sort(candidates, function(a, b) return a.cost < b.cost end)
-        for i = 1, math.min(8, #candidates) do
-            local goal = app.flightPoint(candidates[i].point)
-            if goal and app.routeHop(goal) then
-                if not target or not app.raycast(goal, anchor - goal, app.mapFilters()) then return goal end
-                if not best then best = goal end
-            end
-        end
-        if best then return best end
-        if unsafe then
-            -- Short lower-exposure steps let a surrounded player leave the swarm
-            -- without treating altitude as protection or crossing another crowd.
-            local risk = app.airRisk(root.Position)
+        local angle = os.clock() * 0.2 * (app.orbitDirection or 1)
+        local radii = turret and {6, math.max(8, turret.radius * 0.6), turret.radius} or {8, 14, 22}
+        for _, distance in ipairs(radii) do
             for i = 0, 15 do
-                local a = i * math.pi / 8
-                local goal = root.Position + Vector3.new(math.cos(a) * 10, 0, math.sin(a) * 10)
-                local nextRisk = app.airRisk(goal)
-                if nextRisk < risk and app.airRoute(root.Position, goal)
-                    and not app.raycast(root.Position, goal - root.Position, app.mapFilters()) then
-                    local supported = app.flightPoint(goal)
-                    if supported and (not bestScore or -nextRisk > bestScore) then best, bestScore = goal, -nextRisk end
+                local a = angle + i * math.pi / 8
+                local point = anchor + Vector3.new(math.cos(a) * distance, 0, math.sin(a) * distance)
+                local risk = app.airRisk(point)
+                local cost = (point - root.Position).Magnitude
+                if risk == 0 or initialRisk > 0 and risk < initialRisk then
+                    if unsafe and cost < 6 then cost = cost + 50 end
+                    candidates[#candidates + 1] = {point = point, score = risk * 1000 + cost + distance * 0.2}
                 end
             end
         end
-        if not best then app.note("flight", "NO CLEAR FLIGHT ROUTE; RECHECKING") end
-        return best
+        -- Safety can temporarily take us outside turret coverage. Never walk
+        -- through a swarm just to remain close to a turret.
+        if unsafe then
+            for i = 0, 15 do
+                local a = angle + i * math.pi / 8
+                local point = root.Position + Vector3.new(math.cos(a) * 10, 0, math.sin(a) * 10)
+                local risk = app.airRisk(point)
+                if risk < initialRisk then
+                    candidates[#candidates + 1] = {point = point, score = risk * 1000 + 100
+                        + (point - anchor).Magnitude}
+                end
+            end
+        end
+        table.sort(candidates, function(a, b) return a.score < b.score end)
+        for i = 1, math.min(12, #candidates) do
+            local goal = app.flightPoint(candidates[i].point)
+            if goal and app.routeHop(goal) then return goal end
+        end
+        app.note("movement", "NO SAFE GROUND ROUTE; HOLDING / RECHECKING")
+        return nil
     end
     function app.orbitGoal(target)
-        local cached = app.airGoal
-        local root = app.root()
+        local cached, root = app.airGoal, app.root()
         if cached and root and os.clock() < cached.untilTime and app.airRisk(cached.point) == 0
             and app.airRoute(root.Position, cached.point) then return cached.point end
         local goal = app.safeAirGoal(target)
-        app.airGoal = goal and {point = goal, untilTime = os.clock() + 0.25} or nil
+        app.airGoal = goal and {point = goal, untilTime = os.clock() + 0.2} or nil
         return goal
     end
     function app.combatTick(dt)
         if app.mode ~= "MATCH" or not app.active() then
-            app.releaseFire() app.stopFlight() app.buildGoal = nil return
+            app.releaseFire() app.stopFlight() app.stopWalk() app.buildGoal = nil return
         end
-        if not cfg.fight and not cfg.autoPlace then app.releaseFire() app.stopFlight() app.buildGoal = nil return end
+        if not cfg.fight and not cfg.autoPlace then app.releaseFire() app.stopFlight() app.stopWalk() app.buildGoal = nil return end
         local target = cfg.fight and app.target or nil
         if target and not target.model.Parent then target = nil end
         local build = cfg.autoPlace and not app.editing and app.buildGoal
@@ -1470,20 +1514,20 @@ local function run()
         end
         app.observedHealth = human and human.Health
         local danger = root and (app.airRisk(root.Position) > 0 or os.clock() < (app.damageEvadeUntil or 0))
-        if danger and cfg.fly and (cfg.fight or cfg.autoPlace) then
+        if danger and (cfg.fight or cfg.autoPlace) then
             build = nil
             app.move(app.orbitGoal(target), dt)
-            app.note("flight", "RELOCATING TO CLEAR MAP SPACE")
+            app.note("movement", "DODGING ZOMBIES ON SAFE GROUND")
         end
         if target and target.boss and cfg.bossFirst then build = nil end
         if build then app.releaseFire() app.move(build, dt) return end
         if not target then
             app.releaseFire()
-            if not danger then app.stopFlight() end
+            if not danger then app.move(app.orbitGoal(nil), dt) end
             return
         end
         local tool, info = app.weapon()
-        if cfg.fly and not danger then app.move(app.orbitGoal(target), dt) elseif not cfg.fly then app.stopFlight() end
+        if not danger then app.move(app.orbitGoal(target), dt) end
         if not tool or app.reload(tool) then return end
         local point = app.head(target.model)
         local camera = workspace.CurrentCamera
@@ -1515,10 +1559,13 @@ local function run()
     end
     -- Compact EXIS interface: sidebar categories and expanding child sections.
     local ui = {}
-    ui.blue, ui.text, ui.muted = Color3.fromRGB(58, 148, 245), Color3.fromRGB(224, 232, 244), Color3.fromRGB(147, 162, 184)
+    ui.blue, ui.text, ui.muted = Color3.fromRGB(80, 160, 255), Color3.fromRGB(232, 238, 248), Color3.fromRGB(156, 175, 198)
     function ui.new(class, properties, parent)
         local node = Instance.new(class)
-        for key, value in pairs(properties) do node[key] = value end
+        for key, value in pairs(properties) do
+            if key == "Text" and class == "TextButton" and type(value) == "string" then value = value:upper() end
+            node[key] = value
+        end
         node.Parent = parent
         return node
     end
@@ -1526,43 +1573,44 @@ local function run()
         ui.new("UICorner", {CornerRadius = UDim.new(0, radius or 7)}, node)
     end
     function ui.stroke(node, color)
-        ui.new("UIStroke", {Color = color or Color3.fromRGB(39, 56, 78), Thickness = 1}, node)
+        ui.new("UIStroke", {Color = color or Color3.fromRGB(32, 44, 61), Thickness = 1}, node)
     end
     function ui.stack(parent, padding)
         ui.new("UIListLayout", {Padding = UDim.new(0, padding or 4), SortOrder = Enum.SortOrder.LayoutOrder}, parent)
     end
     function ui.textLabel(parent, text, height)
         return ui.new("TextLabel", {Size = UDim2.new(1, 0, 0, height or 25), BackgroundTransparency = 1,
-            Text = text, TextColor3 = ui.muted, Font = Enum.Font.Gotham, TextSize = 11,
+            Text = text, TextColor3 = ui.muted, Font = Enum.Font.BuilderSans, TextSize = 10,
             TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left}, parent)
     end
     function ui.button(parent, text, callback)
-        local button = ui.new("TextButton", {Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = Color3.fromRGB(23, 42, 65),
-            Text = text, TextColor3 = ui.text, Font = Enum.Font.GothamMedium, TextSize = 11, AutoButtonColor = true}, parent)
+        local button = ui.new("TextButton", {Size = UDim2.new(1, 0, 0, 25), BorderSizePixel = 0, BackgroundColor3 = Color3.fromRGB(23, 45, 71),
+            Text = text, TextColor3 = ui.text, Font = Enum.Font.BuilderSansMedium, TextSize = 10, AutoButtonColor = true}, parent)
         ui.round(button, 6)
         app.connect(button.Activated, callback)
         return button
     end
     function ui.toggle(parent, text, object, key)
-        local row = ui.new("Frame", {Size = UDim2.new(1, 0, 0, 29), BackgroundTransparency = 1}, parent)
-        local label = ui.textLabel(row, text, 29)
-        label.Size, label.TextColor3 = UDim2.new(1, -50, 1, 0), ui.text
-        local button = ui.new("TextButton", {AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -2, 0.5, 0),
-            Size = UDim2.fromOffset(36, 19), Text = "", AutoButtonColor = false}, row)
-        ui.round(button, 5)
-        local thumb = ui.new("Frame", {Size = UDim2.fromOffset(13, 13), BorderSizePixel = 0,
-            BackgroundColor3 = ui.text}, button)
-        ui.round(thumb, 3)
+        local row = ui.new("TextButton", {Size = UDim2.new(1, 0, 0, 25), Text = "", BorderSizePixel = 0,
+            BackgroundColor3 = Color3.fromRGB(21, 30, 43)}, parent)
+        ui.round(row, 5)
+        ui.new("TextLabel", {Position = UDim2.fromOffset(7, 0), Size = UDim2.new(1, -53, 1, 0),
+            BackgroundTransparency = 1, Text = text:upper(), TextColor3 = ui.text, TextSize = 10, TextWrapped = true,
+            Font = Enum.Font.BuilderSans, TextXAlignment = Enum.TextXAlignment.Left}, row)
+        local track = ui.new("Frame", {Position = UDim2.new(1, -32, 0.5, -6), Size = UDim2.fromOffset(25, 12),
+            BackgroundColor3 = Color3.fromRGB(47, 59, 75), BorderSizePixel = 0}, row)
+        ui.round(track, 8)
+        local knob = ui.new("Frame", {Position = UDim2.fromOffset(2, 2), Size = UDim2.fromOffset(8, 8),
+            BackgroundColor3 = ui.text, BorderSizePixel = 0}, track)
+        ui.round(knob, 8)
         local function refresh()
-            local enabled = object[key] == true
-            button.BackgroundColor3 = enabled and ui.blue or Color3.fromRGB(44, 52, 67)
-            thumb.Position = UDim2.fromOffset(enabled and 20 or 3, 3)
+            track.BackgroundColor3 = object[key] and ui.blue or Color3.fromRGB(47, 59, 75)
+            knob.Position = UDim2.fromOffset(object[key] and 15 or 2, 2)
         end
-        app.connect(button.Activated, function()
+        app.connect(row.Activated, function()
             object[key] = not object[key]
             if object == cfg and (key == "fight" or key == "enabled" or key == "headAim") then app.releaseFire() end
-            app.changed()
-            refresh()
+            app.changed() refresh()
         end)
         refresh()
         return row
@@ -1573,7 +1621,7 @@ local function run()
         label.Size, label.TextColor3 = UDim2.new(1, -75, 1, 0), ui.text
         local input = ui.new("TextBox", {AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -2, 0, 3),
             Size = UDim2.fromOffset(67, 24), Text = tostring(cfg[key]), ClearTextOnFocus = false,
-            BackgroundColor3 = Color3.fromRGB(17, 28, 44), TextColor3 = ui.text, Font = Enum.Font.Gotham, TextSize = 11}, row)
+            BackgroundColor3 = Color3.fromRGB(17, 28, 44), TextColor3 = ui.text, Font = Enum.Font.BuilderSans, TextSize = 10}, row)
         ui.round(input, 5)
         app.connect(input.FocusLost, function()
             local value = tonumber(input.Text)
@@ -1581,38 +1629,46 @@ local function run()
             input.Text = tostring(cfg[key])
         end)
     end
+    -- Universal EXIS shell: copied from the Fuzzotopia design.
     local gui = ui.new("ScreenGui", {Name = "EXIS_ZOMBIE_RUSH", ResetOnSpawn = false,
-        IgnoreGuiInset = false, DisplayOrder = 100000, ZIndexBehavior = Enum.ZIndexBehavior.Sibling}, pg)
-    local frame = ui.new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.fromOffset(520, 354), BackgroundColor3 = Color3.fromRGB(10, 16, 25), BorderSizePixel = 0,
-        Active = true}, gui)
+        IgnoreGuiInset = false, DisplayOrder = 2147483647, ZIndexBehavior = Enum.ZIndexBehavior.Sibling}, pg)
+    local screen = ui.new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1}, gui)
+    local frame = ui.new("Frame", {Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(392, 272),
+        BackgroundColor3 = Color3.fromRGB(8, 12, 18), BorderSizePixel = 0, ClipsDescendants = true}, screen)
     ui.round(frame, 9)
-    ui.stroke(frame)
-    local scale = ui.new("UIScale", {Scale = 1}, frame)
+    ui.stroke(frame, Color3.fromRGB(48, 76, 111))
     function app.resize()
-        local camera = workspace.CurrentCamera
-        if camera then
-            scale.Scale = 1
-            frame.Size = UDim2.fromOffset(math.min(app.windowWidth or 520, camera.ViewportSize.X - 24),
-                math.min(app.windowHeight or 354, camera.ViewportSize.Y - 55))
+        local view = screen.AbsoluteSize
+        if view.X <= 0 or view.Y <= 0 then return end
+        local w, h = math.min(app.windowWidth or 392, math.max(1, view.X - 16)), math.min(app.windowHeight or 272, math.max(1, view.Y - 16))
+        frame.Size = UDim2.fromOffset(w, h)
+        if not app.windowPositioned then
+            frame.Position = UDim2.fromOffset((view.X - w) / 2, (view.Y - h) / 2)
+            app.windowPositioned = true
+        else
+            frame.Position = UDim2.fromOffset(math.clamp(frame.Position.X.Offset, 0, math.max(0, view.X - w)),
+                math.clamp(frame.Position.Y.Offset, 0, math.max(0, view.Y - h)))
         end
     end
     app.resize()
-    local titlebar = ui.new("Frame", {Size = UDim2.new(1, 0, 0, 35), BackgroundColor3 = Color3.fromRGB(15, 25, 40),
+    local titlebar = ui.new("Frame", {Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = Color3.fromRGB(17, 22, 31),
         BorderSizePixel = 0, Active = true}, frame)
-    ui.round(titlebar, 9)
-    ui.new("UIGradient", {Color = ColorSequence.new(Color3.fromRGB(20, 42, 68), Color3.fromRGB(11, 18, 30)), Rotation = 0}, titlebar)
-    local title = ui.textLabel(titlebar, "  EXIScript | ZOMBIE RUSH SURVIVAL", 35)
-    title.Size, title.TextColor3, title.Font = UDim2.new(1, -75, 1, 0), ui.blue, Enum.Font.GothamBold
-    local minimize = ui.button(titlebar, "−", function() frame.Visible = false end)
-    minimize.Size, minimize.Position = UDim2.fromOffset(27, 25), UDim2.new(1, -63, 0, 5)
+    ui.new("UIGradient", {Color = ColorSequence.new(Color3.fromRGB(175, 209, 255), Color3.fromRGB(105, 125, 152)), Rotation = 12}, titlebar)
+    ui.new("Frame", {Position = UDim2.fromOffset(7, 11), Size = UDim2.fromOffset(2, 12), BackgroundColor3 = ui.blue, BorderSizePixel = 0}, titlebar)
+    local title = ui.textLabel(titlebar, "EXIScript | ZOMBIE RUSH SURVIVAL", 30)
+    title.Position, title.Size, title.TextColor3, title.Font = UDim2.fromOffset(18, 0), UDim2.new(1, -75, 1, 0), ui.blue, Enum.Font.BuilderSansBold
+    title.TextWrapped, title.TextTruncate, title.TextSize = false, Enum.TextTruncate.AtEnd, 11
+    local icon
+    local minimize = ui.button(titlebar, "−", function() frame.Visible = false icon.Visible = true end)
+    minimize.Size, minimize.Position, minimize.TextSize = UDim2.fromOffset(25, 23), UDim2.new(1, -57, 0, 3), 20
+    minimize.BackgroundColor3 = Color3.fromRGB(14, 19, 27)
     local close = ui.button(titlebar, "×", function() app.stop() end)
-    close.Size, close.Position = UDim2.fromOffset(27, 25), UDim2.new(1, -32, 0, 5)
-    local icon = ui.new("TextButton", {Size = UDim2.fromOffset(34, 34), Position = UDim2.new(0, 16, 0.5, 0),
-        BackgroundColor3 = Color3.fromRGB(12, 25, 42), Text = "EXIS", TextColor3 = ui.blue,
-        TextSize = 11, Font = Enum.Font.GothamBold, AutoButtonColor = true}, gui)
-    ui.round(icon, 6)
-    ui.stroke(icon, ui.blue)
+    close.Size, close.Position, close.TextSize = UDim2.fromOffset(25, 23), UDim2.new(1, -29, 0, 3), 20
+    close.BackgroundColor3 = Color3.fromRGB(14, 19, 27)
+    icon = ui.new("TextButton", {Name = "OpenEXIScript", Size = UDim2.fromOffset(32, 32), Position = UDim2.fromOffset(12, 90),
+        BackgroundColor3 = Color3.fromRGB(8, 15, 25), Text = "EXIS", TextColor3 = Color3.fromRGB(240, 247, 255),
+        TextSize = 10, Font = Enum.Font.BuilderSansBold, Visible = false, BorderSizePixel = 0, ZIndex = 20}, screen)
+    ui.round(icon, 4) ui.stroke(icon, ui.blue)
     function ui.draggable(handle, target, activate)
         local pointer, initial, origin, moved
         app.connect(handle.InputBegan, function(input)
@@ -1626,7 +1682,9 @@ local function run()
                 local delta = input.Position - initial
                 if delta.Magnitude > 5 then moved = true end
                 if moved then
-                    target.Position = UDim2.new(origin.X.Scale, origin.X.Offset + delta.X, origin.Y.Scale, origin.Y.Offset + delta.Y)
+                    local size = screen.AbsoluteSize
+                    target.Position = UDim2.fromOffset(math.clamp(origin.X.Offset + delta.X, 0, math.max(0, size.X - target.AbsoluteSize.X)),
+                        math.clamp(origin.Y.Offset + delta.Y, 0, math.max(0, size.Y - target.AbsoluteSize.Y)))
                 end
             end
         end)
@@ -1640,7 +1698,7 @@ local function run()
     ui.draggable(titlebar, frame)
     ui.draggable(icon, icon, function()
         if app.editing and app.closeMapEditor then app.closeMapEditor(false)
-        else frame.Visible = not frame.Visible end
+        else frame.Visible, icon.Visible = true, false end
     end)
     local grip = ui.new("TextButton", {Size = UDim2.fromOffset(17, 17), Position = UDim2.new(1, -18, 1, -18),
         Text = "◢", TextColor3 = ui.blue, BackgroundTransparency = 1, TextSize = 16, ZIndex = 4}, frame)
@@ -1653,67 +1711,98 @@ local function run()
     app.connect(UIS.InputChanged, function(input)
         if resizePointer and (input == resizePointer or input.UserInputType == Enum.UserInputType.MouseMovement) then
             local delta = input.Position - resizeStart
-            app.windowWidth, app.windowHeight = math.clamp(resizeSize.X + delta.X, 340, 800), math.clamp(resizeSize.Y + delta.Y, 260, 650)
+            app.windowWidth, app.windowHeight = math.clamp(resizeSize.X + delta.X, 310, 800), math.clamp(resizeSize.Y + delta.Y, 210, 650)
             app.resize()
         end
     end)
     app.connect(UIS.InputEnded, function(input)
         if input == resizePointer or input.UserInputType == Enum.UserInputType.MouseButton1 then resizePointer = nil end
     end)
-    local navigation = ui.new("ScrollingFrame", {Position = UDim2.fromOffset(8, 44), Size = UDim2.new(0, 94, 1, -69),
-        BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 1, CanvasSize = UDim2.new(),
-        AutomaticCanvasSize = Enum.AutomaticSize.Y}, frame)
-    ui.stack(navigation, 5)
-    local body = ui.new("Frame", {Position = UDim2.fromOffset(112, 44), Size = UDim2.new(1, -122, 1, -69),
-        BackgroundTransparency = 1}, frame)
-    local footer = ui.textLabel(frame, "READY", 19)
-    footer.Position, footer.Size = UDim2.new(0, 10, 1, -21), UDim2.new(1, -20, 0, 19)
+    local shellBody = ui.new("Frame", {Position = UDim2.fromOffset(0, 30), Size = UDim2.new(1, 0, 1, -30), BackgroundTransparency = 1}, frame)
+    local navigation = ui.new("ScrollingFrame", {Size = UDim2.new(0, 82, 1, 0), BackgroundColor3 = Color3.fromRGB(15, 19, 27),
+        BorderSizePixel = 0, ScrollBarThickness = 2, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y}, shellBody)
+    ui.new("UIPadding", {PaddingTop = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4)}, navigation)
+    ui.stack(navigation, 3)
+    local body = ui.new("Frame", {Position = UDim2.fromOffset(90, 29), Size = UDim2.new(1, -99, 1, -51), BackgroundTransparency = 1}, shellBody)
+    local pageTitle = ui.textLabel(shellBody, "MAIN", 26)
+    pageTitle.Position, pageTitle.Size, pageTitle.TextColor3, pageTitle.Font = UDim2.fromOffset(91, 0), UDim2.new(1, -101, 0, 26), ui.text, Enum.Font.BuilderSansBold
+    pageTitle.TextSize = 12
+    ui.new("Frame", {Position = UDim2.fromOffset(82, 0), Size = UDim2.new(0, 1, 1, 0), BackgroundColor3 = Color3.fromRGB(31, 43, 59), BorderSizePixel = 0}, shellBody)
+    ui.new("Frame", {Position = UDim2.fromOffset(91, 25), Size = UDim2.new(1, -102, 0, 1), BackgroundColor3 = Color3.fromRGB(31, 43, 59), BorderSizePixel = 0}, shellBody)
+    local footer = ui.textLabel(shellBody, "READY", 19)
+    footer.Position, footer.Size = UDim2.new(0, 91, 1, -22), UDim2.new(1, -119, 0, 19)
     footer.TextTruncate, footer.TextWrapped, footer.TextSize = Enum.TextTruncate.AtEnd, false, 10
-    ui.pages, ui.nav, ui.openGroups = {}, {}, {}
+    ui.pages, ui.nav, ui.groups = {}, {}, {}
     function ui.page(name)
         local page = ui.new("ScrollingFrame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
             BorderSizePixel = 0, ScrollBarThickness = 2, ScrollBarImageColor3 = ui.blue,
             CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = false}, body)
-        ui.new("UIPadding", {PaddingRight = UDim.new(0, 4), PaddingLeft = UDim.new(0, 1), PaddingBottom = UDim.new(0, 8)}, page)
-        ui.stack(page, 6)
+        ui.stack(page, 3)
         ui.pages[name] = page
-        local button = ui.button(navigation, name, function() ui.show(name) end)
-        button.TextSize = 10
+        local button = ui.button(navigation, "  " .. name, function() ui.show(name) end)
+        button.Size, button.TextXAlignment, button.Font = UDim2.new(1, 0, 0, 21), Enum.TextXAlignment.Left, Enum.Font.BuilderSansMedium
+        ui.round(button, 7) ui.stroke(button, Color3.fromRGB(35, 56, 79))
         ui.nav[name] = button
         return page
     end
     function ui.show(name)
+        if app.selectedPage == name then body.Visible = not body.Visible return end
         app.selectedPage = name
+        body.Visible, pageTitle.Text = true, name:upper()
         for key, page in pairs(ui.pages) do
             page.Visible = key == name
-            ui.nav[key].BackgroundColor3 = key == name and Color3.fromRGB(26, 65, 107) or Color3.fromRGB(14, 25, 39)
+            ui.nav[key].BackgroundColor3 = key == name and Color3.fromRGB(23, 45, 71) or Color3.fromRGB(15, 19, 27)
+            ui.nav[key].TextColor3 = key == name and ui.blue or ui.text
         end
     end
-    function ui.group(parent, name)
-        local box = ui.new("Frame", {Size = UDim2.new(1, -1, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-            BackgroundColor3 = Color3.fromRGB(15, 23, 35), BorderSizePixel = 0}, parent)
-        ui.round(box, 7)
-        ui.stroke(box)
-        ui.stack(box, 0)
-        local header = ui.button(box, "  " .. name .. "    ›", function() end)
-        header.TextXAlignment, header.BackgroundTransparency, header.Size = Enum.TextXAlignment.Left, 1, UDim2.new(1, 0, 0, 31)
-        local children = ui.new("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-            BackgroundTransparency = 1, Visible = false}, box)
-        ui.new("UIPadding", {PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 9), PaddingBottom = UDim.new(0, 6)}, children)
-        ui.stack(children, 2)
-        local function set(open)
-            children.Visible = open
-            header.Text = "  " .. name .. (open and "    ⌄" or "    ›")
+function ui.group(container,name)
+    local frame=ui.new("Frame",{Size=UDim2.new(1,-4,0,0),AutomaticSize=Enum.AutomaticSize.Y,
+        BackgroundColor3=Color3.fromRGB(16,22,31),BorderSizePixel=0},container)
+    ui.round(frame,6)
+    local border=ui.new("UIStroke",{Color=Color3.fromRGB(32,44,61),Thickness=1},frame)
+    ui.new("UIListLayout",{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,0)},frame)
+    local header=ui.new("TextButton",{LayoutOrder=0,Size=UDim2.new(1,0,0,25),
+        BackgroundTransparency=1,Text="",AutoButtonColor=false},frame)
+    ui.new("TextLabel",{Position=UDim2.fromOffset(9,0),Size=UDim2.new(1,-35,1,0),
+        BackgroundTransparency=1,Text=name:upper(),TextXAlignment=Enum.TextXAlignment.Left,
+        TextTruncate=Enum.TextTruncate.AtEnd,TextColor3=ui.text,TextSize=10,
+        Font=Enum.Font.BuilderSansMedium},header)
+    local arrow=ui.new("TextLabel",{Position=UDim2.new(1,-24,0,0),Size=UDim2.fromOffset(20,25),
+        BackgroundTransparency=1,Text="›",TextColor3=Color3.fromRGB(126,149,179),TextSize=17,
+        Font=Enum.Font.BuilderSans},header)
+    local body=ui.new("Frame",{LayoutOrder=1,Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,
+        BackgroundTransparency=1,Visible=false},frame)
+    ui.new("UIPadding",{PaddingLeft=UDim.new(0,6),PaddingRight=UDim.new(0,6),
+        PaddingTop=UDim.new(0,2),PaddingBottom=UDim.new(0,5)},body)
+    ui.new("UIListLayout",{Padding=UDim.new(0,3),SortOrder=Enum.SortOrder.LayoutOrder},body)
+    local accent=ui.new("Frame",{Position=UDim2.fromOffset(0,7),Size=UDim2.fromOffset(2,11),
+        BackgroundColor3=ui.blue,BackgroundTransparency=0.7,BorderSizePixel=0},header)
+    local entry={frame=frame,body=body}
+    function entry.setOpen(open)
+        body.Visible=open
+        arrow.Text=open and "⌄" or "›"
+        arrow.TextColor3=open and ui.blue or Color3.fromRGB(126,149,179)
+        border.Color=open and Color3.fromRGB(49,88,135) or Color3.fromRGB(32,44,61)
+        frame.BackgroundColor3=open and Color3.fromRGB(18,27,39) or Color3.fromRGB(16,22,31)
+        accent.BackgroundTransparency=open and 0 or 0.7
+        if not open then
+            for _,other in ipairs(ui.groups) do
+                if other.frame:IsDescendantOf(body) then other.setOpen(false) end
+            end
         end
-        app.connect(header.Activated, function()
-            local open = not children.Visible
-            local previous = ui.openGroups[parent]
-            if previous and previous ~= set then previous(false) end
-            ui.openGroups[parent] = open and set or nil
-            set(open)
-        end)
-        return children
     end
+    ui.groups[#ui.groups+1]=entry
+    app.connect(header.Activated, function()
+        local open=not body.Visible
+        if open then
+            for _,other in ipairs(ui.groups) do
+                if other~=entry and other.frame.Parent==frame.Parent then other.setOpen(false) end
+            end
+        end
+        entry.setOpen(open)
+    end)
+    return body
+end
     local main = ui.page("MAIN")
     local classPage = ui.page("CLASSES")
     local weaponPage = ui.page("WEAPONS")
@@ -1722,20 +1811,16 @@ local function run()
     local areaPage = ui.page("AREA")
     local settings = ui.page("SETTINGS")
     local contextLabel = ui.textLabel(main, "DETECTING CLASS / MAP", 42)
-    contextLabel.TextColor3, contextLabel.Font = ui.text, Enum.Font.GothamMedium
+    contextLabel.TextColor3, contextLabel.Font = ui.text, Enum.Font.BuilderSansMedium
     local fight = ui.group(main, "FIGHT MODE")
     ui.toggle(fight, "AUTO FIGHT", cfg, "fight")
     ui.toggle(fight, "HEAD AIM", cfg, "headAim")
     ui.toggle(fight, "BOSS FIRST", cfg, "bossFirst")
     ui.textLabel(fight, "Uses your equipped gun's normal fire, ammo and reload rules.", 30)
-    local flight = ui.group(main, "FLY AROUND TARGETS")
-    ui.toggle(flight, "FLY ORBIT", cfg, "fly")
-    ui.number(flight, "HEIGHT", "flyHeight", 5, 50)
-    ui.number(flight, "ORBIT RADIUS", "orbitRadius", 6, 60)
-    ui.number(flight, "FLY SPEED", "flySpeed", 8, 100)
-    ui.number(flight, "ZOMBIE CLEARANCE", "clearance", 8, 60)
-    ui.button(flight, "SMOOTH FLIGHT", function() cfg.moveMode = "Smooth" app.changed() end)
-    ui.button(flight, "CHECKED TELEPORT", function() cfg.moveMode = "Teleport" app.changed() end)
+    local movement = ui.group(main, "DODGE NEAR TURRETS")
+    ui.textLabel(movement, "Ground movement · avoid zombies · stay within friendly turret coverage. Safety comes first.", 44)
+    ui.number(movement, "TURRET DISTANCE", "turretLeash", 8, 60)
+    ui.number(movement, "ZOMBIE CLEARANCE", "clearance", 8, 60)
     local wave = ui.group(main, "WAVES")
     ui.toggle(wave, "AUTO SKIP", cfg, "autoSkip")
     local liveLabel = ui.textLabel(main, "", 62)
@@ -1826,6 +1911,8 @@ local function run()
         LightDirection = Vector3.new(-1, -2, -1), Active = true, ZIndex = 4}, mapHolder)
     local dotOverlay = ui.new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
         Active = false, Visible = false, ZIndex = 5}, mapHolder)
+    local mapCapture = ui.new("TextButton", {Name = "MapCornerInput", Size = UDim2.fromScale(1, 1),
+        Text = "", BackgroundTransparency = 1, AutoButtonColor = false, Active = true, Modal = true, ZIndex = 8}, mapHolder)
     local dots, lines = {}, {}
     function app.refreshMapDots(camera)
         local points = app.draft or {}
@@ -1833,7 +1920,7 @@ local function run()
             local dot, line = dots[i], lines[i]
             if not dot then
                 dot = ui.new("TextLabel", {Size = UDim2.fromOffset(20, 20), AnchorPoint = Vector2.new(0.5, 0.5),
-                    Text = tostring(i), TextSize = 10, Font = Enum.Font.GothamBold, BackgroundColor3 = ui.blue,
+                    Text = tostring(i), TextSize = 10, Font = Enum.Font.BuilderSansBold, BackgroundColor3 = ui.blue,
                     TextColor3 = Color3.fromRGB(255, 255, 255), BorderSizePixel = 0, ZIndex = 7, Active = false}, dotOverlay)
                 ui.round(dot, 10)
                 line = ui.new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0,
@@ -1846,7 +1933,7 @@ local function run()
                 local a = app.projectMapPoint(Vector3.new(point.x, point.y, point.z))
                 dot.Position, dot.Visible = UDim2.fromOffset(a and a.X or 0, a and a.Y or 0), a ~= nil
                 dot.BackgroundColor3 = i == 1 and Color3.fromRGB(255, 190, 75) or ui.blue
-                local nextPoint = points[i + 1]
+                local nextPoint = points[i + 1] or (#points >= 3 and i == #points and points[1])
                 local b = nextPoint and app.projectMapPoint(Vector3.new(nextPoint.x, nextPoint.y, nextPoint.z))
                 if a and b then
                     local delta = Vector2.new(b.X - a.X, b.Y - a.Y)
@@ -1854,6 +1941,7 @@ local function run()
                     line.Size = UDim2.fromOffset(delta.Magnitude, 2)
                     line.Rotation = math.deg(math.atan2(delta.Y, delta.X))
                     line.BackgroundColor3 = i == 1 and Color3.fromRGB(255, 190, 75) or ui.blue
+                    line.BackgroundTransparency = i == #points and 0.45 or 0
                     line.Visible = true
                 end
             end
@@ -1881,7 +1969,9 @@ local function run()
         local root, human = app.root()
         if not root then app.note("area", "WAIT UNTIL YOUR CHARACTER IS ALIVE") return end
         local saved = app.region().points or {}
-        local layer = root.Position.Y - human.HipHeight - root.Size.Y / 2
+        local floor = app.raycast(root.Position, Vector3.new(0, -256, 0), app.mapFilters())
+        local layer = floor and floor.Normal.Y >= 0.65 and floor.Position.Y
+            or root.Position.Y - human.HipHeight - root.Size.Y / 2
         if #saved > 0 then layer = saved[1].y end
         if not app.startMapView(layer) then return end
         app.buildGoal = nil
@@ -1921,14 +2011,12 @@ local function run()
     end
     editorButton("FLOOR −", 0, 0.25, 97, function()
         if app.mapView then
-            local old = app.mapView.layer
-            if not app.mapLayer(old - 6) then app.mapLayer(old) app.editorMessage = "NO LOWER FLOOR" end
+            if app.stepMapLayer(-1) then app.editorMessage = nil else app.editorMessage = "NO LOWER FLOOR" end
         end
     end)
     editorButton("FLOOR +", 0.75, 0.25, 97, function()
         if app.mapView then
-            local old = app.mapView.layer
-            if not app.mapLayer(old + 6) then app.mapLayer(old) app.editorMessage = "NO HIGHER FLOOR" end
+            if app.stepMapLayer(1) then app.editorMessage = nil else app.editorMessage = "NO HIGHER FLOOR" end
         end
     end)
     editorButton("FULL / CUTAWAY", 0.25, 0.5, 97, function()
@@ -1955,7 +2043,7 @@ local function run()
     ui.button(system, "SAVE CONFIG NOW", function() app.save() app.note("config", "SAVED") end)
     ui.button(system, "STOP MOVEMENT / FIRING", function()
         cfg.fight, cfg.autoPlace = false, false
-        app.releaseFire() app.stopFlight() app.buildGoal = nil app.changed()
+        app.releaseFire() app.stopFlight() app.stopWalk() app.buildGoal = nil app.changed()
     end)
     local diagnostics = ui.group(settings, "DIAGNOSTICS")
     local diagnosticLabel = ui.textLabel(diagnostics, "", 150)
@@ -1973,20 +2061,15 @@ local function run()
     end)
     ui.textLabel(inputOptions, "Switch input mode if aiming works but firing does not.", 30)
     local resize = ui.group(settings, "WINDOW")
-    ui.button(resize, "CENTER / FIT SCREEN", function() frame.Position = UDim2.fromScale(0.5, 0.5) app.resize() end)
-    app.connect(UIS.InputBegan, function(input, processed)
+    ui.button(resize, "CENTER / FIT SCREEN", function() app.windowPositioned = false app.resize() end)
+    function app.tapMap(input)
         if not app.editing then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if not app.mapView or app.mapView.loading then return end
+        if not app.mapView or app.mapView.loading then app.editorMessage = "MAP IS STILL LOADING" return end
+        if #app.mapView.floors == 0 then app.editorMessage = "NO FLOOR SELECTED; USE FLOOR CONTROLS" return end
         local screen = Vector2.new(input.Position.X, input.Position.Y)
         local at, size = app.viewport.AbsolutePosition, app.viewport.AbsoluteSize
         if screen.X < at.X or screen.Y < at.Y or screen.X > at.X + size.X or screen.Y > at.Y + size.Y then return end
-        if #pg:GetGuiObjectsAtPosition(screen.X, screen.Y) > 0 then
-            -- Only our editor blocks selection; the game's transparent full-screen HUD does not.
-            for _, object in ipairs(pg:GetGuiObjectsAtPosition(screen.X, screen.Y)) do
-                if object:IsDescendantOf(editor) or object == icon or (frame.Visible and object:IsDescendantOf(frame)) then return end
-            end
-        end
         if not app.pickPart and #app.draft >= 3 then
             local first = app.draft[1]
             local pixel = app.projectMapPoint(Vector3.new(first.x, first.y, first.z))
@@ -1996,7 +2079,7 @@ local function run()
             end
         end
         local hit = app.mapViewRay(screen)
-        if not hit or not hit.Instance:IsA("BasePart") or hit.Normal.Y < 0.65 then app.note("area", "TAP A FLOOR SURFACE") return end
+        if not hit or not hit.Instance:IsA("BasePart") or hit.Normal.Y < 0.65 then app.editorMessage = "TAP A VISIBLE FLOOR; TRY FLOOR + / -" app.note("area", app.editorMessage) return end
         app.editorMessage = nil
         if app.pickPart then
             local part = app.mapView.sources[hit.Instance]
@@ -2010,11 +2093,16 @@ local function run()
             app.surface, app.surfaceMap = part, app.mapId
             app.draftSurface = {name = part.Name, x = part.Position.X, y = part.Position.Y, z = part.Position.Z}
         else
-            if #app.draft >= 24 then app.note("area", "MAXIMUM 24 DOTS") return end
+            if #app.draft >= 24 then app.editorMessage = "MAXIMUM 24 DOTS; CONNECT OR UNDO" app.note("area", app.editorMessage) return end
             local p = hit.Position
             app.draft[#app.draft + 1] = {x = p.X, y = p.Y, z = p.Z}
         end
+        app.editorMessage = "CORNER " .. #app.draft .. " MARKED · TAP MORE OR CONNECT"
         if app.mapView then app.refreshMapDots(app.mapView.camera) end
+    end
+    app.connect(mapCapture.InputBegan, function(input)
+        local ok, err = pcall(app.tapMap, input)
+        if not ok then app.editorMessage = "MAP INPUT ERROR: " .. tostring(err) app.note("area", app.editorMessage) end
     end)
     app.connect(UIS.InputEnded, function(input)
         if app.editing and app.held and input ~= app.held.token
@@ -2024,7 +2112,7 @@ local function run()
         if not app.alive then return end
         app.alive = false
         app.save()
-        app.releaseFire() app.stopFlight() app.stopMapView() app.clearMarkers()
+        app.releaseFire() app.stopFlight() app.stopWalk() app.stopMapView() app.clearMarkers()
         RunService:UnbindFromRenderStep("EXIS_ZOMBIE_AIM")
         RunService:UnbindFromRenderStep("EXIS_ZOMBIE_MAP")
         for _, connection in ipairs(app.connections) do connection:Disconnect() end
@@ -2040,7 +2128,8 @@ local function run()
     app.connect(gui.Destroying, app.stop)
     app.connect(player.CharacterRemoving, function()
         if app.editing then app.closeMapEditor(false) end
-        app.releaseFire() app.stopFlight() app.buildGoal = nil
+        app.releaseFire() app.stopFlight() app.stopWalk() app.buildGoal = nil
+        app.turretCache, app.airGoal, app.observedHealth = nil, nil, nil
     end)
     RunService:BindToRenderStep("EXIS_ZOMBIE_MAP", Enum.RenderPriority.Camera.Value + 20, function()
         local ok, err = pcall(app.renderMapView)
@@ -2061,7 +2150,7 @@ local function run()
             if not ok then app.note("target", err) end
         end
         local ok, err = pcall(app.combatTick, dt)
-        if not ok then app.releaseFire() app.stopFlight() app.note("combat", err) end
+        if not ok then app.releaseFire() app.stopFlight() app.stopWalk() app.note("combat", err) end
     end)
     RunService:BindToRenderStep("EXIS_ZOMBIE_AIM", Enum.RenderPriority.Camera.Value + 5, function()
         local ok, err = pcall(app.aimTick)
@@ -2077,6 +2166,7 @@ local function run()
                     app.planKey, app.target, app.buildGoal, app.surface, app.defenseCache = nil, nil, nil, nil, nil
                     app.rejected, app.pendingPlacements = {}, {}
                     app.enemyCache, app.airGoal, app.navCache, app.spawnAnchor = nil, nil, nil, nil
+                    app.turretCache, app.groundRouteCache, app.walkGoal, app.observedHealth = nil, nil, nil, nil
                     app.matchMix, app.placementTask = nil, nil
                     ui.buildClasses() ui.buildDefenses()
                 end
