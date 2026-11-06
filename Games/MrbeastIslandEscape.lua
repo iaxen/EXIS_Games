@@ -35,6 +35,9 @@ local function runIslandEscape()
         interval = 0,
         schedulerVersion = 4,
         suiteVersion = 1,
+        smoothVersion = 1,
+        evadeMove = "Teleport",
+        espLabelsOnly = true,
         onlyNeeded = true,
         fastHarvest = true,
         settleTime = 0.12,
@@ -366,11 +369,14 @@ local function runIslandEscape()
                 end
                 if type(d.options) == "table" then
                     opts.suiteVersionLoaded = d.options.suiteVersion == 1
+                    opts.smoothVersionLoaded = d.options.smoothVersion == 1
+                    if d.options.evadeMove == "Walk" or d.options.evadeMove == "Tween" or d.options.evadeMove == "Teleport" then opts.evadeMove = d.options.evadeMove end
+                    if type(d.options.espLabelsOnly) == "boolean" then opts.espLabelsOnly = d.options.espLabelsOnly end
                     for _, name in ipairs({"onlyNeeded", "fastHarvest", "emergencyEscape", "avoidEnemies"}) do
                         if type(d.options[name]) == "boolean" then opts[name] = d.options[name] end
                     end
                     if type(d.options.codes) == "string" then opts.codes = d.options.codes:sub(1, 4096) end
-                    for name, limits in pairs({settleTime = {0.05, 2}, guardRadius = {6, 80}, shadowRadius = {20, 150},
+                    for name, limits in pairs({settleTime = {0, 2}, guardRadius = {6, 80}, shadowRadius = {20, 150},
                         hoverHeight = {4, 24}, roundWait = {5, 120}, espDistance = {30, 5000}, espLimit = {20, 500},
                         dangerRadius = {8, 60}, baseRadius = {15, 100}}) do
                         local n = tonumber(d.options[name])
@@ -401,6 +407,12 @@ local function runIslandEscape()
     end
     if not opts.schedulerVersionLoaded then opts.interval = 0 end
     if not opts.suiteVersionLoaded then flags.escape = false end
+    if not opts.smoothVersionLoaded then
+        opts.interval = 0
+        opts.settleTime = 0
+        opts.fastHarvest = true
+        opts.espLimit = math.min(opts.espLimit, 48)
+    end
     opts.dangerRadius = math.clamp(tonumber(opts.dangerRadius) or 20, 8, 60)
     opts.baseRadius = math.clamp(tonumber(opts.baseRadius) or 45, 15, 100)
     opts.interval = math.clamp(opts.interval, 0, 5)
@@ -817,7 +829,8 @@ local function runIslandEscape()
         r = root()
         return r and (r.Position - goal).Magnitude <= 4
     end
-    local function travel(target, key, radius)
+    local function travel(target, key, radius, overrideMode)
+        local mode = overrideMode or opts.move
         local r, h = root()
         if not r then
             note(key, "CHARACTER NOT READY")
@@ -846,7 +859,7 @@ local function runIslandEscape()
         if (r.Position - p).Magnitude <= radius and motion.floor(r.Position, nil, 8, 3) then
             return true
         end
-        motion.owner = key
+        motion.owner, motion.mode = key, mode
         local goals = motion.goals(target, radius)
         for i = #goals, 1, -1 do
             if not work.safeDestination(goals[i], key) then table.remove(goals, i) end
@@ -864,7 +877,7 @@ local function runIslandEscape()
                 end
                 local goal = goals[index]
                 if not work.safeDestination(goal, key) then return false end
-                if opts.move == "Teleport" then
+                if mode == "Teleport" then
                     local facing = Vector3.new(p.X, goal.Y, p.Z)
                     r.CFrame = (goal - facing).Magnitude > 0.1 and CFrame.lookAt(goal, facing) or CFrame.new(goal)
                     task.wait()
@@ -872,8 +885,8 @@ local function runIslandEscape()
                 end
                 local path = motion.pathTo(r.Position, goal)
                 if path then
-                    note(key, opts.move:upper() .. " - FOLLOWING SAFE ROUTE")
-                    local reached = opts.move == "Tween" and motion.tweenPath(path, goal, key, serial, character, deadline) or (opts.move == "Walk" and motion.walkPath(path, goal, key, serial, character, deadline))
+                    note(key, mode:upper() .. " - FOLLOWING SAFE ROUTE")
+                    local reached = mode == "Tween" and motion.tweenPath(path, goal, key, serial, character, deadline) or (mode == "Walk" and motion.walkPath(path, goal, key, serial, character, deadline))
                     if reached then
                         return true
                     end
@@ -890,7 +903,7 @@ local function runIslandEscape()
         if r and h then
             h:MoveTo(r.Position)
         end
-        motion.owner = nil
+        motion.owner, motion.mode = nil, nil
         if not ok then
             note(key, "MOVEMENT ERROR: " .. tostring(result))
             result = false
@@ -900,7 +913,12 @@ local function runIslandEscape()
         end
         return result == true and motion.valid(key, serial, character)
     end
+    function work.invalidateInventory()
+        work.toolCache, work.countCache, work.signatureCache, work.bagCache, work.resourceToolCache = nil, nil, nil, nil, nil
+    end
     local function tools()
+        local stamp = math.floor(os.clock() * 120)
+        if work.toolCache and work.toolStamp == stamp then return work.toolCache end
         local t = {}
         for _, p in ipairs({
             player:FindFirstChild("Backpack"),
@@ -914,16 +932,22 @@ local function runIslandEscape()
                 end
             end
         end
+        work.toolCache, work.toolStamp = t, stamp
         return t
     end
-    local function count(name)
-        local n = 0
-        for _, o in ipairs(tools()) do
-            if o.Name == name then
-                n = n + (o:GetAttribute("count") or 1)
-            end
+    function work.toolCounts()
+        local stamp = math.floor(os.clock() * 120)
+        if work.countCache and work.countStamp == stamp then return work.countCache end
+        local result = {}
+        for _, tool in ipairs(tools()) do
+            result[tool.Name] = (result[tool.Name] or 0) + (tonumber(tool:GetAttribute("count")) or 1)
         end
-        return n
+        work.countCache, work.countStamp = result, stamp
+        work.signatureCache = nil
+        return result
+    end
+    local function count(name)
+        return work.toolCounts()[name] or 0
     end
     local function equip(t)
         local _, h = root()
@@ -1286,9 +1310,15 @@ local function runIslandEscape()
         switch(mining, "ONLY MATERIALS STILL NEEDED", function() return opts.onlyNeeded end, function(v) opts.onlyNeeded = v end)
         text(mining, "Needed-only follows enabled quests, recipes and fuel goals. Turn it off to stockpile freely.")
         switch(mining, "FAST HARVEST", function() return opts.fastHarvest end, function(v) opts.fastHarvest = v end)
-        work.slider(mining, "settleTime", "DROP SETTLE TIME (SECONDS)", 0.05, 2, 0.05)
+        work.slider(mining, "settleTime", "DROP SETTLE TIME (0 = BACKGROUND WATCH)", 0, 2, 0.05)
         local near = group(p.main, "AURA / NEARBY DEFENCE")
         toggle(near, "aura", "Kill aura • nearby NPCs", "Uses an equipped melee weapon, checked positions and its native cooldown / target cap.")
+        work.evadeButton = button(near, "EVADE MODE: " .. opts.evadeMove:upper(), function()
+            opts.evadeMove = opts.evadeMove == "Teleport" and "Tween" or (opts.evadeMove == "Tween" and "Walk" or "Teleport")
+            work.evadeButton.Text = "EVADE MODE: " .. opts.evadeMove:upper()
+            say("EVADE MODE: " .. opts.evadeMove:upper()) save()
+        end)
+        text(near, "Evade first switches to a safe useful target. Teleport is the default escape mode; normal movement is unchanged.")
         work.slider(near, "guardRadius", "GUARD RADIUS (STUDS)", 6, 80, 1)
         toggle(near, "runShadow", "Run from the Shadow")
         number(near, "shadowRadius", "SHADOW AVOIDANCE RADIUS", 20, 150)
@@ -1339,6 +1369,7 @@ local function runIslandEscape()
             for i = 2, #category do toggle(section, category[i][1], category[i][2]) end
         end
         local display = group(esp, "DISPLAY LIMITS")
+        switch(display, "LIGHTWEIGHT ESP • LABELS ONLY", function() return opts.espLabelsOnly end, function(v) opts.espLabelsOnly = v end)
         number(display, "espDistance", "MAX DISTANCE (STUDS)", 30, 5000)
         number(display, "espLimit", "MAX VISIBLE MARKERS", 20, 500)
         button(display, "CLEAR ALL ESP", function()
@@ -1892,19 +1923,16 @@ local function runIslandEscape()
     end)
     -- Inventory acknowledgement stays inside the scheduler's active task.
     function work.inventory()
-        local result = {}
-        for _, tool in ipairs(tools()) do
-            result[tool.Name] = (result[tool.Name] or 0) + (tonumber(tool:GetAttribute("count")) or 1)
-        end
-        return result
+        return work.toolCounts()
     end
     function work.signature()
+        local inventory = work.inventory()
+        if work.signatureCache then return work.signatureCache end
         local rows = {}
-        for name, amount in pairs(work.inventory()) do
-            rows[#rows + 1] = name .. "=" .. tostring(amount)
-        end
+        for name, amount in pairs(inventory) do rows[#rows + 1] = name .. "=" .. tostring(amount) end
         table.sort(rows)
-        return table.concat(rows, "|")
+        work.signatureCache = table.concat(rows, "|")
+        return work.signatureCache
     end
     function work.running(key, character, serial)
         return alive and work.keyEnabled(key) and player.Character == character
@@ -1930,6 +1958,10 @@ local function runIslandEscape()
         return confirmed
     end
     function work.bagState()
+        local stamp = math.floor(os.clock() * 120)
+        local bagId, bonus = player:GetAttribute("bagId"), player:GetAttribute("bagSlotsBonus")
+        local cached = work.bagCache
+        if cached and cached.stamp == stamp and cached.id == bagId and cached.bonus == bonus and cached.limit == opts.bagLimit then return cached.used, cached.cap end
         local c, used = config(), nil
         local inventory = module("PlayerInventory")
         local api = inventory and inventory.client
@@ -1947,6 +1979,7 @@ local function runIslandEscape()
         local bag = c.bag and c.bag.byId and c.bag.byId[player:GetAttribute("bagId")]
         local cap = opts.bagLimit > 0 and opts.bagLimit or
             ((bag and bag.cap or c.misc.defaultBagSlots) + (tonumber(player:GetAttribute("bagSlotsBonus")) or 0))
+        work.bagCache = {stamp = stamp, id = bagId, bonus = bonus, limit = opts.bagLimit, used = used, cap = cap}
         note("inventory", "BAG: " .. used .. " / " .. cap)
         return used, cap
     end
@@ -2091,7 +2124,11 @@ local function runIslandEscape()
             local item = type(entry) == "table" and c.item.byName[entry.itemCN]
             if item then wanted[item.id] = true end
         end
-        if folder then for _, model in ipairs(folder:GetChildren()) do before[model] = true end end
+        local center = pos(resource)
+        for _, model in ipairs(work.models("drops")) do
+            local point = pos(model)
+            if center and point and (point - center).Magnitude <= 12 then before[model] = true end
+        end
         return {center = pos(resource), before = before, wanted = wanted, key = nil, seen = false}
     end
     function work.drainTreeDrops(context, key)
@@ -2117,8 +2154,10 @@ local function runIslandEscape()
                     note(key, "TREE DROP UNCONFIRMED • RETRY BEFORE NEXT TREE")
                     return false
                 end
+                context.collected = context.collected or {} context.collected[target] = true
                 quietSince = os.clock()
             else
+                if opts.settleTime == 0 then work.watchLateDrops(context) return true end
                 local settle = context.seen and (opts.settleTime or 0.12) or math.max(0.5, opts.settleTime or 0.12)
                 if os.clock() - quietSince >= settle then return true end
                 task.wait()
@@ -2196,12 +2235,274 @@ local function runIslandEscape()
         end
         return best, stats
     end
+    function work.clearSceneIndex()
+        local state = work.sceneCache
+        if state then for _, connection in ipairs(state.connections) do connection:Disconnect() end end
+        work.sceneCache = nil
+    end
+    function work.sceneIndex()
+        local scene = world()
+        if not scene then work.clearSceneIndex() return end
+        if work.sceneCache and work.sceneCache.scene == scene then return work.sceneCache end
+        work.clearSceneIndex()
+        local c = config()
+        local state = {scene = scene, connections = {}, sets = {}, lists = {}, dirty = {}, folders = {}}
+        for _, key in ipairs({"resources", "entities", "drops", "buildings", "chests", "explore", "artifacts", "escape", "stations"}) do
+            state.sets[key] = {} state.dirty[key] = true
+        end
+        for key, name in pairs({resources="Static",entities="Entities",drops="DroppedItems",buildings="Buildings",chests="Chest"}) do
+            state.folders[key] = scene:FindFirstChild(name)
+        end
+        local function add(object)
+            if object:IsA("Model") then
+                if object.Parent == state.folders.entities then work.threatCacheAt = 0 work.baseThreatAt = 0 end
+                for key, folder in pairs(state.folders) do
+                    if object.Parent == folder then state.sets[key][object] = true state.dirty[key] = true if key == "drops" then
+                        work.lateDropsDirty = true
+                        if work.lateDropWatches and next(work.lateDropWatches) and not work.latePollQueued and type(task.defer) == "function" then
+                            work.latePollQueued = true
+                            task.defer(function() work.latePollQueued = nil if alive then work.pollLateDrops() end end)
+                        end
+                    end end
+                end
+                if c.mapProp and c.mapProp.byCnId[object.Name] then state.sets.explore[object] = true state.dirty.explore = true end
+                if work.artifactNames and work.artifactNames[object.Name] then state.sets.artifacts[object] = true state.dirty.artifacts = true end
+                if object.Name == "制作台" then state.sets.stations[object] = true state.dirty.stations = true end
+                if c.chest and c.chest.byId[object.Name] then state.sets.chests[object] = true state.dirty.chests = true end
+            elseif object:IsA("LocalScript") and object.Name == "BoatEscapeClient" then
+                state.sets.escape[object] = true state.dirty.escape = true
+            elseif object:IsA("Folder") then
+                for key, name in pairs({resources="Static",entities="Entities",drops="DroppedItems",buildings="Buildings",chests="Chest"}) do
+                    if object.Parent == scene and object.Name == name then state.folders[key] = object end
+                end
+            end
+        end
+        local function remove(object)
+            if state.sets.entities[object] then work.threatCacheAt = 0 work.baseThreatAt = 0 end
+            for key, set in pairs(state.sets) do
+                if set[object] then set[object] = nil state.dirty[key] = true state.lists[key] = nil end
+            end
+        end
+        -- Subscribe before the initial snapshot so streamed additions cannot fall into a scan gap.
+        if scene.DescendantAdded and scene.DescendantRemoving then
+            state.connections[#state.connections + 1] = scene.DescendantAdded:Connect(add)
+            state.connections[#state.connections + 1] = scene.DescendantRemoving:Connect(remove)
+        end
+        if scene.GetDescendants then for _, object in ipairs(scene:GetDescendants()) do add(object) end end
+        work.sceneCache = state
+        return state
+    end
+    function work.models(key)
+        local state = work.sceneIndex()
+        if not state then return {} end
+        -- Small mock / partial environments without descendant signals use their direct folders.
+        if #state.connections == 0 then
+            local folder = state.folders[key]
+            if folder and folder.GetChildren then return folder:GetChildren() end
+        end
+        if state.dirty[key] then
+            local list = {}
+            for object in pairs(state.sets[key] or {}) do if object.Parent then list[#list + 1] = object end end
+            state.lists[key], state.dirty[key] = list, false
+        end
+        return state.lists[key] or {}
+    end
+    function work.captureEvadeIntent()
+        local focus = work.resourceFocus
+        if focus and focus.model and focus.model.Parent and (work.active == focus.key or work.active == "recoverDrops") then
+            work.evadeIntent = {kind = "resource", key = focus.key, model = focus.model,
+                resourceKind = focus.kind, neededOnly = focus.neededOnly}
+        elseif work.active == "recoverDrops" and work.treeDrops then
+            local context = work.treeDrops
+            work.evadeIntent = {kind = "resource", key = context.key, model = nil,
+                resourceKind = context.resourceKind, neededOnly = context.key == "progression"}
+        elseif work.active == "drops" or work.active == "foodPickup" then
+            work.evadeIntent = {kind = "drop", key = work.active, model = work.interactionTarget}
+        else
+            work.evadeIntent = nil
+        end
+    end
+    function work.safeWorkPoint(point, margin)
+        if not point then return false end
+        for _, row in ipairs(work.hostiles()) do
+            if row.model.Parent and row.human.Health > 0 then
+                local radius = opts.avoidEnemies and opts.dangerRadius + (margin or 0) or 0
+                if flags.runShadow and (not row.attackable or row.model.Name:lower():find("shadow", 1, true)) then
+                    radius = math.max(radius, opts.shadowRadius + (margin or 0))
+                end
+                if radius > 0 and (point - row.point).Magnitude < radius and math.abs(point.Y - row.point.Y) < 18 then return false end
+            end
+        end
+        return true
+    end
+    function work.resourceEligible(model, key, neededOnly)
+        if not model.Parent or not model:IsA("Model") or (motion.blocked[model] and motion.blocked[model] > os.clock()) then return false end
+        local id = model:GetAttribute("resourceId")
+        local info = id and config().worldResource.byId[id]
+        local hp = model:GetAttribute("hp")
+        return info and (type(hp) ~= "number" or hp > 0) and work.resourceAllowed(info, key)
+            and work.resourceTool(info) ~= nil and (not (neededOnly or opts.onlyNeeded) or (work.resourceNeeds[id] or 0) > 0)
+            and (neededOnly or not flags.gather or selectedEmpty("resources") or allowed("resources", id))
+            and work.safeResource(model) and not (failed[model] and failed[model] > os.clock())
+    end
+    function work.alternativeWork(intent)
+        if not intent or not work.keyEnabled(intent.key) or not work.canCollect() then return end
+        local r = root()
+        if not r then return end
+        local best, bestScore
+        local candidates = intent.kind == "resource" and work.models("resources") or work.models("drops")
+        for _, model in ipairs(candidates) do
+            if model ~= intent.model and model.Parent then
+                local eligible = intent.kind == "resource" and work.resourceEligible(model, intent.key, intent.neededOnly)
+                if intent.kind == "drop" then
+                    local item = config().item.byDisplayName[model.Name]
+                    eligible = item and work.dropAllowed(model) and work.safeResource(model)
+                        and (intent.key ~= "foodPickup" or config().food.byId[item.id] ~= nil)
+                        and (intent.key == "foodPickup" or not opts.onlyNeeded or work.needs[item.id])
+                        and (intent.key == "foodPickup" or selectedEmpty("drops") or allowed("drops", item.id))
+                end
+                if eligible then
+                    local score = -(pos(model) - r.Position).Magnitude
+                    if intent.kind == "resource" then
+                        local info = config().worldResource.byId[model:GetAttribute("resourceId")]
+                        if work.resourceKind(info) == intent.resourceKind then score = score + 10000 end
+                        score = score + (work.resourceNeeds[model:GetAttribute("resourceId")] or 0) * 100
+                    end
+                    if not bestScore or score > bestScore then best, bestScore = model, score end
+                end
+            end
+        end
+        return best
+    end
+    function work.retargetEvade(key)
+        local intent = work.evadeIntent
+        local target = work.alternativeWork(intent)
+        if not target then return false end
+        local before = root()
+        if not before then return false end
+        local reach = 2.5
+        if intent.kind == "resource" then
+            local info = config().worldResource.byId[target:GetAttribute("resourceId")]
+            local _, stats = work.resourceTool(info)
+            reach = math.max(1, (stats and stats.range or 6) - 0.5)
+        end
+        work.retargeting = true
+        local ok, moved = pcall(travel, target, key, reach, opts.evadeMove)
+        work.retargeting = nil
+        if not ok then error(moved) end
+        if moved then
+            work.preferredTargets = work.preferredTargets or {}
+            work.preferredTargets[intent.key] = target
+            work.evadeIntent = nil
+            work.refreshAt = 0
+            note(key, "SAFE ALTERNATIVE FOUND • RESUMING " .. intent.key:upper())
+            return true
+        end
+        return false
+    end
+    function work.batchDrop(tool, requested, key)
+        work.pendingDrops = work.pendingDrops or setmetatable({}, {__mode = "k"})
+        local function acknowledged(batch)
+            for _, record in ipairs(batch.records) do
+                local item = record.tool
+                if item.Parent and (tonumber(item:GetAttribute("count")) or 1) > record.before - record.amount then return false end
+            end
+            return true
+        end
+        local function clear(batch)
+            for _, record in ipairs(batch.records) do work.pendingDrops[record.tool] = nil end
+            work.activeDropBatch = nil work.invalidateInventory()
+        end
+        if work.activeDropBatch then
+            local previous = work.activeDropBatch
+            if not work.await(key, function() return acknowledged(previous) end, 3) then return 0 end
+            clear(previous)
+        end
+        local budget = math.min(8, math.max(0, requested))
+        if budget <= 0 or not work.checkpoint(key) then return 0 end
+        local batch, seen = {records = {}, total = 0}, {}
+        local function add(item)
+            if seen[item] or not item.Parent or item.Name ~= tool.Name or batch.total >= budget then return end
+            seen[item] = true
+            local before = tonumber(item:GetAttribute("count")) or 1
+            local amount = math.min(budget - batch.total, before)
+            if amount > 0 then batch.records[#batch.records + 1] = {tool = item, before = before, amount = amount} batch.total = batch.total + amount end
+        end
+        add(tool)
+        for _, owned in ipairs(tools()) do add(owned) end
+        if batch.total == 0 then return 0 end
+        work.activeDropBatch = batch
+        for _, record in ipairs(batch.records) do
+            work.pendingDrops[record.tool] = batch
+            for _ = 1, record.amount do call("PlayerInventory", "dropItem", record.tool) end
+        end
+        if not work.await(key, function() return acknowledged(batch) end, 3) then return 0 end
+        clear(batch)
+        return batch.total
+    end
+    function work.watchLateDrops(context)
+        work.lateDropWatches = work.lateDropWatches or {}
+        context.watchUntil = os.clock() + 3
+        work.lateDropWatches[context] = true
+        work.lateDropsDirty = true
+    end
+    function work.contextEnabled(key)
+        if key == "gather" then return flags.gather or flags.chopTrees or flags.mineStone or flags.mineIron end
+        if key == "progression" then return work.progressionEnabled() end
+        return flags[key]
+    end
+    function work.rotateRecoveries()
+        local queue = work.dropQueue or {}
+        local current = work.treeDrops
+        if current and work.safeWorkPoint(current.center, 5) then return end
+        for i, context in ipairs(queue) do
+            if work.contextEnabled(context.key) and work.safeWorkPoint(context.center, 5) then
+                table.remove(queue, i)
+                if current and current ~= context and not current.queued then current.queued = true queue[#queue + 1] = current end
+                work.treeDrops, context.queued = context, nil
+                return
+            end
+        end
+    end
+    function work.setRecovery(context)
+        if work.treeDrops and work.treeDrops ~= context and not work.treeDrops.queued then
+            work.dropQueue = work.dropQueue or {}
+            work.treeDrops.queued = true work.dropQueue[#work.dropQueue + 1] = work.treeDrops
+        end
+        work.treeDrops = context
+    end
+    function work.pollLateDrops()
+        local watches = work.lateDropWatches
+        if not watches then return end
+        local dirty = work.lateDropsDirty
+        work.lateDropsDirty = nil
+        for context in pairs(watches) do
+            if os.clock() > context.watchUntil or not work.contextEnabled(context.key) then
+                watches[context] = nil
+            elseif dirty then
+                for _, model in ipairs(work.models("drops")) do
+                    local item = config().item.byDisplayName[model.Name]
+                    if model.Parent and item and context.wanted[item.id] and not context.before[model]
+                        and not (context.collected and context.collected[model]) and pos(model)
+                        and (pos(model) - context.center).Magnitude <= 12 and work.dropAllowed(model) then
+                        work.dropQueue = work.dropQueue or {}
+                        if work.treeDrops ~= context and not context.queued then
+                            if not work.treeDrops then work.treeDrops = context
+                            else context.queued = true work.dropQueue[#work.dropQueue + 1] = context end
+                        end
+                        watches[context] = nil
+                        break
+                    end
+                end
+            end
+        end
+    end
     function work.hostiles(force)
         if not force and os.clock() < (work.threatCacheAt or 0) then return work.threatCache or {} end
         local scene, rows = world(), {}
         local folder = scene and scene:FindFirstChild("Entities")
         local c = config()
-        for _, model in ipairs(folder and folder:GetChildren() or {}) do
+        for _, model in ipairs(work.models("entities")) do
             local human = model:FindFirstChildOfClass("Humanoid")
             local point = pos(model)
             if human and human.Health > 0 and point and c.mob and c.mob.byId[model.Name]
@@ -2259,19 +2560,26 @@ local function runIslandEscape()
         return target
     end
     function work.baseThreat()
+        if os.clock() < (work.baseThreatAt or 0) and os.clock() < (work.threatCacheAt or 0)
+            and work.baseThreatRows == work.threatCache and (not work.baseThreatCache
+                or (work.baseThreatCache.Parent and work.baseThreatHuman and work.baseThreatHuman.Health > 0)) then return work.baseThreatCache end
+        work.baseThreatAt = os.clock() + 0.03
         local fire = built("Campfire")
         local center = fire and pos(fire)
         if not center then return end
         local scene = world()
         local buildings = scene and scene:FindFirstChild("Buildings")
+        local buildingPoints = {}
+        for _, building in ipairs(work.models("buildings")) do
+            local point = pos(building) if point then buildingPoints[#buildingPoints + 1] = point end
+        end
         local best, bestScore
         for _, row in ipairs(work.hostiles()) do
             if row.attackable and row.model.Parent and row.human.Health > 0 then
                 local distance = (row.point - center).Magnitude
                 local nearBuilding = false
-                for _, building in ipairs(buildings and buildings:GetChildren() or {}) do
-                    local point = pos(building)
-                    if point and (row.point - point).Magnitude < 14 then nearBuilding = true break end
+                for _, point in ipairs(buildingPoints) do
+                    if (row.point - point).Magnitude < 14 then nearBuilding = true break end
                 end
                 local toward = center - row.point
                 local closing = toward.Magnitude > 0 and row.velocity:Dot(toward.Unit) > 1
@@ -2282,18 +2590,21 @@ local function runIslandEscape()
                 end
             end
         end
+        work.baseThreatCache = best
+        work.baseThreatRows = work.threatCache
+        work.baseThreatHuman = best and best:FindFirstChildOfClass("Humanoid") or nil
         return best
     end
     function work.safeDestination(point, key)
-        if not opts.avoidEnemies then return true end
         local owner = work.active or key
         local risk = work.danger(point, opts.dangerRadius)
         if owner == "evade" or work.escapeMove then
+            if work.retargeting then return work.safeWorkPoint(point, 0) end
             local r = root()
             return r and risk <= work.danger(r.Position, opts.dangerRadius)
         end
         if owner == "combat" or owner == "hunt" then return work.combatClear(point) end
-        return risk == 0
+        return work.safeWorkPoint(point, 0)
     end
     function work.combatClear(point)
         for _, row in ipairs(work.hostiles()) do
@@ -2306,16 +2617,29 @@ local function runIslandEscape()
         return true
     end
     function work.safeRoute(a, b, key)
-        if opts.move == "Teleport" then return work.safeDestination(b, key) end
-        local delta = b - a
-        for i = 1, math.max(1, math.ceil(delta.Magnitude / 3)) do
-            local point = a + delta * (i / math.max(1, math.ceil(delta.Magnitude / 3)))
-            if not work.safeDestination(point, key) then return false end
+        if (motion.mode or opts.move) == "Teleport" then return work.safeDestination(b, key) end
+        local delta, owner = b - a, work.active or key
+        local length2 = delta:Dot(delta)
+        for _, row in ipairs(work.hostiles()) do
+            if row.model.Parent and row.human.Health > 0 then
+                local t = length2 > 0 and math.clamp((row.point - a):Dot(delta) / length2, 0, 1) or 0
+                local closest = a + delta * t
+                local distance = (closest - row.point).Magnitude
+                local radius = opts.avoidEnemies and opts.dangerRadius or 0
+                if flags.runShadow and (not row.attackable or row.model.Name:lower():find("shadow", 1, true)) then radius = math.max(radius, opts.shadowRadius) end
+                if owner == "evade" or work.escapeMove then
+                    local initial = (a - row.point).Magnitude
+                    if radius > 0 and ((initial < radius and distance + 0.1 < initial) or (initial >= radius and distance < radius)) then return false end
+                elseif owner == "combat" or owner == "hunt" then
+                    local elevated = row.model == work.attackTarget and closest.Y - row.point.Y >= opts.combatHeight
+                    if not elevated and distance < work.enemyReach(row.model) + opts.combatMargin then return false end
+                elseif radius > 0 and distance < radius and math.abs(closest.Y - row.point.Y) < 18 then return false end
+            end
         end
         return true
     end
     function work.safeResource(model)
-        return not opts.avoidEnemies or work.danger(pos(model), opts.dangerRadius + 5) == 0
+        return work.safeWorkPoint(pos(model), 5)
     end
     function work.evade(key)
         key = key or "evade"
@@ -2323,7 +2647,8 @@ local function runIslandEscape()
         if not r then return false end
         local radius = work.shadowThreat() and opts.shadowRadius or opts.dangerRadius
         local currentRisk, nearestEnemy = work.danger(r.Position, radius)
-        if currentRisk == 0 then return true end
+        if currentRisk == 0 then work.evadeIntent = nil return true end
+        if work.retargetEvade(key) then return true end
         local best, bestScore
         local lift = math.max(2, human.HipHeight + r.Size.Y / 2)
         local function consider(probe)
@@ -2336,9 +2661,9 @@ local function runIslandEscape()
             local score = -risk * 100 - (candidate - r.Position).Magnitude
             if not bestScore or score > bestScore then best, bestScore = candidate, score end
         end
-        for _, distance in ipairs({12, 24, 36}) do
-            for i = 0, 15 do
-                local angle = i * math.pi / 8
+        for _, distance in ipairs({16, 32, 64}) do
+            for i = 0, 7 do
+                local angle = i * math.pi / 4
                 consider(r.Position + Vector3.new(math.cos(angle) * distance, 0, math.sin(angle) * distance))
             end
         end
@@ -2347,7 +2672,7 @@ local function runIslandEscape()
             return false
         end
         note(key, "EVADING ENEMY PROXIMITY / APPROACH")
-        local moved = travel(best, key, 1)
+        local moved = travel(best, key, 1, opts.evadeMove)
         work.threatCacheAt = 0
         work.safeUntil = os.clock() + 0.35
         return moved
@@ -2432,6 +2757,10 @@ local function runIslandEscape()
         return best, score
     end
     function work.attackPlan(key, stats)
+        local cached = work.attackPlanCache
+        if cached and cached.key == key and cached.stats == stats and cached.target.Parent and cached.human and cached.human.Health > 0
+            and os.clock() < cached.expires and (pos(cached.target) - cached.targetPoint).Magnitude < 1
+            and work.stanceScore(cached.position, cached.target, stats) then return cached.target, cached.position end
         local r = root()
         if not r then return end
         local fire = built("Campfire")
@@ -2462,6 +2791,8 @@ local function runIslandEscape()
                 if not bestScore or score > bestScore then target, position, bestScore = candidate.row.model, point, score end
             end
         end
+        if target then work.attackPlanCache = {key = key, stats = stats, target = target, position = position,
+            targetPoint = pos(target), human = target:FindFirstChildOfClass("Humanoid"), expires = os.clock() + 0.15} else work.attackPlanCache = nil end
         return target, position
     end
     function work.retreat(key)
@@ -2501,7 +2832,7 @@ local function runIslandEscape()
             for _, row in ipairs(work.hostiles()) do
                 if #targets >= (stats.capAOE or 1) then break end
                 local delta = row.point - r.Position
-                if row.model ~= target and row.attackable and delta.Magnitude > 0.1
+                if row.model ~= target and row.attackable and row.model.Parent and row.human.Health > 0 and delta.Magnitude > 0.1
                     and r.CFrame.LookVector:Dot(delta.Unit) >= 0 and work.stanceScore(r.Position, row.model, stats) then
                     targets[#targets + 1] = row.model
                 end
@@ -2554,6 +2885,7 @@ local function runIslandEscape()
         if not o then
             note(key, "NO ELIGIBLE DROPS")
         end
+        work.interactionTarget = o
         if o and travel(o, key) then
             local before = work.signature()
             local amount = count(o.Name)
@@ -2579,17 +2911,11 @@ local function runIslandEscape()
         end
     end
     function work.resourceCandidate(key, neededOnly)
-        local scene = world()
-        local static = scene and scene:FindFirstChild("Static")
-        if not static then return end
-        local c = config()
-        return nearest(static:GetChildren(), function(o)
-            return o:IsA("Model") and o:GetAttribute("resourceId") and c.worldResource.byId[o:GetAttribute("resourceId")] and (type(o:GetAttribute("hp")) ~= "number" or o:GetAttribute("hp") > 0) and work.resourceAllowed(c.worldResource.byId[o:GetAttribute("resourceId")], key) and work.resourceTool(c.worldResource.byId[o:GetAttribute("resourceId")]) ~= nil
-                and (not (neededOnly or opts.onlyNeeded) or (work.resourceNeeds[o:GetAttribute("resourceId")] or 0) > 0) and (neededOnly or not flags.gather or selectedEmpty("resources") or allowed("resources", o:GetAttribute("resourceId"))) and work.safeResource(o) and not (failed[o] and failed[o] > os.clock())
-        end, function(o)
-            local priority = work.resourceNeeds[o:GetAttribute("resourceId")] or 0
-            return priority + ((work.resourcePlans and work.resourcePlans[o]) and 1000 or 0)
-        end)
+        local preferred = work.preferredTargets and work.preferredTargets[key]
+        if preferred and work.resourceEligible(preferred, key, neededOnly) then return preferred end
+        if work.preferredTargets then work.preferredTargets[key] = nil end
+        return nearest(work.models("resources"), function(model) return work.resourceEligible(model, key, neededOnly) end,
+            function(model) return work.resourceNeeds[model:GetAttribute("resourceId")] or 0 end)
     end
     local function gatherResource(key, neededOnly)
         key = key or "gather"
@@ -2603,7 +2929,9 @@ local function runIslandEscape()
             note(key, "MATCH RESOURCES NOT LOADED")
             return
         end
-        if work.treeDrops then work.treeDrops.key = key return work.recoverTreeDrops() end
+        if work.treeDrops and work.safeWorkPoint(work.treeDrops.center, 5) then
+            work.treeDrops.key = key return work.recoverTreeDrops()
+        end
         local c = config()
         local best = work.resourceCandidate(key, neededOnly)
         if not best then
@@ -2611,6 +2939,7 @@ local function runIslandEscape()
             return
         end
         local rc = c.worldResource.byId[best:GetAttribute("resourceId")]
+        work.resourceFocus = {model = best, key = key, kind = work.resourceKind(rc), neededOnly = neededOnly}
         local tool, tc = work.resourceTool(rc)
         if not tool then
             note(key, "MATCHING TOOL REQUIRED")
@@ -2622,6 +2951,7 @@ local function runIslandEscape()
         local dropContext = work.resourcePlans[best] or work.treeDropContext(best)
         work.resourcePlans[best] = dropContext
         dropContext.key = key
+        dropContext.resourceKind = work.resourceKind(rc)
         local character, serial = player.Character, motion.serial
         local deadline = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
         local noDamage = 0
@@ -2629,8 +2959,9 @@ local function runIslandEscape()
             local hp = best:GetAttribute("hp")
             if not best.Parent or (type(hp) == "number" and hp <= 0) then
                 work.recordCut(best, rc)
+                work.resourceFocus = nil
                 work.resourcePlans[best] = nil
-                work.treeDrops = dropContext
+                work.setRecovery(dropContext)
                 work.recoverTreeDrops()
                 note(key, work.treeDrops and "RESOURCE CUT • DROPS PENDING" or "RESOURCE CUT • ALL LOADED DROPS COLLECTED")
                 return true
@@ -2678,7 +3009,7 @@ local function runIslandEscape()
         local c = config()
         local rows = kind == "chest" and c.chest.byId or c.mapProp.byCnId
         local search = kind == "chest" and w:FindFirstChild("Chest") or w
-        local obj = nearest(search and search:GetDescendants() or {}, function(o)
+        local obj = nearest(work.models(kind == "chest" and "chests" or "explore"), function(o)
             return o:IsA("Model") and rows[o.Name] and not (failed[o] and failed[o] > os.clock())
         end)
         if not obj then
@@ -2705,7 +3036,7 @@ local function runIslandEscape()
         if not w then
             return
         end
-        for _, o in ipairs(w:GetDescendants()) do
+        for _, o in ipairs(work.models("escape")) do
             if o:IsA("LocalScript") and o.Name == "BoatEscapeClient" then
                 local boat = o.Parent
                 local part = boat:FindFirstChild("promptPart")
@@ -2804,10 +3135,9 @@ local function runIslandEscape()
             if not best then return deposited end
             -- Native drop sends one unit. Owned quest drops are retained for the eventual full submission.
             local before, dropsBefore = count(info.displayName), #owned
-            call("PlayerInventory", "dropItem", best)
-            if not work.await(key, function()
-                return count(info.displayName) < before and #work.questDrops(req) > dropsBefore
-            end, 3) then return deposited end
+            local amount = work.batchDrop(best, math.min(count(info.displayName), req.count - #owned), key)
+            if amount == 0 then return deposited end
+            if not work.await(key, function() return #work.questDrops(req) >= dropsBefore + amount end, 3) then return deposited end
             deposited = true
         end
         return deposited
@@ -2855,7 +3185,7 @@ local function runIslandEscape()
         if os.clock() < (work.stationSearchAt or 0) then return end
         work.stationSearchAt = os.clock() + 1
         local scene = world()
-        for _, model in ipairs(scene and scene:GetDescendants() or {}) do
+        for _, model in ipairs(work.models("stations")) do
             if model:IsA("Model") and model.Name == "制作台" then
                 local zone = model:FindFirstChild("吸入范围")
                 if zone and zone:IsA("BasePart") then
@@ -2916,19 +3246,21 @@ local function runIslandEscape()
         local deadline = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
         for id, needed in pairs(goal.recipe) do
             local item = config().item.byId[id]
-            while item and ((work.stationStock or {})[id] or 0) < needed and count(item.displayName) > 0
+            local initial = (work.stationStock or {})[id] or 0
+            local sent = 0
+            while item and math.max((work.stationStock or {})[id] or 0, initial + sent) < needed and count(item.displayName) > 0
                 and work.running(key, player.Character, motion.serial) and os.clock() < deadline do
                 if not work.insideStation(zone) then return deposited end
                 local tool
                 for _, candidate in ipairs(tools()) do if candidate.Name == item.displayName then tool = candidate break end end
                 if not tool then break end
-                local before = (work.stationStock or {})[id] or 0
-                call("PlayerInventory", "dropItem", tool)
-                if not work.await(key, function() return ((work.stationStock or {})[id] or 0) > before end, 3) then
-                    note(key, "DEPOSIT SENT; WAITING FOR SHARED STATION STOCK")
-                    return deposited
-                end
-                deposited = true
+                local missing = needed - math.max((work.stationStock or {})[id] or 0, initial + sent)
+                local amount = work.batchDrop(tool, missing, key)
+                if amount == 0 then return deposited end
+                sent = sent + amount deposited = true
+            end
+            if sent > 0 and not work.await(key, function() return ((work.stationStock or {})[id] or 0) >= math.min(needed, initial + sent) end, 3) then
+                note(key, "MATERIALS SENT • WAITING FOR STATION RECEIPT") return deposited
             end
         end
         for id, amount in pairs(goal.recipe) do
@@ -3636,17 +3968,17 @@ local function runIslandEscape()
     function work.pick(jobs, now, ceiling)
         local best, bestScore
         for _, job in ipairs(jobs) do
-            if work.jobEnabled(job) and now >= (due[job.key] or 0) then
+            if now >= (due[job.key] or 0) then
                 local ok, ready, rank = pcall(function()
                     local rank = work.rank(job)
-                    if ceiling and rank >= ceiling then return false, rank end
-                    return not job.ready or job.ready(), rank
+                    if (ceiling and rank >= ceiling) or (bestScore and rank >= bestScore) then return false, rank end
+                    return work.jobEnabled(job) and (not job.ready or job.ready()), rank
                 end)
                 if not ok then
-                    note(job.key, "READINESS ERROR: " .. tostring(ready))
-                    due[job.key] = now + 0.5
-                elseif ready and (not bestScore or rank < bestScore) then
+                    note(job.key, "READINESS ERROR: " .. tostring(ready)) due[job.key] = now + 0.5
+                elseif ready then
                     best, bestScore = job, rank
+                    if rank == 0 then break end
                 end
             end
         end
@@ -3664,6 +3996,7 @@ local function runIslandEscape()
         work.nextPriorityCheck = os.clock() + 0.03
         local job, rank = work.pick(work.jobs, os.clock(), work.rank(work.currentJob))
         if job then
+            if job.key == "evade" then work.captureEvadeIntent() end
             work.preempted = {from = work.active, to = job.key, rank = rank}
             work.suspended = work.suspended or {}
             work.suspended[work.active] = true
@@ -3730,7 +4063,7 @@ local function runIslandEscape()
         if not w then
             return false
         end
-        for _, o in ipairs(w:GetDescendants()) do
+        for _, o in ipairs(work.models("escape")) do
             if o:IsA("LocalScript") and o.Name == "BoatEscapeClient" then
                 local part = o.Parent:FindFirstChild("promptPart")
                 local prompt = part and part:FindFirstChildOfClass("ProximityPrompt")
@@ -3784,12 +4117,19 @@ local function runIslandEscape()
             or (kind == "stone" and flags.mineStone) or (kind == "iron" and flags.mineIron)
     end
     function work.resourceTool(info)
+        local stamp = math.floor(os.clock() * 120)
+        if work.resourceToolStamp ~= stamp then work.resourceToolCache = {} work.resourceToolStamp = stamp end
+        work.resourceToolCache = work.resourceToolCache or {}
+        local key = info.requireToolType or "__unknown"
+        local cached = work.resourceToolCache[key]
+        if cached then return cached.tool, cached.stats end
         local best, stats
         for _, tool in ipairs(tools()) do
             local row = config().tool.byDisplayName[tool.Name]
             if row and (info.requireToolType == "any" or row.toolType == info.requireToolType)
                 and (not stats or (row.useDmg or 0) > (stats.useDmg or 0)) then best, stats = tool, row end
         end
+        work.resourceToolCache[key] = {tool = best, stats = stats}
         return best, stats
     end
     function work.boatId()
@@ -3799,7 +4139,7 @@ local function runIslandEscape()
     end
     function work.artifactCandidate()
         local scene = world()
-        return nearest(scene and scene:GetDescendants() or {}, function(model)
+        return nearest(work.models("artifacts"), function(model)
             if not model:IsA("Model") or not work.artifactNames[model.Name] then return false end
             local part = model:FindFirstChild("promptPart")
             local prompt = part and part:FindFirstChildOfClass("ProximityPrompt")
@@ -3811,7 +4151,7 @@ local function runIslandEscape()
         local c, scene = config(), world()
         local rows = kind == "chest" and c.chest.byId or c.mapProp.byCnId
         local folder = kind == "chest" and scene and scene:FindFirstChild("Chest") or scene
-        for _, model in ipairs(folder and folder:GetDescendants() or {}) do
+        for _, model in ipairs(work.models(kind == "chest" and "chests" or "explore")) do
             if model:IsA("Model") and rows[model.Name] and work.safeResource(model)
                 and not (failed[model] and failed[model] > os.clock()) then return true end
         end
@@ -3835,6 +4175,9 @@ local function runIslandEscape()
     function work.bindSuite()
         if work.suiteBound then return end
         work.suiteBound = true
+        local inventoryService = RS.Engine.Service:FindFirstChild("PlayerInventory")
+        local inventoryChanged = inventoryService and inventoryService:FindFirstChild("inventoryChangedRemote")
+        if inventoryChanged then connections[#connections + 1] = inventoryChanged.OnClientEvent:Connect(work.invalidateInventory) end
         local extra = RS.Engine.Service:FindFirstChild("BoatExtra")
         local changed = extra and extra:FindFirstChild("requiresUpdRemote")
         local function update(list)
@@ -3856,6 +4199,7 @@ local function runIslandEscape()
         connections[#connections + 1] = gui.Destroying:Connect(function()
             work.releaseHover()
             work.clearESP()
+            work.clearSceneIndex()
             if work.espFolder then work.espFolder:Destroy() end
         end)
     end
@@ -4094,7 +4438,7 @@ local function runIslandEscape()
     end
     function work.clearESP()
         for model, marker in pairs(work.espMarkers or {}) do
-            marker.billboard:Destroy() marker.highlight:Destroy()
+            marker.billboard:Destroy() if marker.highlight then marker.highlight:Destroy() end
             work.espMarkers[model] = nil
         end
     end
@@ -4118,14 +4462,21 @@ local function runIslandEscape()
             local distance = (point - r.Position).Magnitude
             if distance <= opts.espDistance then targets[#targets + 1] = {model = model, category = category, distance = distance} end
         end
-        for _, name in ipairs({"Static", "Entities", "DroppedItems", "Buildings", "Chest"}) do
-            local folder = scene:FindFirstChild(name)
-            for _, model in ipairs(folder and folder:GetChildren() or {}) do add(model, name) end
+        local groups = {
+            {"resources", "Static", flags.espTrees or flags.espStone or flags.espIron or flags.espOtherResources},
+            {"entities", "Entities", flags.espEnemies or flags.espShadow},
+            {"drops", "DroppedItems", flags.espDrops or flags.espFood or flags.espBags},
+            {"buildings", "Buildings", flags.espCamp or flags.espBlueprints},
+            {"chests", "Chest", flags.espChests},
+            {"artifacts", "explore", flags.espArtifacts},
+            {"explore", "explore", flags.espPuzzles},
+        }
+        for _, row in ipairs(groups) do
+            if row[3] then for _, model in ipairs(work.models(row[1])) do add(model, row[2]) end end
         end
-        for _, model in ipairs(scene:GetDescendants()) do
-            if model:IsA("Model") and (work.artifactNames[model.Name] or (config().mapProp and config().mapProp.byCnId[model.Name])) then add(model, "explore") end
+        if flags.espPlayers then
+            for _, person in ipairs(Players:GetPlayers()) do if person ~= player and person.Character then add(person.Character, "players") end end
         end
-        for _, person in ipairs(Players:GetPlayers()) do if person ~= player and person.Character then add(person.Character, "players") end end
         table.sort(targets, function(a, b) return a.distance < b.distance end)
         local keep = {}
         for i = 1, math.min(#targets, opts.espLimit) do
@@ -4135,17 +4486,21 @@ local function runIslandEscape()
                 keep[model] = true
                 local marker = work.espMarkers[model]
                 if not marker then
-                    local highlight = Instance.new("Highlight") highlight.Adornee = model
-                    highlight.FillTransparency = 0.85 highlight.OutlineTransparency = 0.15
-                    highlight.FillColor = blue highlight.OutlineColor = blue
-                    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop highlight.Parent = work.espFolder
                     local billboard = make("BillboardGui", {Adornee = part, AlwaysOnTop = true,
                         Size = UDim2.fromOffset(150, 32), StudsOffsetWorldSpace = Vector3.new(0, 3, 0)}, pg)
                     local label = make("TextLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
                         TextColor3 = white, TextStrokeTransparency = 0.35, TextSize = 10, Font = Enum.Font.BuilderSansBold,
                         TextWrapped = true}, billboard)
-                    marker = {billboard = billboard, highlight = highlight, label = label}
+                    marker = {billboard = billboard, label = label}
                     work.espMarkers[model] = marker
+                end
+                if opts.espLabelsOnly and marker.highlight then marker.highlight:Destroy() marker.highlight = nil end
+                if not opts.espLabelsOnly and not marker.highlight then
+                    local highlight = Instance.new("Highlight") highlight.Adornee = model
+                    highlight.FillTransparency = 0.9 highlight.OutlineTransparency = 0.15
+                    highlight.FillColor = blue highlight.OutlineColor = blue
+                    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop highlight.Parent = work.espFolder
+                    marker.highlight = highlight
                 end
                 local c = config()
                 local item = c.item.byDisplayName[model.Name]
@@ -4155,7 +4510,7 @@ local function runIslandEscape()
             end
         end
         for model, marker in pairs(work.espMarkers) do
-            if not keep[model] or not model.Parent then marker.billboard:Destroy() marker.highlight:Destroy() work.espMarkers[model] = nil end
+            if not keep[model] or not model.Parent then marker.billboard:Destroy() if marker.highlight then marker.highlight:Destroy() end work.espMarkers[model] = nil end
         end
     end
     function work.statusTick()
@@ -4222,8 +4577,9 @@ local function runIslandEscape()
         },
         {
             key = "recoverDrops", priority = 2.4, cooldown = 0.02,
-            enabled = function() return work.treeDrops and flags[work.treeDrops.key] end,
-            ready = function() return work.canCollect() and work.treeDrops and flags[work.treeDrops.key] end,
+            enabled = function() return work.treeDrops and work.contextEnabled(work.treeDrops.key) end,
+            ready = function() return work.canCollect() and work.treeDrops and work.contextEnabled(work.treeDrops.key)
+                and work.safeWorkPoint(work.treeDrops.center, 5) end,
             run = work.recoverTreeDrops,
         },
         {
@@ -4464,6 +4820,7 @@ local function runIslandEscape()
     work.jobs, work.jobsByKey = jobsList, {}
     for _, job in ipairs(jobsList) do work.jobsByKey[job.key] = job end
     function work.settleCuts()
+        work.pollLateDrops()
         work.dropQueue = work.dropQueue or {}
         for model, context in pairs(work.resourcePlans or {}) do
             local hp = model:GetAttribute("hp")
@@ -4474,7 +4831,10 @@ local function runIslandEscape()
                 work.resourcePlans[model] = nil
             end
         end
-        if not work.treeDrops and #work.dropQueue > 0 then work.treeDrops = table.remove(work.dropQueue, 1) end
+        if not work.treeDrops and #work.dropQueue > 0 then
+            work.treeDrops = table.remove(work.dropQueue, 1) work.treeDrops.queued = nil
+        end
+        work.rotateRecoveries()
     end
     local function cancelFishing()
         if fish.mini then
