@@ -1,6 +1,6 @@
 -- Runs extracted production helpers with delayed receipts and native API shapes.
 math.clamp = function(x,a,b) return math.max(a,math.min(b,x)) end
-local sourcePath = arg and arg[1] or 'Games/MrbeastIslandEscape.lua'
+local sourcePath = (arg and arg[1]) or os.getenv('EXIS_MRBEAST_SOURCE') or 'Games/MrbeastIslandEscape.lua'
 local f=assert(io.open(sourcePath));local source=f:read('*a');f:close()
 local function extract(a,b)local i=assert(source:find(a,1,true));local j=assert(source:find(b,i+#a,true));return source:sub(i,j-1)end
 local chunks={
@@ -17,7 +17,10 @@ local function setup()
  now=0; inventory={Wood=0,Stone=0,Ore=0,Coal=0,Meat=0};events={};scheduled={};counts={yield=0}
  os.clock=function()return now end
  flags={autoFarm=true,tidyBag=true,progression=true,smelt=true,cook=true};opts={jobTimeout=15}
- work={needs={},amounts={},resourceNeeds={},buildRemaining={},sent=0,preempted=nil}
+ work={needs={},amounts={},resourceNeeds={},buildRemaining={},sent=0,preempted=nil,
+  goalAmounts=function(goal)return goal.amounts end,
+  stationGoal=function(goal)if goal.kind=='bag'then return goal end end,
+  submitGoal=function()return false end}
  player={Character={}};motion={serial=1};campData={};furnaceData={};due={};selected={}
  configData={item={byId={wood={id='wood',displayName='Wood'},stone={id='stone',displayName='Stone'},ore={id='ore',displayName='Ore'},coal={id='coal',displayName='Coal'},meat={id='meat',displayName='Meat'}}},recipe={byId={}},build={byId={}},misc={furnaceMatter1Id='ore',furnaceMatter2Id='coal'},worldResource={byId={}}}
  configData.item.byName={}
