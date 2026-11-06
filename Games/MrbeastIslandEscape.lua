@@ -135,11 +135,12 @@ local function runIslandEscape()
         return progress and type(progress[id]) == "number" and math.max(0, progress[id]) or total
     end
     local path = storage.path("exis_island_" .. player.UserId .. "_" .. game.PlaceId .. ".json")
-    local blue = Color3.fromRGB(83, 158, 244)
-    local white = Color3.fromRGB(226, 234, 245)
+    local blue = Color3.fromRGB(80, 160, 255)
+    local white = Color3.fromRGB(232, 238, 248)
     local function make(class, props, parent)
         local o = Instance.new(class)
         for k, v in pairs(props) do
+            if k == "Text" and class == "TextButton" and type(v) == "string" then v = v:upper() end
             o[k] = v
         end
         o.Parent = parent
@@ -187,7 +188,7 @@ local function runIslandEscape()
         Text = "EXIScript | MRBEAST ISLAND ESCAPE",
         TextColor3 = blue,
         Font = Enum.Font.BuilderSansBold,
-        TextSize = 10,
+        TextSize = 11,
         TextTruncate = Enum.TextTruncate.AtEnd,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, header)
@@ -1107,6 +1108,8 @@ local function runIslandEscape()
             Thickness = 1,
         }, b)
         b.Activated:Connect(function()
+            if work.selectedPage == name then content.Visible = not content.Visible return end
+            work.selectedPage, content.Visible = name, true
             pageTitle.Text = name:upper()
             for n, other in pairs(pages) do
                 other.Visible = n == name
@@ -1830,6 +1833,7 @@ local function runIslandEscape()
             h:MoveTo(r.Position)
         end
     end)
+    work.selectedPage = "Main"
     pages.Main.Visible = true
     tabButtons.Main.TextColor3 = blue
     tabButtons.Main.BackgroundColor3 = Color3.fromRGB(23, 45, 71)
