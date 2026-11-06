@@ -1,6 +1,59 @@
 -- EXI: exported client APIs and live NPC options; Roblox runtime testing required.
 -- AFK updates: confirmed buff cooldowns, persistent desired toggles, quests/orders/mayor, selective dig and crop arrangement.
 -- Shop choices follow GameHUD: NpcChoose(keeperId, offeredOptionId).
+-- Executor-workspace storage. Old root files remain readable during migration.
+local storage = {root = "EXIGames/Fuzzotopia"}
+function storage.path(name)
+    name = tostring(name):gsub("\\", "/")
+    if name:sub(1, #storage.root + 1) == storage.root .. "/" then return name end
+    return storage.root .. "/" .. name
+end
+function storage.ensure()
+    for _, directory in ipairs({"EXIGames", storage.root}) do
+        local exists = false
+        if type(isfolder) == "function" then
+            local ok, found = pcall(isfolder, directory)
+            exists = ok and found == true
+        end
+        if not exists then
+            assert(type(makefolder) == "function", "Cannot create save folder: executor makefolder is unavailable")
+            local ok, err = pcall(makefolder, directory)
+            if not ok then
+                local found = false
+                if type(isfolder) == "function" then
+                    local checked, present = pcall(isfolder, directory)
+                    found = checked and present == true
+                end
+                assert(found, "Cannot create save folder " .. directory .. ": " .. tostring(err))
+            end
+        end
+    end
+end
+function storage.write(name, contents)
+    assert(type(writefile) == "function", "Executor writefile is unavailable")
+    storage.ensure()
+    return writefile(storage.path(name), contents)
+end
+function storage.read(name)
+    assert(type(readfile) == "function", "Executor readfile is unavailable")
+    local target = storage.path(name)
+    local ok, contents = pcall(readfile, target)
+    if ok then return contents end
+    local legacy = tostring(name):gsub("\\", "/")
+    if legacy:sub(1, #storage.root + 1) == storage.root .. "/" then
+        legacy = legacy:sub(#storage.root + 2)
+    end
+    local oldOK, oldContents = pcall(readfile, legacy)
+    if not oldOK then error(contents, 0) end
+    -- Loading still succeeds if saving is unsupported; never delete the old save.
+    pcall(storage.write, target, oldContents)
+    return oldContents
+end
+function storage.exists(name)
+    local ok = pcall(storage.read, name)
+    return ok
+end
+
 local SEED_PREFIX = "seeds#"
 local PURCHASE_DELAY = 0.25
 local BED_DELAY = 0.1 -- Seconds; adjustable live from the Main tab.
@@ -2532,7 +2585,7 @@ function ui.number(container,value,minimum,maximum,onChange)
     end)
     return input
 end
-local config={path="exi_"..player.UserId.."_"..game.PlaceId..".json",loading=false,pending=nil,numbers={}}
+local config={path=storage.path("exi_"..player.UserId.."_"..game.PlaceId..".json"),loading=false,pending=nil,numbers={}}
 function config.status(message)
     report(message)
     if config.label then config.label.Text=message end
@@ -2548,7 +2601,7 @@ function config.snapshot()
 end
 function config.save()
     if type(writefile)~="function" then config.status("Saving unavailable: executor writefile is missing") return false end
-    local ok,err=pcall(function() writefile(config.path,HttpService:JSONEncode(config.snapshot())) end)
+    local ok,err=pcall(function() storage.write(config.path,HttpService:JSONEncode(config.snapshot())) end)
     config.status(ok and "Config saved" or "Save failed: "..tostring(err))
     return ok
 end
@@ -2608,11 +2661,11 @@ function config.load()
     if type(readfile)~="function" then config.status("Loading unavailable: executor readfile is missing") return false end
     local source=config.path
     local legacy="hardinero_"..player.UserId.."_"..game.PlaceId..".json"
-    if type(isfile)=="function" and not isfile(source) then
-        if isfile(legacy) then source=legacy
+    if not storage.exists(source) then
+        if storage.exists(legacy) then source=legacy
         else config.status("No saved config yet; changes will auto-save") return false end
     end
-    local ok,err=pcall(function() config.apply(HttpService:JSONDecode(readfile(source))) end)
+    local ok,err=pcall(function() config.apply(HttpService:JSONDecode(storage.read(source))) end)
     if ok and source~=config.path then config.save() end
     config.loading=false
     config.status(ok and "Saved config restored" or "Load failed: "..tostring(err))
@@ -2626,7 +2679,7 @@ configChanged=function(force)
         if alive then config.save() end
     end)
 end
-sessionOptions.path="exi_autorun_"..player.UserId.."_"..game.PlaceId..".json"
+sessionOptions.path=storage.path("exi_autorun_"..player.UserId.."_"..game.PlaceId..".json")
 sessionOptions.raw="https://raw.githubusercontent.com/iaxen/EXIScript/main/EXIScript.lua"
 function sessionOptions.say(message)
     if sessionOptions.label then sessionOptions.label.Text=message end
@@ -2646,17 +2699,20 @@ end
 function sessionOptions.sync()
     local ok,err=pcall(function()
         assert(type(writefile)=="function" and type(readfile)=="function","Executor file access unavailable")
-        writefile(sessionOptions.path,HttpService:JSONEncode({enabled=states.autoExecute==true}))
-        if not states.autoExecute then
-            sessionOptions.say("AUTO EXECUTE: OFF")
-            return
-        end
+        storage.write(sessionOptions.path,HttpService:JSONEncode({enabled=states.autoExecute==true}))
         local folder=nil
         if type(isfolder)=="function" then
             for _,path in ipairs({"autoexec","autoexecute"}) do if isfolder(path) then folder=path break end end
         end
+        -- Refresh old launchers even when disabled so they read the new flag.
+        local launcher=sessionOptions.loader()
+        storage.write("EXI_FUZZOPIA_"..game.PlaceId..".lua",launcher)
         if folder then
-            writefile(folder.."/EXI_FUZZOPIA_"..game.PlaceId..".lua",sessionOptions.loader())
+            writefile(folder.."/EXI_FUZZOPIA_"..game.PlaceId..".lua",launcher)
+        end
+        if not states.autoExecute then
+            sessionOptions.say("AUTO EXECUTE: OFF")
+            return
         end
         local queued=sessionOptions.queue()
         sessionOptions.say(folder and (queued and "AUTO EXECUTE READY • EXECUTOR AUTOEXEC + TELEPORT" or "AUTO EXECUTE READY • EXECUTOR AUTOEXEC FOLDER") or
@@ -2750,15 +2806,15 @@ jobs.reconnectMonitor=task.defer(function()
 end)
 ui.events={lastRefresh=0,counts={},seen={},keys={},probLabels={},total=0,
     ids={"GoldenHour","FishingFrenzy","BlessingRain","MarketBoom","LuckyEggs","BountifulForest","StarShower"}}
-ui.events.path="exi_event_history_"..game.PlaceId..".json"
+ui.events.path=storage.path("exi_event_history_"..game.PlaceId..".json")
 function ui.events.saveHistory()
     if type(writefile)=="function" then
-        pcall(writefile,ui.events.path,HttpService:JSONEncode({version=1,counts=ui.events.counts,keys=ui.events.keys}))
+        pcall(storage.write,ui.events.path,HttpService:JSONEncode({version=1,counts=ui.events.counts,keys=ui.events.keys}))
     end
 end
 function ui.events.loadHistory()
     if type(readfile)~="function" then return end
-    local ok,data=pcall(function()return HttpService:JSONDecode(readfile(ui.events.path))end)
+    local ok,data=pcall(function()return HttpService:JSONDecode(storage.read(ui.events.path))end)
     if not ok or type(data)~="table" or data.version~=1 then return end
     for _,id in ipairs(ui.events.ids) do
         local count=type(data.counts)=="table" and data.counts[id]
@@ -3165,8 +3221,8 @@ function ui.layout.export()
     local text=HttpService:JSONEncode(data)
     ui.layout.input.Text=text
     if type(setclipboard)=="function" then setclipboard(text) end
-    if type(writefile)=="function" then pcall(writefile,"exi_house_export.json",text) end
-    ui.layout.say("HOUSE EXPORTED • COPY THE JSON OR SEND exi_house_export.json WITH YOUR DESIGN")
+    if type(writefile)=="function" then pcall(storage.write,"exi_house_export.json",text) end
+    ui.layout.say("HOUSE EXPORTED • COPY THE JSON OR SEND EXIGames/Fuzzotopia/exi_house_export.json WITH YOUR DESIGN")
 end
 -- Read-only export of another player's already replicated interior.
 function ui.layout.interiorFor(ownerId)
@@ -3283,8 +3339,8 @@ function ui.layout.exportVisited()
     local text = HttpService:JSONEncode(data)
     assert(#text < 200000, "Export is too large for the layout text box.")
     ui.layout.input.Text = text
-    local filename = "exi_house_" .. tostring(ownerId) .. "_layout.json"
-    local saved = type(writefile) == "function" and pcall(writefile, filename, text)
+    local filename = storage.path("exi_house_" .. tostring(ownerId) .. "_layout.json")
+    local saved = type(writefile) == "function" and pcall(storage.write, filename, text)
     if type(setclipboard) == "function" then
         pcall(setclipboard, text)
     end
@@ -3771,12 +3827,12 @@ ui.layout.input=make("TextBox",{Size=UDim2.new(1,0,0,116),MultiLine=true,ClearTe
     BackgroundColor3=Color3.fromRGB(10,16,24),BorderSizePixel=0},ui.houseImport)
 corner(ui.layout.input,5)
 ui.layout.path=make("TextBox",{Size=UDim2.new(1,0,0,25),ClearTextOnFocus=false,
-    Text="exi_house_layout.json",TextSize=10,Font=Enum.Font.Code,TextColor3=white,
+    Text=storage.path("exi_house_layout.json"),TextSize=10,Font=Enum.Font.Code,TextColor3=white,
     BackgroundColor3=Color3.fromRGB(13,20,30),BorderSizePixel=0},ui.houseImport)
 ui.button(ui.houseImport,"LOAD JSON FILE",function()
     assert(not states.houseLayout,"Stop building before loading a layout.")
     assert(type(readfile)=="function","Executor readfile is unavailable; paste JSON instead.")
-    local text=readfile(ui.layout.path.Text)
+    local text=storage.read(ui.layout.path.Text)
     ui.layout.decode(text)
     ui.layout.input.Text=text
     ui.layout.say("LAYOUT LOADED • VALIDATE BEFORE APPLYING")
@@ -3804,7 +3860,7 @@ ui.button(ui.houseClear,"PICK UP ALL FURNITURE",ui.layout.clearHouse)
 ui.button(ui.houseClear,"STOP CLEARING",ui.layout.cancel)
 ui.layout.clearLabel=ui.text(ui.houseClear,"ENTER YOUR OWN HOUSE TO CLEAR")
 ui.houseExport=ui.group(ui.housePage,"EXPORT HOUSE DATA")
-ui.text(ui.houseExport,"Exports floors, furniture, inventory and catalog IDs to exi_house_export.json.")
+ui.text(ui.houseExport,"Exports floors, furniture, inventory and catalog IDs to EXIGames/Fuzzotopia/exi_house_export.json.")
 ui.button(ui.houseExport,"EXPORT MY HOUSE",ui.layout.export)
 ui.houseVisited=ui.group(ui.housePage,"EXPORT VISITED HOUSE")
 ui.text(ui.houseVisited,"Visit the house and wait for furniture to load. Exports visible furniture layout only; inventory is excluded.")
