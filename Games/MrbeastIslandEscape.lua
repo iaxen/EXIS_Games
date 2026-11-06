@@ -1,5 +1,58 @@
 -- EXIScript: Island Escape module. Client APIs verified against the supplied export.
 local function runIslandEscape()
+    -- Executor-workspace storage. Old root files remain readable during migration.
+    local storage = {root = "EXIGames/MrbeastIslandEscape"}
+    function storage.path(name)
+        name = tostring(name):gsub("\\", "/")
+        if name:sub(1, #storage.root + 1) == storage.root .. "/" then return name end
+        return storage.root .. "/" .. name
+    end
+    function storage.ensure()
+        for _, directory in ipairs({"EXIGames", storage.root}) do
+            local exists = false
+            if type(isfolder) == "function" then
+                local ok, found = pcall(isfolder, directory)
+                exists = ok and found == true
+            end
+            if not exists then
+                assert(type(makefolder) == "function", "Cannot create save folder: executor makefolder is unavailable")
+                local ok, err = pcall(makefolder, directory)
+                if not ok then
+                    local found = false
+                    if type(isfolder) == "function" then
+                        local checked, present = pcall(isfolder, directory)
+                        found = checked and present == true
+                    end
+                    assert(found, "Cannot create save folder " .. directory .. ": " .. tostring(err))
+                end
+            end
+        end
+    end
+    function storage.write(name, contents)
+        assert(type(writefile) == "function", "Executor writefile is unavailable")
+        storage.ensure()
+        return writefile(storage.path(name), contents)
+    end
+    function storage.read(name)
+        assert(type(readfile) == "function", "Executor readfile is unavailable")
+        local target = storage.path(name)
+        local ok, contents = pcall(readfile, target)
+        if ok then return contents end
+        local legacy = tostring(name):gsub("\\", "/")
+        if legacy:sub(1, #storage.root + 1) == storage.root .. "/" then
+            legacy = legacy:sub(#storage.root + 2)
+        end
+        local oldOK, oldContents = pcall(readfile, legacy)
+        if not oldOK then error(contents, 0) end
+        -- Loading still succeeds if saving is unsupported; never delete the old save.
+        pcall(storage.write, target, oldContents)
+        return oldContents
+    end
+    function storage.exists(name)
+        local ok = pcall(storage.read, name)
+        return ok
+    end
+
     local Players = game:GetService("Players")
     local RS = game:GetService("ReplicatedStorage")
     local UIS = game:GetService("UserInputService")
@@ -80,7 +133,7 @@ local function runIslandEscape()
         local progress = info.assetId and work.buildRemaining[info.assetId]
         return progress and type(progress[id]) == "number" and math.max(0, progress[id]) or total
     end
-    local path = "exis_island_" .. player.UserId .. "_" .. game.PlaceId .. ".json"
+    local path = storage.path("exis_island_" .. player.UserId .. "_" .. game.PlaceId .. ".json")
     local blue = Color3.fromRGB(83, 158, 244)
     local white = Color3.fromRGB(226, 234, 245)
     local function make(class, props, parent)
@@ -315,8 +368,8 @@ local function runIslandEscape()
                     selected = selected,
                     options = opts,
                 })
-                writefile(path, payload)
-                writefile("exis_island_session_" .. player.UserId .. ".json", payload)
+                storage.write(path, payload)
+                storage.write("exis_island_session_" .. player.UserId .. ".json", payload)
             end)
             if not ok then
                 say(e)
@@ -327,11 +380,11 @@ local function runIslandEscape()
         pcall(function()
             local configPath = path
             pcall(function()
-                local sharedPath = "exis_island_session_" .. player.UserId .. ".json"
-                local shared = HTTP:JSONDecode(readfile(sharedPath))
+                local sharedPath = storage.path("exis_island_session_" .. player.UserId .. ".json")
+                local shared = HTTP:JSONDecode(storage.read(sharedPath))
                 if shared.flags and shared.flags.autoRound then configPath = sharedPath end
             end)
-            local d = HTTP:JSONDecode(readfile(configPath))
+            local d = HTTP:JSONDecode(storage.read(configPath))
             if d.version == 1 then
                 if type(d.flags) == "table" then
                     for k, v in pairs(d.flags) do

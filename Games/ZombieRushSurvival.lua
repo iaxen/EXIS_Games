@@ -1,6 +1,59 @@
 -- EXIScript | Zombie Rush Survival | initial test release
 -- Lobby: 82457571485380. Both gameplay maps: 87413622775071.
 -- Each EXIS game keeps its own module and configuration.
+-- Executor-workspace storage. Old root files remain readable during migration.
+local storage = {root = "EXIGames/ZombieRushSurvival"}
+function storage.path(name)
+    name = tostring(name):gsub("\\", "/")
+    if name:sub(1, #storage.root + 1) == storage.root .. "/" then return name end
+    return storage.root .. "/" .. name
+end
+function storage.ensure()
+    for _, directory in ipairs({"EXIGames", storage.root}) do
+        local exists = false
+        if type(isfolder) == "function" then
+            local ok, found = pcall(isfolder, directory)
+            exists = ok and found == true
+        end
+        if not exists then
+            assert(type(makefolder) == "function", "Cannot create save folder: executor makefolder is unavailable")
+            local ok, err = pcall(makefolder, directory)
+            if not ok then
+                local found = false
+                if type(isfolder) == "function" then
+                    local checked, present = pcall(isfolder, directory)
+                    found = checked and present == true
+                end
+                assert(found, "Cannot create save folder " .. directory .. ": " .. tostring(err))
+            end
+        end
+    end
+end
+function storage.write(name, contents)
+    assert(type(writefile) == "function", "Executor writefile is unavailable")
+    storage.ensure()
+    return writefile(storage.path(name), contents)
+end
+function storage.read(name)
+    assert(type(readfile) == "function", "Executor readfile is unavailable")
+    local target = storage.path(name)
+    local ok, contents = pcall(readfile, target)
+    if ok then return contents end
+    local legacy = tostring(name):gsub("\\", "/")
+    if legacy:sub(1, #storage.root + 1) == storage.root .. "/" then
+        legacy = legacy:sub(#storage.root + 2)
+    end
+    local oldOK, oldContents = pcall(readfile, legacy)
+    if not oldOK then error(contents, 0) end
+    -- Loading still succeeds if saving is unsupported; never delete the old save.
+    pcall(storage.write, target, oldContents)
+    return oldContents
+end
+function storage.exists(name)
+    local ok = pcall(storage.read, name)
+    return ok
+end
+
 local Core = {}
 
 function Core.finite(n)
@@ -355,9 +408,9 @@ local function run()
         health = false, gun = false, melee = false, autoPlace = false, defenseTypes = {},
         regions = {}, maxDefenses = 18, reserveCash = 0, fight = false, fly = true,
         headAim = true, bossFirst = true, clearance = 14, moveMode = "Smooth", placeSpawnArea = false, fireInput = "Mobile", flyHeight = 14, orbitRadius = 16, flySpeed = 32}
-    local file = "EXIS_ZombieRushSurvival_" .. player.UserId .. ".json"
-    if type(readfile) == "function" and type(isfile) == "function" then
-        local ok, data = pcall(function() if isfile(file) then return Http:JSONDecode(readfile(file)) end end)
+    local file = storage.path("EXIS_ZombieRushSurvival_" .. player.UserId .. ".json")
+    if type(readfile) == "function" then
+        local ok, data = pcall(function() if storage.exists(file) then return Http:JSONDecode(storage.read(file)) end end)
         if ok and type(data) == "table" and data.version == 1 then
             for key, value in pairs(data) do if type(value) == type(cfg[key]) then cfg[key] = value end end
         end
@@ -369,7 +422,7 @@ local function run()
     end
     function app.save()
         if type(writefile) == "function" then
-            local ok, err = pcall(function() writefile(file, Http:JSONEncode(cfg)) end)
+            local ok, err = pcall(function() storage.write(file, Http:JSONEncode(cfg)) end)
             if not ok then app.notes.config = "CONFIG SAVE FAILED: " .. tostring(err) end
         end
     end
