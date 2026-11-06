@@ -30,7 +30,7 @@ local function setup()
  built=function(name)if name=='Campfire'then return camp end end
  world=function()return{FindFirstChild=function()end}end
  note=function()end
- travel=function(_,key,radius)events[#events+1]='travel';assert(key=='unloadBag'and radius==9);return true end
+ travel=function(_,key,radius)events[#events+1]='travel';assert(key=='unloadBag'and radius==0.5);return true end
  task={wait=function()now=now+.02 for _,e in ipairs(scheduled)do if not e.done and now>=e.at then e.done=true;e.run()end end end}
  work={selectedCraftMaterialGoal=function()end,sent=0,artifactNames={Compass=true},models=function()return drops end,safeResource=function()return true end,
   running=function()return not work.preempted end,checkpoint=function()return not work.preempted end,
@@ -44,8 +44,11 @@ local function setup()
   tool.attrs.count=tool.attrs.count-1;if tool.attrs.count==0 then tool.Parent=nil end
   drops[#drops+1]=model(tool.Name,player.Name)
  end
+ work.interactPrompt=function()return nil end
  body('    function work.markCampDrop(', '    function work.collectModel(')
  body('    function work.batchDrop(', '    function work.watchLateDrops(')
+ work.campDropPoint=function()return rootPart.Position end
+ work.campDropClear=function()return true end
 end
 local function tool(id,name,n,extra)
  local item={id=id,displayName=name,isBagItem=true};for k,v in pairs(extra or{})do item[k]=v end

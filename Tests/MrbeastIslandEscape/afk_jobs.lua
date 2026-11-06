@@ -15,6 +15,7 @@ local function model(name,point)
  local m={Name=name,Parent=true,point=point or vec(0,0,0),attrs={}}
  function m:GetAttribute(k)return self.attrs[k]end
  function m:IsA(c)return c=='Model'end
+ function m:FindFirstChildWhichIsA()return nil end
  function m:FindFirstChild(k)return self[k]end
  function m:FindFirstChildOfClass(k)return self[k]end
  return m
@@ -55,7 +56,10 @@ local function setup()
  work.fuelItem=function()return cfg.item.byId.wood end
  work.noFood=function()return false end
  work.rawFoodOwned=function()return false end
+ work.interactPrompt=function()return nil end
+ work.huntCandidate=function()end
  work.recordPickup=function(m)events[#events+1]='pickup:'..m.Name end
+ work.pause=function(key,seconds)local stop=now+seconds;while now<stop do if work.preempted then return false end task.wait()end return true end
  work.await=function(key,predicate,seconds)local untilTime=now+(seconds or 3)repeat if predicate()then return true end if work.preempted then return false end task.wait()until now>=untilTime return false end
  task={wait=function()now=now+.02 for _,e in ipairs(schedule)do if not e.done and now>=e.at then e.done=true;e.run()end end end}
  travel=function(target,key,radius)events[#events+1]='travel:'..key;return true end
@@ -202,11 +206,13 @@ test('chest travels within the actual configured opening distance',function()
  call=function()return false end
  assert(not work.openChest()and radius==7)
 end)
-test('an already-open chest is cached and not revisited as if closed',function()
- local m=chest();call=function(service,op,arg)
+test('an already-open chest recovers its remaining owned loot without reopening',function()
+ local m=chest();local loot=model('Stone');loot.attrs.ownerName=player.Name;sceneRows.drops={loot}
+ call=function(service,op,arg)
   if service=='ItemCollect'then inventory[arg.Name]=(inventory[arg.Name]or 0)+1;arg.Parent=false;return end
- return op=='isOpened'end
- assert(work.openChest()and work.chestState(m).complete and not work.chestCandidate())
+  assert(op~='requestOpen');return op=='isOpened'
+ end
+ assert(work.openChest()and inventory.Stone==1 and work.chestState(m).complete and not work.chestCandidate())
 end)
 local function rewardUI()
  local background={Visible=true};local cells={}
@@ -318,6 +324,37 @@ test('a rejected chest pickup stays pending until a later collection succeeds',f
   if op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now;later(.2,function()local d=model('Stone');d.attrs.ownerName=player.Name;sceneRows.drops={d}end)end
  end
  assert(work.openChest()and attempts==2 and inventory.Stone==1)
+end)
+test('native chest E hold finishes before opening and looting',function()
+ local m=chest();local accepted=false;local triggered=0
+ local prompt={Enabled=true,HoldDuration=.8,MaxActivationDistance=7,
+ InputHoldBegin=function()events[#events+1]='Ebegin'end,InputHoldEnd=function()events[#events+1]='Eend'end}
+ m.FindFirstChildWhichIsA=function()return prompt end
+ loadBody('    function work.interactPrompt(', '    function work.collectModel(')
+ fireproximityprompt=function(p)
+  assert(p==prompt and now>=.8);triggered=triggered+1;accepted=true
+  later(.2,function()local d=model('Stone');d.attrs.ownerName=player.Name;sceneRows.drops={d}end)
+ end
+ call=function(service,op,arg)
+  if service=='ItemCollect'then inventory[arg.Name]=(inventory[arg.Name]or 0)+1;arg.Parent=false;return end
+  assert(op~='requestOpen');return op=='isOpened'and accepted
+ end
+ assert(work.openChest()and inventory.Stone==1 and triggered==1)
+ fireproximityprompt=nil
+end)
+test('native pickup E prompt collects before completion is reported',function()
+ local d=model('Stone');local pressed=0
+ local prompt={Enabled=true,HoldDuration=0,MaxActivationDistance=5,InputHoldBegin=function()end,InputHoldEnd=function()end}
+ d.FindFirstChildWhichIsA=function()return prompt end
+ loadBody('    function work.interactPrompt(', '    function work.collectModel(')
+ fireproximityprompt=function(p)assert(p==prompt);pressed=pressed+1;inventory.Stone=1;d.Parent=false end
+ call=function()error('pickup prompt must be used')end
+ assert(work.collectModel(d,'chests',false,true)and pressed==1)
+ fireproximityprompt=nil
+end)
+test('already-open empty chests finish after checking for remaining loot',function()
+ local m=chest();call=function(_,op)assert(op~='requestOpen');return op=='isOpened'end
+ assert(work.openChest()and work.chestState(m).complete and now>=1)
 end)
 os.clock=realClock
 assert(loadfile(path))

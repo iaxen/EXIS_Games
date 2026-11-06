@@ -56,6 +56,7 @@ local function setup()
  work.foodAllowed=function(_,id)return id=='meat'end
  blueprintReady=function()return false end
  questTick=function()return false end
+ work.huntCandidate=function()end
  for _,chunk in ipairs(chunks)do assert(load(chunk))()end
  return inventory,events
 end
