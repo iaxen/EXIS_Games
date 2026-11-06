@@ -32,7 +32,7 @@ local function setup()
  note=function()end
  travel=function(_,key,radius)events[#events+1]='travel';assert(key=='unloadBag'and radius==9);return true end
  task={wait=function()now=now+.02 for _,e in ipairs(scheduled)do if not e.done and now>=e.at then e.done=true;e.run()end end end}
- work={sent=0,artifactNames={Compass=true},models=function()return drops end,safeResource=function()return true end,
+ work={selectedCraftMaterialGoal=function()end,sent=0,artifactNames={Compass=true},models=function()return drops end,safeResource=function()return true end,
   running=function()return not work.preempted end,checkpoint=function()return not work.preempted end,
   invalidateInventory=function()end,stationGoal=function()end,taskDemand=function()return 0 end,
   noFood=function()return false end,submitGoal=function()return false end,goalAmounts=function(g)return g.amounts or{}end,

@@ -1382,7 +1382,7 @@ local function runIslandEscape()
         local food = group(p.camp, "FOOD / INVENTORY")
         toggle(food, "huntFood", "Hunt food when empty", "Looks for mobs with configured food drops. Does not chase the Shadow.")
         toggle(food, "tidyBag", "Tidy bag by submitting materials", "Submits usable materials to quests, buildings, crafting, cooking and smelting.")
-        toggle(food, "unloadBag", "Unload leftovers near campfire", "Submits first, then drops unused bag items at camp. Keeps tools and ingredients needed for direct crafting.")
+        toggle(food, "unloadBag", "Unload leftovers near campfire", "Submits first, then drops unused bag items at camp. Reclaims them when a task needs them; keeps tools and direct-craft ingredients.")
         work.slider(food, "hunger", "EAT BELOW HUNGER (%)", 1, 100, 1)
         local projects = group(p.craft, "PROGRESSION GOALS")
         toggle(projects, "toolLadder", "Craft tool ladder")
@@ -1557,7 +1557,7 @@ local function runIslandEscape()
     end)
     text(session, "Walk uses dry paths, jump waypoints and stuck recovery. Tween follows checked paths. Teleport uses a dry landing; blocked routes are skipped.")
     local jobGroup = group(settings, "TASK PRIORITIES")
-    text(jobGroup, "0 EVADE • 0.8 EMERGENCY EXIT (OPT IN) • 1 DEFENCE • 2 EAT • 2.1 REWARDS • 3 FIRE / FOOD • 4 BAG • 5 CAMP / TOOLS / IRON • 6 QUESTS • 7 GATHER • 8 EXPLORE • 9 OPTIONAL BOAT / ESCAPE • 10 NIGHT HOLD • 11 ROUND CONTROLS")
+    text(jobGroup, "0 EVADE • 0.8 EMERGENCY EXIT (OPT IN) • 1 DEFENCE • 2 EAT • 3 FIRE / FOOD • 3.5 READY CRAFT • 3.6 REWARDS • 4 BAG • 5 CAMP / TOOLS / IRON • 6 QUESTS • 7 GATHER • 8 EXPLORE • 9 OPTIONAL BOAT / ESCAPE • 10 NIGHT HOLD • 11 ROUND CONTROLS")
     text(jobGroup, "Lower number = higher priority. Higher jobs interrupt at frame checkpoints. Equal / lower jobs wait. Unfinished work stays enabled and resumes when safe.")
     local queueLabel = text(jobGroup, "JOB: IDLE")
     for _, category in ipairs({
@@ -2326,7 +2326,7 @@ local function runIslandEscape()
         end
     end
     function work.stashWanted(model, record)
-        local c, goal = config(), work.activeGoal or work.objective
+        local c, goal = config(), work.probingGoal or work.activeGoal or work.objective or work.selectedCraftMaterialGoal()
         if goal and work.taskDemand(record.id, "progression") > 0 then
             if goal.kind == "build" then
                 local folder = world() and world():FindFirstChild("Buildings")
@@ -2363,7 +2363,7 @@ local function runIslandEscape()
             or (c.armour and c.armour.byId[item.id]) or item.type == "tool"
             or item.type == "armour" or item.type == "bag"
             or (work.artifactNames and work.artifactNames[tool.Name]) then return 0 end
-        local goal = work.activeGoal or work.objective
+        local goal = work.probingGoal or work.activeGoal or work.objective or work.selectedCraftMaterialGoal()
         -- Direct crafting consumes a complete recipe; retain its needed ingredients.
         if goal and goal.kind == "craft" and not work.stationGoal(goal)
             and (work.goalAmounts(goal)[item.id] or 0) > 0 then return 0 end
@@ -3277,24 +3277,25 @@ local function runIslandEscape()
         return defeated
     end
     function work.pickupCandidate(neededOnly)
-        local w = world()
-        local folder = w and w:FindFirstChild("DroppedItems")
-        if not folder then
-            return
-        end
+        local scene = world()
+        local folder = scene and scene:FindFirstChild("DroppedItems")
+        if not folder then return end
         local c = config()
-        return nearest(folder:GetChildren(), function(x)
-            local owner = x:GetAttribute("ownerName")
-            local protected = x:GetAttribute("protectEndTick") or 0
-            if owner and owner ~= player.Name and protected > workspace:GetServerTimeNow() then
-                return false
-            end
-            local info = c.item.byDisplayName[x.Name]
-            return not ((neededOnly or opts.onlyNeeded) and work.objective and work.objective.kind == "quest"
-                and x:GetAttribute("ownerName") == player.Name and info and work.questRequirement
-                and info.id == work.questRequirement.itemId) and not x:GetAttribute("collecting") and info and (not (neededOnly or opts.onlyNeeded) or work.needs[info.id]) and (neededOnly or selectedEmpty("drops") or allowed("drops", info.id)) and work.safeResource(x) and not (failed[x] and failed[x] > os.clock())
-        end, function(x)
-            local info = c.item.byDisplayName[x.Name]
+        local goal = work.probingGoal or work.activeGoal or work.objective or work.selectedCraftMaterialGoal()
+        local function eligible(model)
+            if not model.Parent or not work.dropAllowed(model) then return false end
+            local info = c.item.byDisplayName[model.Name]
+            if not info then return false end
+            if goal and goal.kind == "quest" and model:GetAttribute("ownerName") == player.Name
+                and work.questRequirement and info.id == work.questRequirement.itemId then return false end
+            if (neededOnly or opts.onlyNeeded) and work.taskDemand(info.id, "progression") <= 0 then return false end
+            return (neededOnly or selectedEmpty("drops") or allowed("drops", info.id)) and work.safeResource(model)
+                and not (failed[model] and failed[model] > os.clock())
+        end
+        local loaded, stash = folder:GetChildren(), {}
+        for _, model in ipairs(loaded) do if work.markCampDrop(model) then stash[#stash + 1] = model end end
+        return nearest(stash, eligible) or nearest(loaded, eligible, function(model)
+            local info = c.item.byDisplayName[model.Name]
             return info and work.needs[info.id] or 0
         end)
     end
@@ -4144,18 +4145,16 @@ local function runIslandEscape()
         return anySubmitted
     end
     local function craftTick()
-        local c = config()
-        if selectedEmpty("craft") then
-            note("craft", "SELECT ITEMS FIRST")
-            return
+        local goal = work.nextReadyCraft()
+        if not goal then note("craft", "NO READY CRAFT RECIPE") return false end
+        note("craft", "CRAFTING: " .. tostring(goal.info.displayName or goal.id))
+        local completed = work.submitGoal("craft", goal)
+        if not completed and not work.preempted then
+            work.upgradeBlocked = work.upgradeBlocked or {}
+            work.upgradeBlocked[goal.key] = os.clock() + 0.75
         end
-        for id in pairs(selected.craft or {}) do
-            local i = c.item.byId[id]
-            if allowed("craft", id) and i and count(i.displayName) == 0 and recipeReady(i) then
-                return work.request("craft", "CraftItems", "craft", id)
-            end
-        end
-        note("craft", "OWNED ALREADY OR NEED MATERIALS")
+        work.refreshAt = 0
+        return completed
     end
     local function buildTick()
         return work.contribute("build", true)
@@ -4393,7 +4392,7 @@ local function runIslandEscape()
         return amounts
     end
     function work.taskDemand(id, key)
-        local goal = work.activeGoal or work.objective
+        local goal = work.probingGoal or work.activeGoal or work.objective or work.selectedCraftMaterialGoal()
         if goal then
             local item = config().item.byId[id]
             return math.max(0, (work.supplyAmounts(goal)[id] or 0) - (item and count(item.displayName) or 0))
@@ -4439,6 +4438,52 @@ local function runIslandEscape()
         end
         return false
     end
+    function work.selectedCraftMaterialGoal()
+        if not flags.craft then return end
+        local ids, c = {}, config()
+        for id, enabled in pairs(selected.craft or {}) do if enabled then ids[#ids + 1] = id end end
+        table.sort(ids)
+        for _, id in ipairs(ids) do
+            local item = c.item.byId[id]
+            if item and item.recipeId and count(item.displayName) == 0 then
+                local amounts = work.recipeAmounts(item)
+                if next(amounts) then
+                    return {key = "selected:" .. id, id = id, kind = "craft", info = item, amounts = amounts}
+                end
+            end
+        end
+    end
+    function work.readyCraft(goal)
+        if not goal or (goal.kind ~= "craft" and goal.kind ~= "bag") or not goal.info then return false end
+        if goal.kind == "bag" and not work.bagRank(goal.id) then return false end
+        if goal.kind == "craft" and count(goal.info.displayName) > 0 then return false end
+        if goal.kind == "bag" or work.stationGoal(goal) then
+            local _, zone = work.station()
+            if not work.stationSynced or not zone or not work.safeResource(zone) then return false end
+        end
+        return not next(work.missing(work.goalAmounts(goal)))
+    end
+    function work.nextReadyCraft()
+        local candidates = {}
+        if flags.progression or flags.toolLadder or flags.bagUpgrade then candidates = work.upgradeCandidates() end
+        if flags.craft then
+            local c, ids = config(), {}
+            for id, enabled in pairs(selected.craft or {}) do if enabled then ids[#ids + 1] = id end end
+            table.sort(ids)
+            for _, id in ipairs(ids) do
+                local item = c.item.byId[id]
+                if item and item.recipeId then
+                    candidates[#candidates + 1] = {key = "selected:" .. id, id = id, kind = "craft", info = item, amounts = work.recipeAmounts(item)}
+                end
+            end
+        end
+        for _, goal in ipairs(candidates) do
+            local manual = type(goal.key) == "string" and goal.key:sub(1, 9) == "selected:"
+            if (not manual or flags.craft or flags.progression)
+                and os.clock() >= (work.upgradeBlocked and work.upgradeBlocked[goal.key] or 0)
+                and work.readyCraft(goal) then return goal end
+        end
+    end
     function work.goalRunnable(goal)
         local amounts = work.goalAmounts(goal)
         local missing = work.missing(amounts)
@@ -4457,6 +4502,8 @@ local function runIslandEscape()
         if not work.canCollect() then return false end
         local c = config()
         local needs, amounts, resourceNeeds = work.needs, work.amounts, work.resourceNeeds
+        local previousProbe = work.probingGoal
+        work.probingGoal = goal
         work.needs, work.amounts, work.resourceNeeds = {}, {}, {}
         local ready = false
         local ok, err = pcall(function()
@@ -4481,12 +4528,24 @@ local function runIslandEscape()
             if not ready then ready = work.pickupCandidate(true) ~= nil or work.resourceCandidate("progression", true) ~= nil end
         end)
         work.needs, work.amounts, work.resourceNeeds = needs, amounts, resourceNeeds
+        work.probingGoal = previousProbe
         if not ok then error(err) end
         return ready
     end
+    function work.goalQueueRank(goal)
+        if goal.kind == "fuel" and (goal.maintenance or campData.isOnFire == false) then return -200 end
+        if goal.kind == "build" and work.buildRank(goal.info) == 0 then return -190 end
+        if goal.kind == "craft" or goal.kind == "bag" then return -100 + (tonumber(goal.rank) or 0) end
+        return tonumber(goal.rank) or 100
+    end
     function work.chooseUpgrade()
         work.upgradeBlocked = work.upgradeBlocked or {}
-        for _, goal in ipairs(work.upgradeCandidates()) do
+        local candidates = work.upgradeCandidates()
+        table.sort(candidates, function(a, b)
+            local ar, br = work.goalQueueRank(a), work.goalQueueRank(b)
+            return ar < br or (ar == br and a.key < b.key)
+        end)
+        for _, goal in ipairs(candidates) do
             local blocked = work.upgradeBlocked[goal.key]
             if not blocked or blocked <= os.clock() then
                 work.upgradeBlocked[goal.key] = nil
@@ -4617,12 +4676,8 @@ local function runIslandEscape()
                 end
             end
             if flags.craft then
-                for id, v in pairs(selected.craft or {}) do
-                    local item = c.item.byId[id]
-                    if v and item and count(item.displayName) == 0 then
-                        work.needRecipe(item, 60)
-                    end
-                end
+                local goal = work.selectedCraftMaterialGoal()
+                if goal then work.needRecipe(goal.info, 60) end
             end
         end
         local w = world()
@@ -4676,9 +4731,10 @@ local function runIslandEscape()
         if key == "evade" then return 0 end
         if key == "combat" then return (flags.combat and work.baseThreat()) and 1 or 1.5 end
         if key == "escape" and opts.emergencyEscape then return 0.8 end
-        if key == "mrbeastReward" then return 2.1 end
+        if key == "mrbeastReward" then return 3.6 end
         if key == "eat" then return 2 end
         if key == "fuel" then return 3 end
+        if key == "craft" then return 3.5 end
         if key == "cooked" then return work.noFood() and 3.1 or 7.4 end
         if key == "foodPickup" then return 3.15 end
         if key == "cook" then return work.noFood() and 3.2 or 7.5 end
@@ -5369,7 +5425,7 @@ local function runIslandEscape()
             run = work.evade,
         },
         {
-            key = "mrbeastReward", priority = 2.1, cooldown = 0.02,
+            key = "mrbeastReward", priority = 3.6, cooldown = 0.02,
             enabled = function() return flags.choiceRewards end,
             ready = function()
                 work.recoverChoices()
@@ -5508,15 +5564,10 @@ local function runIslandEscape()
         },
         {
             key = "craft",
-            priority = 5,
-            cooldown = 3,
-            ready = function()
-                for id, selectedItem in pairs(selected.craft or {}) do
-                    local item = selectedItem and config().item.byId[id]
-                    if item and count(item.displayName) == 0 and recipeReady(item) then return true end
-                end
-                return false
-            end,
+            enabled = function() return flags.craft or flags.progression or flags.toolLadder or flags.bagUpgrade end,
+            priority = 3.5,
+            cooldown = 0,
+            ready = function() return work.nextReadyCraft() ~= nil end,
             run = craftTick,
         },
         {
@@ -5819,6 +5870,7 @@ local function runIslandEscape()
     say("ISLAND ESCAPE LOADED • LONG RUN MODE • CONFIG SAVED PER GAME")
 end
 runIslandEscape()
+
 
 
 
