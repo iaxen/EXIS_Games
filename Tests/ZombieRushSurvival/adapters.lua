@@ -102,13 +102,13 @@ end)
 test('critical health upgrade outranks gun and melee purchases',function()
  local h=setup();h.cfg.gun=true;h.cfg.health=true;h.cfg.melee=true
  h.app.root=function()return{},{Health=20,MaxHealth=100}end
- assert(h.app.upgradeTick());assert(h.requests[1].args[1]=='Health')
+ h.app.matchTick();assert(h.requests[1].args[1]=='Health')
 end)
-test('healthy match upgrade order is gun then health then melee',function()
+test('ordinary upgrades are mixed without repeating a ready type before the others',function()
  local h=setup();h.cfg.gun=true;h.cfg.health=true;h.cfg.melee=true
- assert(h.app.upgradeTick());assert(h.requests[1].args[1]=='PurchaseWeaponTierUpgrade')
- h.cfg.gun=false;h.advance(2);assert(h.app.upgradeTick());assert(h.requests[2].args[1]=='Health')
- h.cfg.health=false;h.advance(2);assert(h.app.upgradeTick());assert(h.requests[3].args[1]=='MeleeUpgrade')
+ local seen={}
+ for i=1,3 do h.app.matchTick();local kind=h.requests[#h.requests].args[1];assert(not seen[kind]);seen[kind]=true;h.advance(2)end
+ assert(seen.Health and seen.PurchaseWeaponTierUpgrade and seen.MeleeUpgrade)
 end)
 test('upgrade maximum and all-off settings suppress remote calls',function()
  local h=setup();assert(not h.app.upgradeTick());h.cfg.gun=true;h.upgrades.IsAtMaxLevel=function()return true end

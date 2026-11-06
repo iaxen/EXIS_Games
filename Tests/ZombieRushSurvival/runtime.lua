@@ -18,9 +18,9 @@ local function setup()
   game={PlaceId=87413622775071},workspace={GetAttribute=function()return'Map2'end},
   firesignal=function(signal,token)events[#events+1]={signal=signal,token=token}end},{__index=_G})
  app.root=function()return{Position=v(7,3,0),Size=v(2,2,2)},{HipHeight=2}end
- app.module=function()return{}end;app.find=function()return{}end
+ app.module=function()return{GetCurrentPrice=function()return'Cash',10 end}end;app.afford=function()return true end;app.airRisk=function()return 0 end;app.inPlayableMap=function()return true end;app.find=function()return{}end
  app.note=function()end;app.region=function()return{points={}}end
- app.occupied=function()return false end;app.active=function()return true end
+ app.occupied=function()return false end;app.active=function()return true end;app.placementRegion=app.region
  app.ground=function(x,z,y)return{Position=v(x,y,z)}end
  app.invoke=function(key,remote,...)events[#events+1]={key=key,args={...}};return{ok=true}end
  local spec={facing=2};local slot={name='PulseTurret',spec=spec,w=3,d=3}

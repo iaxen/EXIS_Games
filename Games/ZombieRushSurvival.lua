@@ -223,6 +223,117 @@ function Core.mapViewHeight(bounds, width, height, fov, top)
     return math.max(halfZ / (tangent * usable), halfX / (tangent * aspect)) * 1.15
 end
 
+function Core.fairChoice(state, keys, random)
+    local ready = {}
+    for _, key in ipairs(keys) do ready[key] = true end
+    state.remaining, state.served = state.remaining or {}, state.served or {}
+    local remaining, included = {}, {}
+    for _, key in ipairs(state.remaining) do
+        if ready[key] then remaining[#remaining + 1], included[key] = key, true end
+    end
+    for _, key in ipairs(keys) do
+        if not included[key] and not state.served[key] then remaining[#remaining + 1] = key end
+    end
+    if #remaining == 0 then
+        remaining, state.served = {}, {}
+        for _, key in ipairs(keys) do remaining[#remaining + 1] = key end
+    end
+    state.remaining = remaining
+    if #remaining == 0 then return nil end
+    return remaining[(random or math.random)(1, #remaining)]
+end
+
+function Core.finishChoice(state, key)
+    state.served = state.served or {}
+    state.served[key] = true
+    for i = #(state.remaining or {}), 1, -1 do if state.remaining[i] == key then table.remove(state.remaining, i) end end
+end
+
+function Core.airRisk(point, rows, clearance)
+    local risk, count = 0, 0
+    for _, row in ipairs(rows) do
+        local radius = math.max(clearance, (row.range or 3) + 3)
+        local d = math.sqrt((point.x - row.x) ^ 2 + (point.z - row.z) ^ 2)
+        if d < radius then risk, count = risk + (radius - d + 1) ^ 2, count + 1 end
+    end
+    return risk, count
+end
+
+function Core.airRoute(a, b, rows, clearance)
+    local dx, dz = b.x - a.x, b.z - a.z
+    local length = dx * dx + dz * dz
+    for _, row in ipairs(rows) do
+        local t = length > 0 and math.max(0, math.min(1, ((row.x - a.x) * dx + (row.z - a.z) * dz) / length)) or 0
+        local radius = math.max(clearance, (row.range or 3) + 3)
+        if (a.x + t * dx - row.x) ^ 2 + (a.z + t * dz - row.z) ^ 2 < radius ^ 2 then return false end
+    end
+    return true
+end
+
+function Core.escapeRoute(a, b, rows, clearance)
+    local initial = Core.airRisk(a, rows, clearance)
+    if initial == 0 then return Core.airRoute(a, b, rows, clearance) end
+    if Core.airRisk(b, rows, clearance) >= initial then return false end
+    for _, t in ipairs({0.2, 0.4, 0.6, 0.8}) do
+        local risk = Core.airRisk({x = a.x + (b.x - a.x) * t, z = a.z + (b.z - a.z) * t}, rows, clearance)
+        if risk > initial + 0.01 then return false end
+    end
+    return true
+end
+
+function Core.mapPixelDirection(x, y, width, height, fov)
+    if width <= 0 or height <= 0 then return nil end
+    if x < 0 or y < 0 or x > width or y > height then return nil end
+    local tangent = math.tan(math.rad(fov) / 2)
+    return (x / width * 2 - 1) * tangent * width / height, (1 - y / height * 2) * tangent, -1
+end
+
+function Core.hull(points)
+    local p = {}
+    for _, point in ipairs(points) do p[#p + 1] = {x = point.x, y = point.y, z = point.z} end
+    table.sort(p, function(a, b) return a.x == b.x and a.z < b.z or a.x < b.x end)
+    local unique = {}
+    for _, point in ipairs(p) do
+        local prev = unique[#unique]
+        if not prev or prev.x ~= point.x or prev.z ~= point.z then unique[#unique + 1] = point end
+    end
+    if #unique < 3 then return {} end
+    local lower, upper = {}, {}
+    for _, point in ipairs(unique) do
+        while #lower >= 2 and Core.cross(lower[#lower - 1], lower[#lower], point) <= 0 do table.remove(lower) end
+        lower[#lower + 1] = point
+    end
+    for i = #unique, 1, -1 do
+        local point = unique[i]
+        while #upper >= 2 and Core.cross(upper[#upper - 1], upper[#upper], point) <= 0 do table.remove(upper) end
+        upper[#upper + 1] = point
+    end
+    table.remove(lower) table.remove(upper)
+    for _, point in ipairs(upper) do lower[#lower + 1] = point end
+    return lower
+end
+
+function Core.clipPolygon(subject, boundary)
+    local output = subject
+    for i, a in ipairs(boundary) do
+        local b, input = boundary[i % #boundary + 1], output
+        output = {}
+        for j, endPoint in ipairs(input) do
+            local start = input[(j - 2) % #input + 1]
+            local from, to = Core.cross(a, b, start), Core.cross(a, b, endPoint)
+            local fromInside, toInside = from >= -0.0001, to >= -0.0001
+            if fromInside ~= toInside then
+                local t = from / (from - to)
+                output[#output + 1] = {x = start.x + (endPoint.x - start.x) * t,
+                    y = start.y + (endPoint.y - start.y) * t, z = start.z + (endPoint.z - start.z) * t}
+            end
+            if toInside then output[#output + 1] = endPoint end
+        end
+        if #output == 0 then break end
+    end
+    return output
+end
+
 -- Runtime adapters. The planning functions above have no Roblox dependencies.
 local function run()
     if not game:IsLoaded() then game.Loaded:Wait() end
@@ -243,7 +354,7 @@ local function run()
         buyWeapons = {}, upgradeWeapons = {}, loadout = {}, autoLoadout = false,
         health = false, gun = false, melee = false, autoPlace = false, defenseTypes = {},
         regions = {}, maxDefenses = 18, reserveCash = 0, fight = false, fly = true,
-        headAim = true, bossFirst = true, fireInput = "Mobile", flyHeight = 14, orbitRadius = 16, flySpeed = 32}
+        headAim = true, bossFirst = true, clearance = 14, moveMode = "Smooth", placeSpawnArea = false, fireInput = "Mobile", flyHeight = 14, orbitRadius = 16, flySpeed = 32}
     local file = "EXIS_ZombieRushSurvival_" .. player.UserId .. ".json"
     if type(readfile) == "function" and type(isfile) == "function" then
         local ok, data = pcall(function() if isfile(file) then return Http:JSONDecode(readfile(file)) end end)
@@ -252,7 +363,7 @@ local function run()
         end
     end
     for key, limits in pairs({maxDefenses = {1, 48}, reserveCash = {0, 1e12}, flyHeight = {5, 50},
-        orbitRadius = {6, 60}, flySpeed = {8, 70}}) do
+        orbitRadius = {6, 90}, flySpeed = {8, 100}, clearance = {8, 60}}) do
         local value = cfg[key]
         cfg[key] = Core.finite(value) and math.clamp(value, limits[1], limits[2]) or limits[1]
     end
@@ -334,7 +445,7 @@ local function run()
         return root, human
     end
     function app.active()
-        return app.alive and cfg.enabled and not app.editing and app.root() ~= nil
+        return app.alive and cfg.enabled and app.root() ~= nil
     end
     function app.note(key, value)
         app.notes[key] = tostring(value)
@@ -428,30 +539,96 @@ local function run()
         end
         return false
     end
-    function app.upgradeTick()
+    function app.upgradeCandidate(name)
         local upgrades = app.module(modules, "PlayerUpgradeDefinitions")
-        if not upgrades then return false end
-        local _, human = app.root()
-        local order = {"gun", "health", "melee"}
-        if human and human.Health / human.MaxHealth < 0.5 then order = {"health", "gun", "melee"} end
+        if not upgrades then return nil end
         local types = {health = "Health", gun = upgrades.WeaponTierUpgradeTypeName, melee = upgrades.MeleeUpgradeTypeName}
-        for _, name in ipairs(order) do
-            local kind = types[name]
-            if cfg[name] and kind and upgrades.Types[kind] then
-                local level = upgrades.GetPlayerLevel(player, kind)
-                if not upgrades.IsAtMaxLevel(kind, level) then
-                    local round = RS:FindFirstChild("RoundInfo")
-                    local currency, price = upgrades.GetPrice(kind, level, {Player = player, CurrentLevel = level,
-                        Difficulty = app.value(round and round:FindFirstChild("Difficulty"), "Regular")})
-                    local key = "upgrade:" .. name
-                    if app.afford(currency, price) and os.clock() >= (app.next[key] or 0) then
-                        app.invoke(key, app.find(RS, "Events", "Actions", "PurchaseUpgrade"), kind)
-                        return true
+        local kind = types[name]
+        if not cfg[name] or not kind or not upgrades.Types[kind] then return nil end
+        local level = upgrades.GetPlayerLevel(player, kind)
+        if upgrades.IsAtMaxLevel(kind, level) then return nil end
+        local round = RS:FindFirstChild("RoundInfo")
+        local currency, price = upgrades.GetPrice(kind, level, {Player = player, CurrentLevel = level,
+            Difficulty = app.value(round and round:FindFirstChild("Difficulty"), "Regular")})
+        if app.afford(currency, price) and os.clock() >= (app.next["upgrade:" .. name] or 0) then return kind end
+    end
+    function app.upgradeTick(preferred)
+        local ready = {}
+        for _, name in ipairs(preferred and {preferred} or {"health", "gun", "melee"}) do
+            if app.upgradeCandidate(name) then ready[#ready + 1] = name end
+        end
+        app.upgradeMix = app.upgradeMix or {}
+        local name = preferred and ready[1] or Core.fairChoice(app.upgradeMix, ready)
+        if not name then return false end
+        local kind = app.upgradeCandidate(name)
+        if not kind then return false end
+        app.invoke("upgrade:" .. name, app.find(RS, "Events", "Actions", "PurchaseUpgrade"), kind)
+        Core.finishChoice(app.upgradeMix, name)
+        return true
+    end
+    function app.turretEstablished()
+        local folder = workspace:FindFirstChild("Deployables")
+        for _, model in ipairs(folder and folder:GetChildren() or {}) do
+            local name = model:GetAttribute("TypeName")
+            local info = name and defs.Types[name]
+            if model:GetAttribute("OwnerUserId") == player.UserId and model:GetAttribute("Destroyed") ~= true
+                and (model:GetAttribute("Health") or 1) > 0 and info and Core.role(name, info) == "turret" then return true end
+        end
+        for _, pending in pairs(app.pendingPlacements or {}) do
+            if os.clock() < pending.expires and pending.slot.role == "turret" then return true end
+        end
+        return false
+    end
+    function app.matchTick()
+        local _, human = app.root()
+        if not human then return end
+        -- Survival remains urgent; ordinary spending uses a randomized fair cycle.
+        if human.Health / human.MaxHealth < 0.5 and app.upgradeCandidate("health") then app.upgradeTick("health") return end
+        local boss = cfg.fight and cfg.bossFirst and app.target and app.target.boss
+        if cfg.autoPlace and not boss and not app.turretEstablished() then
+            local first = app.placementTask and app.placementTask.slot.role == "turret" and app.placementTask
+                or app.getPlacement("turret", true)
+            if first then
+                if not first.affordable then app.note("economy", "SAVING FOR FIRST TURRET") app.buildGoal = nil return end
+                app.placementTask = first
+                local result = app.placeTick()
+                if result ~= nil then app.placementTask = nil end
+                return
+            end
+        end
+        if app.placementTask and not boss then
+            local result = app.placeTick()
+            if result == nil then return end -- Keep a moving placement until it completes.
+            if app.matchMix and app.placementKey then Core.finishChoice(app.matchMix, app.placementKey) end
+            app.placementTask, app.placementKey = nil, nil
+        end
+        local keys, choices = {}, {}
+        for _, name in ipairs({"health", "gun", "melee"}) do
+            if app.upgradeCandidate(name) then keys[#keys + 1] = "upgrade:" .. name end
+        end
+        if cfg.autoPlace and not boss then
+            local seen = {}
+            for _, slot in ipairs(app.layout()) do
+                if not seen[slot.name] then
+                    seen[slot.name] = true
+                    local candidate = app.getPlacement(slot.name)
+                    if candidate then
+                        local key = "place:" .. slot.name
+                        keys[#keys + 1], choices[key] = key, candidate
                     end
                 end
             end
         end
-        return false
+        app.matchMix = app.matchMix or {}
+        local key = Core.fairChoice(app.matchMix, keys)
+        if not key then app.buildGoal = nil return end
+        if choices[key] then
+            app.placementTask, app.placementKey = choices[key], key
+            local result = app.placeTick()
+            if result == nil then return end
+            app.placementTask, app.placementKey = nil, nil
+        else app.upgradeTick(key:sub(9)) end
+        Core.finishChoice(app.matchMix, key)
     end
     function app.skipTick()
         if app.mode ~= "MATCH" or not app.alive or not app.root() or app.editing then return end
@@ -479,8 +656,11 @@ local function run()
     end
     function app.mapFilters()
         local result = {}
-        for _, name in ipairs({"MapGeometry", "Map"}) do
-            local folder = workspace:FindFirstChild(name)
+        local geometry = workspace:FindFirstChild("MapGeometry")
+        if geometry then result[#result + 1] = geometry end
+        local map = workspace:FindFirstChild("Map")
+        for _, name in ipairs({"Map", "Background"}) do
+            local folder = map and map:FindFirstChild(name)
             if folder then result[#result + 1] = folder end
         end
         return result
@@ -492,112 +672,237 @@ local function run()
         params.IgnoreWater = false
         return workspace:Raycast(origin, direction, params)
     end
-    -- A temporary top-down view of the live map, not a separate guessed map image.
     function app.stopMapView()
         local state = app.mapView
         if not state then return end
         app.mapView = nil
-        for part, original in pairs(state.transparency) do
-            if part.Parent then part.LocalTransparencyModifier = original end
-        end
-        for screen, enabled in pairs(state.screens) do if screen.Parent then screen.Enabled = enabled end end
-        for camera, snapshot in pairs(state.cameras) do
-            if camera.Parent then
-                camera.CameraType = snapshot.kind
-                camera.CameraSubject = snapshot.subject
-                camera.FieldOfView = snapshot.fov
-                camera.CFrame, camera.Focus = snapshot.frame, snapshot.focus
-            end
-        end
         UIS.MouseBehavior, UIS.MouseIconEnabled = state.mouseBehavior, state.mouseIcon
-        game:GetService("ContextActionService"):UnbindAction("EXIS_MAP_NAV")
+        if state.world then state.world:Destroy() end
+        if state.camera then state.camera:Destroy() end
+        if app.viewport then app.viewport.CurrentCamera = nil end
     end
     function app.mapLayer(layer)
         local state = app.mapView
         if not state then return false end
         local floors = {}
-        local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
         for _, part in ipairs(state.parts) do
             if part.Parent then
                 local top = part.CFrame:PointToWorldSpace(Vector3.new(0, part.Size.Y / 2, 0))
                 local onLayer = math.abs(top.Y - layer) <= 3.1 and part.CFrame.UpVector.Y >= 0.65
-                -- Local cutaway makes the cave floor visible through its roof.
-                part.LocalTransparencyModifier = onLayer and state.transparency[part] or 1
-                if onLayer and (part.CanCollide or part.Transparency < 1) then
-                    floors[#floors + 1] = part
-                    for _, corner in ipairs({{-1, -1}, {1, -1}, {1, 1}, {-1, 1}}) do
-                        local p = part.CFrame:PointToWorldSpace(Vector3.new(corner[1] * part.Size.X / 2, part.Size.Y / 2, corner[2] * part.Size.Z / 2))
-                        minX, maxX, minZ, maxZ = math.min(minX, p.X), math.max(maxX, p.X), math.min(minZ, p.Z), math.max(maxZ, p.Z)
-                    end
-                end
+                part.LocalTransparencyModifier = state.cutaway and not onLayer and 1 or (state.original[part] or 0)
+                if onLayer then floors[#floors + 1] = part end
             end
         end
         if #floors == 0 then return false end
         state.layer, state.floors = layer, floors
-        state.bounds = {minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ}
-        state.center = Vector3.new((minX + maxX) / 2, layer, (minZ + maxZ) / 2)
-        state.zoom, state.panX, state.panZ = 1, 0, 0
         return true
+    end
+    function app.cloneMapPart(source)
+        local changed = {}
+        local all = {source}
+        for _, child in ipairs(source:GetDescendants()) do all[#all + 1] = child end
+        for _, node in ipairs(all) do if not node.Archivable then changed[#changed + 1] = node node.Archivable = true end end
+        local ok, clone = pcall(source.Clone, source)
+        for _, node in ipairs(changed) do if node.Parent then node.Archivable = false end end
+        if not ok or not clone then return nil end
+        for _, node in ipairs(clone:GetDescendants()) do
+            if node:IsA("BaseScript") or node:IsA("ModuleScript") or node:IsA("BasePart")
+                or node:IsA("JointInstance") or node:IsA("Constraint") then node:Destroy() end
+        end
+        clone.Anchored, clone.CanCollide, clone.CanTouch, clone.CanQuery = true, false, false, true
+        clone.CFrame = source.CFrame
+        clone.LocalTransparencyModifier = source.LocalTransparencyModifier
+        return clone
     end
     function app.startMapView(layer)
         app.stopMapView()
-        if not workspace.CurrentCamera then app.note("area", "CAMERA NOT READY") return false end
-        local state = {parts = {}, transparency = {}, screens = {}, cameras = {}, map = app.mapId,
-            mouseBehavior = UIS.MouseBehavior, mouseIcon = UIS.MouseIconEnabled}
+        if not app.viewport then return false end
+        local world = Instance.new("WorldModel")
+        world.Name, world.Parent = "EXIS_MAP_REPLICA", app.viewport
+        local camera = Instance.new("Camera")
+        camera.FieldOfView, camera.Parent = 50, app.viewport
+        app.viewport.CurrentCamera = camera
+        local state = {world = world, camera = camera, parts = {}, sources = {}, original = {}, floors = {}, map = app.mapId,
+            layer = layer, zoom = 1, panX = 0, panZ = 0, cutaway = false, loading = true,
+            mouseBehavior = UIS.MouseBehavior, mouseIcon = UIS.MouseIconEnabled, count = 0, total = 0, failed = 0}
         app.mapView = state
-        local seen = {}
+        local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
+        local originals, seen = {}, {}
         for _, folder in ipairs(app.mapFilters()) do
-            for _, part in ipairs(folder:GetDescendants()) do
-                if part:IsA("BasePart") and not seen[part] then
-                    seen[part] = true
-                    state.parts[#state.parts + 1] = part
-                    state.transparency[part] = part.LocalTransparencyModifier
+            for _, source in ipairs(folder:GetDescendants()) do
+                if source:IsA("BasePart") and not seen[source] then
+                    seen[source] = true originals[#originals + 1] = source
+                    if source.Transparency < 1 then
+                        local p = source.Position
+                        minX, maxX = math.min(minX, p.X - source.Size.X / 2), math.max(maxX, p.X + source.Size.X / 2)
+                        minZ, maxZ = math.min(minZ, p.Z - source.Size.Z / 2), math.max(maxZ, p.Z + source.Size.Z / 2)
+                    end
                 end
             end
         end
-        if not app.mapLayer(layer) then
-            app.stopMapView()
-            app.note("area", "MAP FLOOR NOT LOADED; TRY AGAIN NEAR THE FLOOR")
-            return false
+        local nav = app.navigation()
+        if #nav.hull >= 3 then
+            minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
+            for _, p in ipairs(nav.hull) do minX, maxX, minZ, maxZ = math.min(minX, p.x), math.max(maxX, p.x), math.min(minZ, p.z), math.max(maxZ, p.z) end
         end
-        for _, name in ipairs({"Gameplay", "Toolbar", "TouchGui"}) do
-            local screen = pg:FindFirstChild(name)
-            if screen and screen:IsA("ScreenGui") then state.screens[screen] = screen.Enabled screen.Enabled = false end
-        end
-        game:GetService("ContextActionService"):BindActionAtPriority("EXIS_MAP_NAV", function()
-            return Enum.ContextActionResult.Sink
-        end, false, 10000, Enum.PlayerActions.CharacterForward, Enum.PlayerActions.CharacterBackward,
-            Enum.PlayerActions.CharacterLeft, Enum.PlayerActions.CharacterRight, Enum.PlayerActions.CharacterJump)
+        if minX == math.huge then app.stopMapView() app.note("area", "MAP GEOMETRY NOT LOADED") return false end
+        state.bounds = {minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ}
+        state.center, state.total = Vector3.new((minX + maxX) / 2, layer, (minZ + maxZ) / 2), #originals
+        -- Bounded clone batches keep the live fight loop running during replica loading.
+        task.spawn(function()
+            for index, source in ipairs(originals) do
+                if not app.alive or app.mapView ~= state then return end
+                if source.Parent then
+                    local clone = app.cloneMapPart(source)
+                    if clone then
+                        clone.Parent = world
+                        state.parts[#state.parts + 1], state.sources[clone] = clone, source
+                        state.original[clone] = source.LocalTransparencyModifier
+                    else state.failed = state.failed + 1 end
+                end
+                state.count = index
+                if index % 24 == 0 then task.wait() end
+            end
+            if app.mapView ~= state then return end
+            state.loading = false
+            if state.failed > 0 then app.note("replica", "COPY FAILED FOR " .. state.failed .. " MAP PARTS") end
+            if not app.mapLayer(state.layer) then app.editorMessage = "CHOOSE A FLOOR LAYER" end
+        end)
         return true
     end
+    function app.projectMapPoint(point)
+        local state, viewport = app.mapView, app.viewport
+        if not state or not viewport or not state.camera then return nil end
+        local p = state.camera.CFrame:PointToObjectSpace(point)
+        if p.Z >= -0.01 then return nil end
+        local size, tangent = viewport.AbsoluteSize, math.tan(math.rad(state.camera.FieldOfView) / 2)
+        if size.X <= 0 or size.Y <= 0 then return nil end
+        return Vector2.new(size.X / 2 + p.X / -p.Z * size.Y / (2 * tangent),
+            size.Y / 2 - p.Y / -p.Z * size.Y / (2 * tangent))
+    end
     function app.renderMapView()
-        local state = app.mapView
-        if not state or not app.editing then return end
-        local camera = workspace.CurrentCamera
-        if not camera then return end
-        if not state.cameras[camera] then
-            state.cameras[camera] = {kind = camera.CameraType, subject = camera.CameraSubject,
-                frame = camera.CFrame, focus = camera.Focus, fov = camera.FieldOfView}
-        end
-        local viewport = camera.ViewportSize
-        local height = Core.mapViewHeight(state.bounds, viewport.X - 16, viewport.Y, 50, 150) * state.zoom
-        state.height = math.clamp(height, 8, 20000)
-        local toolbarOffset = state.height * math.tan(math.rad(50) / 2) * math.min(150, viewport.Y * 0.8) / math.max(1, viewport.Y)
-        local center = state.center + Vector3.new(state.panX, 0, state.panZ - toolbarOffset)
+        local state, viewport = app.mapView, app.viewport
+        if not state or not app.editing or not viewport then return end
+        local size = viewport.AbsoluteSize
+        state.height = math.clamp(Core.mapViewHeight(state.bounds, size.X, size.Y, 50) * state.zoom, 8, 20000)
+        local center = state.center + Vector3.new(state.panX, 0, state.panZ)
+        state.camera.CFrame = CFrame.lookAt(center + Vector3.new(0, state.height, 0), center, Vector3.new(0, 0, -1))
         UIS.MouseBehavior, UIS.MouseIconEnabled = Enum.MouseBehavior.Default, true
-        camera.CameraType, camera.FieldOfView = Enum.CameraType.Scriptable, 50
-        camera.CFrame = CFrame.lookAt(center + Vector3.new(0, state.height, 0), center, Vector3.new(0, 0, -1))
-        camera.Focus = CFrame.new(center)
-        if app.refreshMapDots then app.refreshMapDots(camera) end
+        if app.refreshMapDots then app.refreshMapDots(state.camera) end
     end
     function app.mapViewRay(screen)
-        local state, camera = app.mapView, workspace.CurrentCamera
-        if not state or not camera then return nil end
-        local inset = GuiService:GetGuiInset()
-        local ray = camera:ViewportPointToRay(screen.X - inset.X, screen.Y - inset.Y)
-        local hit = app.raycast(ray.Origin, ray.Direction * ((state.height or 1000) * 3 + 200), state.floors)
-        if not hit or hit.Material == Enum.Material.Water or hit.Normal.Y < 0.65 then return nil end
-        return hit
+        local state, viewport = app.mapView, app.viewport
+        if not state or state.loading or #state.floors == 0 or not viewport then return nil end
+        local p, size = viewport.AbsolutePosition, viewport.AbsoluteSize
+        local x, y, z = Core.mapPixelDirection(screen.X - p.X, screen.Y - p.Y, size.X, size.Y, state.camera.FieldOfView)
+        if not x then return nil end
+        local direction = state.camera.CFrame:VectorToWorldSpace(Vector3.new(x, y, z)).Unit
+        local params = RaycastParams.new()
+        params.FilterType, params.FilterDescendantsInstances = Enum.RaycastFilterType.Include, state.floors
+        return state.world:Raycast(state.camera.CFrame.Position, direction * (state.height * 3 + 200), params)
+    end
+    function app.navigation()
+        local cached = app.navCache
+        if cached and cached.map == app.mapId and os.clock() < cached.untilTime then return cached end
+        local spawns = app.find(workspace, "Map", "ZombieTestMap", "ZombieSpawns")
+        local rows, points = {}, {}
+        for _, part in ipairs(spawns and spawns:GetChildren() or {}) do
+            if part:IsA("BasePart") then
+                local p = part.Position
+                rows[#rows + 1] = {point = p, source = part}
+                points[#points + 1] = {x = p.X, y = p.Y, z = p.Z}
+            end
+        end
+        local spawn = app.find(workspace, "Map", "ZombieTestMap", "PlayerSpawn")
+        if spawn and spawn:IsA("BasePart") then
+            points[#points + 1] = {x = spawn.Position.X, y = spawn.Position.Y, z = spawn.Position.Z}
+        end
+        local filters = app.mapFilters()
+        local map = workspace:FindFirstChild("Map")
+        if map then
+            local preload, generated = map:FindFirstChild("PreloadPaths"), map:FindFirstChild("Zombie_GeneratedPaths")
+            if preload then filters[#filters + 1] = preload end
+            if generated then filters[#filters + 1] = generated end
+        end
+        local borders = app.find(workspace, "WeaponBlacklist", "Zombie_BorderWalls")
+        if borders then filters[#filters + 1] = borders end
+        cached = {map = app.mapId, spawns = rows, hull = Core.hull(points), filters = filters, untilTime = os.clock() + 5}
+        app.navCache = cached
+        return cached
+    end
+    function app.inPlayableMap(point)
+        local nav = app.navigation()
+        return #nav.hull >= 3 and Core.inside({x = point.X, z = point.Z}, nav.hull)
+    end
+    function app.travelHit(origin, direction)
+        if direction.Magnitude < 0.01 then return nil end
+        local root = app.root()
+        if not root then return true end
+        local params = RaycastParams.new()
+        params.FilterType, params.FilterDescendantsInstances = Enum.RaycastFilterType.Include, app.navigation().filters
+        params.RespectCanCollide, params.CollisionGroup = true, root.CollisionGroup
+        -- Sweep a character-sized volume, not just a ray through its center.
+        return workspace:Blockcast(CFrame.new(origin), Vector3.new(3, 4, 3), direction, params)
+    end
+    function app.placementRegion()
+        if not cfg.placeSpawnArea then return app.region() end
+        local nav, root = app.navigation(), app.root()
+        if #nav.hull < 3 or not root or #nav.spawns == 0 then return {points = {}} end
+        if not app.spawnAnchor or app.spawnAnchorMap ~= app.mapId then
+            local best, distance
+            for _, row in ipairs(nav.spawns) do
+                local d = (row.point - root.Position).Magnitude
+                if app.airRisk(row.point) > 0 then d = d + 10000 end
+                if not distance or d < distance then best, distance = row.point, d end
+            end
+            local alternatives = {}
+            for _, row in ipairs(nav.spawns) do alternatives[#alternatives + 1] = row.point end
+            table.sort(alternatives, function(a, b) return (a - root.Position).Magnitude < (b - root.Position).Magnitude end)
+            best = alternatives[((app.spawnAnchorTurn or 0) % #alternatives) + 1] or best
+            local hit = app.raycast(best + Vector3.new(0, 5, 0), Vector3.new(0, -100, 0), app.mapFilters())
+            if hit and hit.Normal.Y >= 0.65 then best = hit.Position end
+            app.spawnAnchor, app.spawnAnchorMap = best, app.mapId
+        end
+        local p, radius = app.spawnAnchor, 25
+        local square = {{x = p.X - radius, y = p.Y, z = p.Z - radius}, {x = p.X + radius, y = p.Y, z = p.Z - radius},
+            {x = p.X + radius, y = p.Y, z = p.Z + radius}, {x = p.X - radius, y = p.Y, z = p.Z + radius}}
+        local clipped = Core.clipPolygon(square, nav.hull)
+        if #clipped > 24 then
+            local simpler = {}
+            for i = 1, 24 do simpler[i] = clipped[math.floor((i - 1) * #clipped / 24) + 1] end
+            clipped = simpler
+        end
+        return {points = clipped, anywhere = true}
+    end
+    function app.routeHop(goal)
+        local root = app.root()
+        if not root or not app.inPlayableMap(goal) then return nil end
+        if app.airRoute(root.Position, goal) and not app.travelHit(root.Position, goal - root.Position) then return goal end
+        local cached = app.routeCache
+        if cached and os.clock() < cached.untilTime and (cached.goal - goal).Magnitude < 1
+            and (cached.from - root.Position).Magnitude < 3 then
+            if not cached.hop then return nil end
+            if app.airRoute(root.Position, cached.hop) and not app.travelHit(root.Position, cached.hop - root.Position) then return cached.hop end
+        end
+        local cache = {goal = goal, from = root.Position, untilTime = os.clock() + 0.18}
+        app.routeCache = cache
+        local candidates = {}
+        for _, row in ipairs(app.navigation().spawns) do
+            local p = row.point
+            local cost = (p - root.Position).Magnitude + (p - goal).Magnitude
+            candidates[#candidates + 1] = {point = p, cost = cost}
+        end
+        table.sort(candidates, function(a, b) return a.cost < b.cost end)
+        for i = 1, math.min(24, #candidates) do
+            local point = candidates[i].point
+            if app.airRisk(point) == 0 then
+                local hop = app.flightPoint(point)
+                if hop and (hop - root.Position).Magnitude > 3 and app.airRoute(root.Position, hop)
+                    and app.airRoute(hop, goal) and not app.travelHit(root.Position, hop - root.Position)
+                    and not app.travelHit(hop, goal - hop) then cache.hop = hop return hop end
+            end
+        end
+        return nil
     end
     function app.resolveSurface()
         local saved = app.region().surface
@@ -616,7 +921,7 @@ local function run()
         return nil
     end
     function app.ground(x, z, y)
-        local region = app.region()
+        local region = app.placementRegion()
         local surface = app.resolveSurface()
         if region.surface and not surface then return nil end
         local filters = surface and {surface} or app.mapFilters()
@@ -659,7 +964,7 @@ local function run()
     function app.specs()
         local result = {}
         if not app.className then return result end
-        local region = app.region()
+        local region = app.placementRegion()
         local poly = region.points or {}
         local outward = #poly >= 2 and Vector3.new(poly[2].z - poly[1].z, 0, poly[1].x - poly[2].x) or Vector3.new(0, 0, -1)
         local center = Vector3.new(0, 0, 0)
@@ -689,7 +994,7 @@ local function run()
         local key = app.mapId .. ":" .. tostring(app.className) .. ":" .. app.revision
         if key == app.planKey then return app.plan or {} end
         local specs = app.specs()
-        local plan, reason, reserve = Core.plan(app.region().points or {}, specs, cfg.maxDefenses, app.defenseBoxes())
+        local plan, reason, reserve = Core.plan(app.placementRegion().points or {}, specs, cfg.maxDefenses, app.defenseBoxes())
         local byName = {}
         for _, spec in ipairs(specs) do byName[spec.name] = spec end
         for _, slot in ipairs(plan) do slot.spec = byName[slot.name] end
@@ -700,7 +1005,7 @@ local function run()
     function app.defenseBoxes()
         if app.defenseCache and os.clock() < app.defenseCache.untilTime then return app.defenseCache.boxes end
         local folder, boxes = workspace:FindFirstChild("Deployables"), {}
-        local poly, floorY = app.region().points or {}, 0
+        local poly, floorY = app.placementRegion().points or {}, 0
         for _, p in ipairs(poly) do floorY = floorY + p.y / #poly end
         for _, model in ipairs(folder and folder:GetChildren() or {}) do
             if model:IsA("Model") and model:GetAttribute("Destroyed") ~= true then
@@ -729,58 +1034,87 @@ local function run()
         end
         return false
     end
-    function app.getPlacement()
-        if app.mode ~= "MATCH" or not cfg.autoPlace or app.mapId == "Unknown" or not app.className then return nil end
+    function app.getPlacement(preferred, allowUnfunded)
+        if os.clock() < (app.next.place or 0) then return nil end
+        if app.mode ~= "MATCH" or not cfg.autoPlace or app.editing or app.mapId == "Unknown" or not app.className then return nil end
         local client = app.module(app.find(player, "PlayerScripts", "Client"), "DeployableSystem")
         if not client then return nil end
         local folder, ownedCount = workspace:FindFirstChild("Deployables"), 0
-        if folder then
-            for _, model in ipairs(folder:GetChildren()) do
-                if model:GetAttribute("OwnerUserId") == player.UserId and model:GetAttribute("Destroyed") ~= true then ownedCount = ownedCount + 1 end
-            end
+        for _, model in ipairs(folder and folder:GetChildren() or {}) do
+            if model:GetAttribute("OwnerUserId") == player.UserId and model:GetAttribute("Destroyed") ~= true then ownedCount = ownedCount + 1 end
         end
         if ownedCount >= cfg.maxDefenses then return nil end
+        local choices = {}
         for index, slot in ipairs(app.layout()) do
             local key = app.planKey .. ":" .. index
-            if os.clock() >= (app.rejected[key] or 0) and not app.occupied(slot) then
+            if (not preferred or slot.name == preferred or slot.role == preferred)
+                and os.clock() >= (app.rejected[key] or 0) and not app.occupied(slot) then
                 local currency, price = client.GetCurrentPrice(slot.name)
-                if app.afford(currency, price) then
+                local affordable = app.afford(currency, price)
+                if affordable or allowUnfunded then
                     local hit = app.ground(slot.x, slot.z, slot.y)
-                    if hit then
-                        return {key = key, slot = slot, point = hit.Position, class = app.className,
-                            map = app.mapId, revision = app.revision}
-                    end
-                    app.rejected[key] = os.clock() + 10
+                    if hit and app.inPlayableMap(hit.Position) and app.airRisk(hit.Position) == 0 then
+                        choices[#choices + 1] = {key = key, slot = slot, point = hit.Position, class = app.className,
+                            map = app.mapId, revision = app.revision, affordable = affordable}
+                    elseif not hit then app.rejected[key] = os.clock() + 8 end
                 end
             end
         end
-        return nil
+        if #choices == 0 then
+            if cfg.placeSpawnArea and not app.placementTask and os.clock() >= (app.next.spawnArea or 0) then
+                app.next.spawnArea = os.clock() + 5
+                app.spawnAnchorTurn = (app.spawnAnchorTurn or 0) + 1
+                app.spawnAnchor, app.planKey = nil, nil
+            end
+            return nil
+        end
+        return choices[math.random(1, #choices)]
     end
     function app.placeTick()
         if app.target and app.target.boss and cfg.bossFirst and cfg.fight then app.buildGoal = nil return end
-        local candidate = app.getPlacement()
-        if not candidate then app.buildGoal = nil return end
+        if app.editing then app.buildGoal = nil return false end
+        local candidate = app.placementTask or app.getPlacement()
+        if not candidate then app.buildGoal = nil return false end
+        if candidate.class ~= app.className or candidate.map ~= app.mapId or candidate.revision ~= app.revision then
+            app.placementTask, app.buildGoal = nil, nil return false
+        end
         local root, human = app.root()
-        if not root then return end
+        if not root then return false end
+        if app.airRisk(root.Position) > 0 or app.airRisk(candidate.point) > 0 then app.buildGoal = nil return false end
         local lift = human.HipHeight + root.Size.Y / 2
         local outward = Vector3.new(root.Position.X - candidate.point.X, 0, root.Position.Z - candidate.point.Z)
         if outward.Magnitude < 0.1 then outward = Vector3.new(1, 0, 0) end
         local side = candidate.point + outward.Unit * math.min(8, math.max(candidate.slot.w, candidate.slot.d) / 2 + 3)
         local sideHit = app.ground(side.X, side.Z, candidate.point.Y)
         local stand = (sideHit and sideHit.Position or candidate.point) + Vector3.new(0, lift, 0)
+        if app.airRisk(stand) > 0 or not app.inPlayableMap(stand) then
+            local safe
+            for i = 0, 7 do
+                local angle = i * math.pi / 4
+                local probe = candidate.point + Vector3.new(math.cos(angle) * 7, 0, math.sin(angle) * 7)
+                local floor = app.ground(probe.X, probe.Z, candidate.point.Y)
+                if floor and app.airRisk(floor.Position) == 0 and app.inPlayableMap(floor.Position) then safe = floor.Position + Vector3.new(0, lift, 0) break end
+            end
+            if not safe then return false end
+            stand = safe
+        end
         local delta = stand - root.Position
         if delta.Magnitude > 10 or math.abs(root.Position.Y - stand.Y) > 2 then
             app.buildGoal = stand
             app.note("defense", "MOVING INTO PLACEMENT RANGE")
-            return
+            return nil
         end
         app.buildGoal = nil
         -- Re-check after movement; selection, class, occupancy and cash can change.
         if candidate.class ~= app.className or candidate.map ~= app.mapId or candidate.revision ~= app.revision
-            or not cfg.autoPlace or not app.active() or app.occupied(candidate.slot) then return end
+            or not cfg.autoPlace or not app.active() or app.occupied(candidate.slot) then return false end
         local spec = candidate.slot.spec
-        local region = app.region()
-        if not Core.fits(candidate.slot, candidate.slot.w + 0.1, candidate.slot.d + 0.1, region.points or {}) then return end
+        local region = app.placementRegion()
+        if not Core.fits(candidate.slot, candidate.slot.w + 0.1, candidate.slot.d + 0.1, region.points or {}) then return false end
+        local client = app.module(app.find(player, "PlayerScripts", "Client"), "DeployableSystem")
+        if not client then return false end
+        local currency, price = client.GetCurrentPrice(candidate.slot.name)
+        if not app.afford(currency, price) then return false end
         local result = app.invoke("place", app.find(RS, "DeployableSystem_Remotes", "Place"),
             candidate.slot.name, candidate.point, {Facing = spec.facing})
         if type(result) == "table" and result.ok == true then
@@ -791,6 +1125,7 @@ local function run()
             app.rejected[candidate.key] = os.clock() + 8
             app.note("defense", "REJECTED: " .. tostring(result.reason or "UNKNOWN"))
         end
+        return result and result.ok == true or false
     end
     function app.weapon()
         local guns = app.module(modules, "GunData")
@@ -837,19 +1172,12 @@ local function run()
     function app.chooseTarget()
         local root = app.root()
         if not root then return nil end
-        local folder = workspace:FindFirstChild("Zombie_ClientVisuals")
-        if not folder then return nil end
         local best, score
-        for _, model in ipairs(folder:GetChildren()) do
-            if model:IsA("Model") and model:GetAttribute("ZombieId") ~= nil then
-                local point = app.head(model)
-                local health = model:FindFirstChildOfClass("Humanoid")
-                if point and (not health or health.Health > 0) then
-                    local boss = app.isBoss(model)
-                    local rank = Core.targetScore((point - root.Position).Magnitude, boss, cfg.bossFirst,
-                        app.target and app.target.model == model)
-                    if not score or rank > score then best, score = {model = model, point = point, boss = boss}, rank end
-                end
+        for _, row in ipairs(app.enemyRows()) do
+            if row.model.Parent then
+                local rank = Core.targetScore((row.point - root.Position).Magnitude, row.boss, cfg.bossFirst,
+                    app.target and app.target.model == row.model)
+                if not score or rank > score then best, score = {model = row.model, point = row.point, boss = row.boss}, rank end
             end
         end
         return best
@@ -914,59 +1242,195 @@ local function run()
             if state.human.Parent then state.human.AutoRotate = state.autoRotate end
         end
     end
+    function app.ensureFlight(root, human)
+        if app.flight and app.flight.root == root then return end
+        app.stopFlight()
+        local attachment = Instance.new("Attachment")
+        attachment.Name, attachment.Parent = "EXIS_FLIGHT", root
+        local velocity = Instance.new("LinearVelocity")
+        velocity.Name, velocity.Attachment0 = "EXIS_FLIGHT_VELOCITY", attachment
+        velocity.RelativeTo, velocity.MaxForce = Enum.ActuatorRelativeTo.World, math.huge
+        velocity.VectorVelocity, velocity.Parent = Vector3.new(0, 0, 0), root
+        app.flight = {root = root, human = human, attachment = attachment, velocity = velocity, autoRotate = human.AutoRotate}
+        human.AutoRotate = false
+    end
     function app.move(goal, dt)
         local root, human = app.root()
-        if not root or not goal then app.stopFlight() return end
-        if not cfg.fly then app.stopFlight() human:MoveTo(goal) return end
-        if not app.flight or app.flight.root ~= root then
-            app.stopFlight()
-            local attachment = Instance.new("Attachment")
-            attachment.Name, attachment.Parent = "EXIS_FLIGHT", root
-            local velocity = Instance.new("LinearVelocity")
-            velocity.Name, velocity.Attachment0 = "EXIS_FLIGHT_VELOCITY", attachment
-            velocity.RelativeTo, velocity.MaxForce = Enum.ActuatorRelativeTo.World, math.huge
-            velocity.VectorVelocity, velocity.Parent = Vector3.new(0, 0, 0), root
-            app.flight = {root = root, human = human, attachment = attachment, velocity = velocity, autoRotate = human.AutoRotate}
-            human.AutoRotate = false
+        if not root or not goal then
+            if app.flight then app.flight.velocity.VectorVelocity = Vector3.new(0, 0, 0) end
+            return
         end
+        local hop = app.routeHop(goal)
+        if not hop then
+            app.routeBlockedSince = app.routeBlockedSince or os.clock()
+            if app.placementTask and os.clock() - app.routeBlockedSince >= 1 then
+                app.rejected[app.placementTask.key] = os.clock() + 8
+                if app.matchMix and app.placementKey then Core.finishChoice(app.matchMix, app.placementKey) end
+                app.placementTask, app.placementKey, app.buildGoal = nil, nil, nil
+            end
+            if app.flight then app.flight.velocity.VectorVelocity = Vector3.new(0, 0, 0) end
+            app.airGoal = nil
+            return
+        end
+        app.routeBlockedSince = nil
+        goal = hop
+        if cfg.moveMode == "Teleport" and cfg.fly then
+            app.ensureFlight(root, human)
+            app.flight.velocity.VectorVelocity = Vector3.new(0, 0, 0)
+            if os.clock() >= (app.next.teleport or 0) then
+                app.next.teleport = os.clock() + 0.15
+                root.CFrame = CFrame.new(goal) * root.CFrame.Rotation
+                root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            end
+            return
+        end
+        if not cfg.fly then app.stopFlight() human:MoveTo(goal) return end
+        app.ensureFlight(root, human)
         local delta = goal - root.Position
         local direction = delta.Magnitude > 0.2 and delta.Unit * math.min(cfg.flySpeed, delta.Magnitude * 4) or Vector3.new(0, 0, 0)
         if direction.Magnitude > 0 then
             local probe = direction.Unit * math.min(5, delta.Magnitude)
-            local hit = app.raycast(root.Position, probe, app.mapFilters())
+            local hit = app.travelHit(root.Position, probe)
             if hit then
                 local slide = direction - hit.Normal * math.min(0, direction:Dot(hit.Normal))
                 direction = slide.Magnitude > 0.5 and slide.Unit * math.min(cfg.flySpeed, slide.Magnitude) or Vector3.new(0, 0, 0)
             end
         end
         local rate = math.min(1, dt * 12)
-        app.flight.velocity.VectorVelocity = app.flight.velocity.VectorVelocity:Lerp(direction, rate)
+        local velocity = app.flight.velocity.VectorVelocity:Lerp(direction, rate)
+        local probe = root.Position + velocity * math.max(dt, 0.12)
+        if not app.airRoute(root.Position, probe) or app.travelHit(root.Position, probe - root.Position) then
+            velocity = Vector3.new(0, 0, 0)
+            app.airGoal = nil
+        end
+        app.flight.velocity.VectorVelocity = velocity
     end
-    function app.orbitGoal(target)
+    function app.enemyRows()
+        if app.enemyCache and os.clock() < app.enemyCache.untilTime then return app.enemyCache.rows end
+        local folder, rows = workspace:FindFirstChild("Zombie_ClientVisuals"), {}
+        local types = app.module(shared:FindFirstChild("Zombies"), "ZombieTypes")
+        for _, model in ipairs(folder and folder:GetChildren() or {}) do
+            if model:IsA("Model") and model:GetAttribute("ZombieId") ~= nil then
+                local point = app.head(model)
+                local human = model:FindFirstChildOfClass("Humanoid")
+                if point and (not human or human.Health > 0) then
+                    local info = types and types.GetById(model:GetAttribute("ZombieTypeId"))
+                    rows[#rows + 1] = {model = model, point = point, x = point.X, z = point.Z,
+                        range = info and tonumber(info.attackRange) or 3, boss = app.isBoss(model)}
+                end
+            end
+        end
+        app.enemyCache = {rows = rows, untilTime = os.clock() + 0.08}
+        return rows
+    end
+    function app.airRisk(point)
+        return Core.airRisk({x = point.X, z = point.Z}, app.enemyRows(), cfg.clearance)
+    end
+    function app.airRoute(a, b)
+        local from, to = {x = a.X, z = a.Z}, {x = b.X, z = b.Z}
+        return Core.escapeRoute(from, to, app.enemyRows(), cfg.clearance)
+    end
+    function app.flightPoint(point)
+        if not app.inPlayableMap(point) then return nil end
+        local hit = app.raycast(point + Vector3.new(0, 3, 0), Vector3.new(0, -256, 0), app.mapFilters())
+        if not hit or hit.Material == Enum.Material.Water or hit.Normal.Y < 0.6 then return nil end
+        local root, human = app.root()
+        if not root then return nil end
+        local lift = human.HipHeight + root.Size.Y / 2
+        local base = hit.Position + Vector3.new(0, lift, 0)
+        local ceiling = app.raycast(base, Vector3.new(0, cfg.flyHeight + 3, 0), app.mapFilters())
+        local y = hit.Position.Y + cfg.flyHeight
+        if ceiling then y = math.min(y, ceiling.Position.Y - lift - 0.5) end
+        if y < base.Y then return nil end
+        return Vector3.new(point.X, y, point.Z)
+    end
+    function app.safeAirGoal(target)
         local root = app.root()
         if not root then return nil end
-        local point = app.head(target.model)
-        if not point then return nil end
-        local angle = os.clock() * 0.65
-        for i = 0, 7 do
-            local a = angle + i * math.pi / 4
-            local goal = point + Vector3.new(math.cos(a) * cfg.orbitRadius, cfg.flyHeight, math.sin(a) * cfg.orbitRadius)
-            if not app.raycast(root.Position, goal - root.Position, app.mapFilters()) then return goal end
+        local anchor = target and app.head(target.model) or root.Position
+        if not anchor then return nil end
+        local unsafe = app.airRisk(root.Position) > 0
+        local angle = os.clock() * 0.3 * (app.orbitDirection or 1)
+        local best, bestScore
+        local radius = math.max(cfg.orbitRadius, cfg.clearance + 4)
+        for _, row in ipairs(app.enemyRows()) do if target and row.model == target.model then radius = math.max(radius, (row.range or 3) + 7) end end
+        local candidates = {}
+        for _, distance in ipairs({radius, radius + 18, radius + 38}) do
+            for i = 0, 11 do
+                local a = angle + i * math.pi / 6
+                local point = anchor + Vector3.new(math.cos(a) * distance, 0, math.sin(a) * distance)
+                if app.inPlayableMap(point) and app.airRisk(point) == 0 then
+                    local cost = (point - root.Position).Magnitude
+                    if os.clock() < (app.damageEvadeUntil or 0) and cost < 12 then cost = cost + 100 end
+                    candidates[#candidates + 1] = {point = point, cost = cost + distance * 0.2}
+                end
+            end
         end
-        return root.Position
+        table.sort(candidates, function(a, b) return a.cost < b.cost end)
+        for i = 1, math.min(8, #candidates) do
+            local goal = app.flightPoint(candidates[i].point)
+            if goal and app.routeHop(goal) then
+                if not target or not app.raycast(goal, anchor - goal, app.mapFilters()) then return goal end
+                if not best then best = goal end
+            end
+        end
+        if best then return best end
+        if unsafe then
+            -- Short lower-exposure steps let a surrounded player leave the swarm
+            -- without treating altitude as protection or crossing another crowd.
+            local risk = app.airRisk(root.Position)
+            for i = 0, 15 do
+                local a = i * math.pi / 8
+                local goal = root.Position + Vector3.new(math.cos(a) * 10, 0, math.sin(a) * 10)
+                local nextRisk = app.airRisk(goal)
+                if nextRisk < risk and app.airRoute(root.Position, goal)
+                    and not app.raycast(root.Position, goal - root.Position, app.mapFilters()) then
+                    local supported = app.flightPoint(goal)
+                    if supported and (not bestScore or -nextRisk > bestScore) then best, bestScore = goal, -nextRisk end
+                end
+            end
+        end
+        if not best then app.note("flight", "NO CLEAR FLIGHT ROUTE; RECHECKING") end
+        return best
+    end
+    function app.orbitGoal(target)
+        local cached = app.airGoal
+        local root = app.root()
+        if cached and root and os.clock() < cached.untilTime and app.airRisk(cached.point) == 0
+            and app.airRoute(root.Position, cached.point) then return cached.point end
+        local goal = app.safeAirGoal(target)
+        app.airGoal = goal and {point = goal, untilTime = os.clock() + 0.25} or nil
+        return goal
     end
     function app.combatTick(dt)
         if app.mode ~= "MATCH" or not app.active() then
             app.releaseFire() app.stopFlight() app.buildGoal = nil return
         end
+        if not cfg.fight and not cfg.autoPlace then app.releaseFire() app.stopFlight() app.buildGoal = nil return end
         local target = cfg.fight and app.target or nil
         if target and not target.model.Parent then target = nil end
-        local build = cfg.autoPlace and app.buildGoal
+        local build = cfg.autoPlace and not app.editing and app.buildGoal
+        local root, human = app.root()
+        if human and app.observedHealth and human.Health < app.observedHealth then
+            app.airGoal, app.damageEvadeUntil = nil, os.clock() + 1.2
+            app.orbitDirection = -(app.orbitDirection or 1)
+        end
+        app.observedHealth = human and human.Health
+        local danger = root and (app.airRisk(root.Position) > 0 or os.clock() < (app.damageEvadeUntil or 0))
+        if danger and cfg.fly and (cfg.fight or cfg.autoPlace) then
+            build = nil
+            app.move(app.orbitGoal(target), dt)
+            app.note("flight", "RELOCATING TO CLEAR MAP SPACE")
+        end
         if target and target.boss and cfg.bossFirst then build = nil end
         if build then app.releaseFire() app.move(build, dt) return end
-        if not target then app.releaseFire() app.stopFlight() return end
+        if not target then
+            app.releaseFire()
+            if not danger then app.stopFlight() end
+            return
+        end
         local tool, info = app.weapon()
-        if cfg.fly then app.move(app.orbitGoal(target), dt) else app.stopFlight() end
+        if cfg.fly and not danger then app.move(app.orbitGoal(target), dt) elseif not cfg.fly then app.stopFlight() end
         if not tool or app.reload(tool) then return end
         local point = app.head(target.model)
         local camera = workspace.CurrentCamera
@@ -977,7 +1441,7 @@ local function run()
     end
     function app.aimTick()
         if not cfg.fight or not cfg.headAim or not app.active() or not app.target then return end
-        if app.buildGoal and not (app.target.boss and cfg.bossFirst) then return end
+        if not app.editing and app.buildGoal and not (app.target.boss and cfg.bossFirst) then return end
         local camera, target = workspace.CurrentCamera, app.target.model
         if not camera or not target.Parent then return end
         local point = app.head(target)
@@ -1215,7 +1679,10 @@ local function run()
     ui.toggle(flight, "FLY ORBIT", cfg, "fly")
     ui.number(flight, "HEIGHT", "flyHeight", 5, 50)
     ui.number(flight, "ORBIT RADIUS", "orbitRadius", 6, 60)
-    ui.number(flight, "FLY SPEED", "flySpeed", 8, 70)
+    ui.number(flight, "FLY SPEED", "flySpeed", 8, 100)
+    ui.number(flight, "ZOMBIE CLEARANCE", "clearance", 8, 60)
+    ui.button(flight, "SMOOTH FLIGHT", function() cfg.moveMode = "Smooth" app.changed() end)
+    ui.button(flight, "CHECKED TELEPORT", function() cfg.moveMode = "Teleport" app.changed() end)
     local wave = ui.group(main, "WAVES")
     ui.toggle(wave, "AUTO SKIP", cfg, "autoSkip")
     local liveLabel = ui.textLabel(main, "", 62)
@@ -1269,12 +1736,13 @@ local function run()
     ui.toggle(upgrades, "AUTO HEALTH", cfg, "health")
     ui.toggle(upgrades, "AUTO GUN TIER", cfg, "gun")
     ui.toggle(upgrades, "AUTO MELEE", cfg, "melee")
-    ui.textLabel(upgrades, "Health comes first below 50% HP; otherwise gun, health, melee.", 30)
+    ui.textLabel(upgrades, "Turret first, then mixed placements and upgrades. Low HP prioritizes health.", 30)
     local upgradeState = ui.textLabel(upgradesPage, "", 50)
     function ui.buildDefenses()
         for _, child in ipairs(defensePage:GetChildren()) do if child:IsA("GuiObject") then child:Destroy() end end
         local group = ui.group(defensePage, "AUTO DEFENSE")
         ui.toggle(group, "AUTO PLACE CURRENT CLASS", cfg, "autoPlace")
+        ui.toggle(group, "USE ZOMBIE-SPAWN MAP AREA", cfg, "placeSpawnArea")
         ui.number(group, "MAX OWNED DEFENSES", "maxDefenses", 1, 48)
         ui.textLabel(group, "Barricades at front · turrets inside · support gap reserved.", 30)
         local selection = ui.group(defensePage, "CLASS DEFENSE SELECTION")
@@ -1297,8 +1765,14 @@ local function run()
     ui.stroke(editor, ui.blue)
     local editorText = ui.textLabel(editor, "TOP VIEW · TAP CORNERS", 27)
     editorText.TextSize = 10
+    local mapHolder = ui.new("Frame", {Position = UDim2.fromOffset(8, 150), Size = UDim2.new(1, -16, 1, -158),
+        BackgroundColor3 = Color3.fromRGB(9, 17, 29), Visible = false, ClipsDescendants = true, ZIndex = 4}, gui)
+    ui.round(mapHolder) ui.stroke(mapHolder, ui.blue)
+    app.viewport = ui.new("ViewportFrame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        Ambient = Color3.fromRGB(180, 180, 180), LightColor = Color3.fromRGB(255, 250, 240),
+        LightDirection = Vector3.new(-1, -2, -1), Active = true, ZIndex = 4}, mapHolder)
     local dotOverlay = ui.new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
-        Active = false, Visible = false, ZIndex = 5}, gui)
+        Active = false, Visible = false, ZIndex = 5}, mapHolder)
     local dots, lines = {}, {}
     function app.refreshMapDots(camera)
         local points = app.draft or {}
@@ -1316,18 +1790,18 @@ local function run()
             local point = points[i]
             dot.Visible, line.Visible = false, false
             if point then
-                local a, visible = camera:WorldToViewportPoint(Vector3.new(point.x, point.y, point.z))
-                dot.Position, dot.Visible = UDim2.fromOffset(a.X, a.Y), visible
+                local a = app.projectMapPoint(Vector3.new(point.x, point.y, point.z))
+                dot.Position, dot.Visible = UDim2.fromOffset(a and a.X or 0, a and a.Y or 0), a ~= nil
                 dot.BackgroundColor3 = i == 1 and Color3.fromRGB(255, 190, 75) or ui.blue
                 local nextPoint = points[i + 1]
-                if nextPoint then
-                    local b = camera:WorldToViewportPoint(Vector3.new(nextPoint.x, nextPoint.y, nextPoint.z))
+                local b = nextPoint and app.projectMapPoint(Vector3.new(nextPoint.x, nextPoint.y, nextPoint.z))
+                if a and b then
                     local delta = Vector2.new(b.X - a.X, b.Y - a.Y)
                     line.Position = UDim2.fromOffset((a.X + b.X) / 2, (a.Y + b.Y) / 2)
                     line.Size = UDim2.fromOffset(delta.Magnitude, 2)
                     line.Rotation = math.deg(math.atan2(delta.Y, delta.X))
                     line.BackgroundColor3 = i == 1 and Color3.fromRGB(255, 190, 75) or ui.blue
-                    line.Visible = a.Z > 0 and b.Z > 0
+                    line.Visible = true
                 end
             end
         end
@@ -1335,7 +1809,7 @@ local function run()
     function app.closeMapEditor(saved)
         app.stopMapView()
         app.editing, app.pickPart, app.draftSurface, app.clearSurface = false, false, nil, nil
-        editor.Visible, dotOverlay.Visible, frame.Visible = false, false, true
+        editor.Visible, dotOverlay.Visible, mapHolder.Visible, frame.Visible = false, false, false, true
         app.drawRegion(saved and app.draft or app.region().points or {}, true)
     end
     function app.commitArea()
@@ -1357,11 +1831,11 @@ local function run()
         local layer = root.Position.Y - human.HipHeight - root.Size.Y / 2
         if #saved > 0 then layer = saved[1].y end
         if not app.startMapView(layer) then return end
-        app.releaseFire() app.stopFlight()
+        app.buildGoal = nil
         app.editing, app.pickPart, app.draftSurface, app.editorMessage = true, mode == "part", nil, nil
         app.draft, app.clearSurface = {}, mode == "new"
         if mode == "saved" then for _, point in ipairs(saved) do app.draft[#app.draft + 1] = {x = point.x, y = point.y, z = point.z} end end
-        frame.Visible, editor.Visible, dotOverlay.Visible = false, true, true
+        frame.Visible, editor.Visible, dotOverlay.Visible, mapHolder.Visible = false, true, true, true
         app.clearMarkers()
         app.renderMapView()
     end
@@ -1392,16 +1866,22 @@ local function run()
             if app.mapView then control[2](app.mapView) end
         end)
     end
-    editorButton("LOWER FLOOR", 0, 0.5, 97, function()
+    editorButton("FLOOR −", 0, 0.25, 97, function()
         if app.mapView then
             local old = app.mapView.layer
             if not app.mapLayer(old - 6) then app.mapLayer(old) app.editorMessage = "NO LOWER FLOOR" end
         end
     end)
-    editorButton("HIGHER FLOOR", 0.5, 0.5, 97, function()
+    editorButton("FLOOR +", 0.75, 0.25, 97, function()
         if app.mapView then
             local old = app.mapView.layer
             if not app.mapLayer(old + 6) then app.mapLayer(old) app.editorMessage = "NO HIGHER FLOOR" end
+        end
+    end)
+    editorButton("FULL / CUTAWAY", 0.25, 0.5, 97, function()
+        if app.mapView and not app.mapView.loading then
+            app.mapView.cutaway = not app.mapView.cutaway
+            app.mapLayer(app.mapView.layer)
         end
     end)
     ui.button(area, "OPEN TOP VIEW · NEW AREA", function() app.openMapEditor("new") end)
@@ -1442,11 +1922,12 @@ local function run()
     local resize = ui.group(settings, "WINDOW")
     ui.button(resize, "CENTER / FIT SCREEN", function() frame.Position = UDim2.fromScale(0.5, 0.5) app.resize() end)
     app.connect(UIS.InputBegan, function(input, processed)
-        if not app.editing or processed then return end
+        if not app.editing then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        local camera = workspace.CurrentCamera
-        if not camera then return end
+        if not app.mapView or app.mapView.loading then return end
         local screen = Vector2.new(input.Position.X, input.Position.Y)
+        local at, size = app.viewport.AbsolutePosition, app.viewport.AbsoluteSize
+        if screen.X < at.X or screen.Y < at.Y or screen.X > at.X + size.X or screen.Y > at.Y + size.Y then return end
         if #pg:GetGuiObjectsAtPosition(screen.X, screen.Y) > 0 then
             -- Only our editor blocks selection; the game's transparent full-screen HUD does not.
             for _, object in ipairs(pg:GetGuiObjectsAtPosition(screen.X, screen.Y)) do
@@ -1455,9 +1936,8 @@ local function run()
         end
         if not app.pickPart and #app.draft >= 3 then
             local first = app.draft[1]
-            local pixel = camera:WorldToViewportPoint(Vector3.new(first.x, first.y, first.z))
-            local inset = GuiService:GetGuiInset()
-            if (Vector2.new(pixel.X + inset.X, pixel.Y + inset.Y) - screen).Magnitude <= 14 then
+            local pixel = app.projectMapPoint(Vector3.new(first.x, first.y, first.z))
+            if pixel and (pixel + app.viewport.AbsolutePosition - screen).Magnitude <= 14 then
                 app.commitArea()
                 return
             end
@@ -1466,7 +1946,8 @@ local function run()
         if not hit or not hit.Instance:IsA("BasePart") or hit.Normal.Y < 0.65 then app.note("area", "TAP A FLOOR SURFACE") return end
         app.editorMessage = nil
         if app.pickPart then
-            local part = hit.Instance
+            local part = app.mapView.sources[hit.Instance]
+            if not part or not part.Parent then return end
             local points = {}
             for _, corner in ipairs({{-1, -1}, {1, -1}, {1, 1}, {-1, 1}}) do
                 local p = part.CFrame:PointToWorldSpace(Vector3.new(corner[1] * part.Size.X / 2, part.Size.Y / 2, corner[2] * part.Size.Z / 2))
@@ -1480,7 +1961,11 @@ local function run()
             local p = hit.Position
             app.draft[#app.draft + 1] = {x = p.X, y = p.Y, z = p.Z}
         end
-        if app.mapView then app.refreshMapDots(camera) end
+        if app.mapView then app.refreshMapDots(app.mapView.camera) end
+    end)
+    app.connect(UIS.InputEnded, function(input)
+        if app.editing and app.held and input ~= app.held.token
+            and input.UserInputType == Enum.UserInputType.MouseButton1 then app.releaseFire() end
     end)
     function app.stop()
         if not app.alive then return end
@@ -1538,6 +2023,8 @@ local function run()
                     if app.mapView and app.mapView.map ~= app.mapId then app.closeMapEditor(false) end
                     app.planKey, app.target, app.buildGoal, app.surface, app.defenseCache = nil, nil, nil, nil, nil
                     app.rejected, app.pendingPlacements = {}, {}
+                    app.enemyCache, app.airGoal, app.navCache, app.spawnAnchor = nil, nil, nil, nil
+                    app.matchMix, app.placementTask = nil, nil
                     ui.buildClasses() ui.buildDefenses()
                 end
                 if cfg.enabled and not app.editing then
@@ -1549,7 +2036,7 @@ local function run()
                     elseif app.mode == "LOBBY" then
                         if not app.classTick() then app.weaponTick() end
                     elseif app.active() and app.mapId ~= "Unknown" then
-                        if not app.upgradeTick() then app.placeTick() end
+                        app.matchTick()
                     end
                 end
             end)
@@ -1576,7 +2063,9 @@ local function run()
                 .. "\nCASH " .. tostring(app.balance("Cash") or "—") .. "  ·  ZOMBUX " .. tostring(app.balance("Zombux") or "—")
             areaLabel.Text = (app.mapName or "UNKNOWN") .. " · " .. #(app.region().points or {}) .. " DOTS"
             editor.Size = UDim2.fromOffset(math.min(370, workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.X - 20 or 370), 137)
-            editorText.Text = app.editorMessage or (app.pickPart and "TOP VIEW · TAP THE FLOOR PART" or "TOP VIEW · DOTS " .. #(app.draft or {}) .. " · TAP FIRST DOT TO CLOSE")
+            local view = app.mapView
+            editorText.Text = view and view.loading and ("COPYING MAP " .. view.count .. "/" .. view.total .. " · " .. (cfg.fight and "FIGHT ON" or "FIGHT OFF"))
+                or app.editorMessage or ("MAP REPLICA · DOTS " .. #(app.draft or {}) .. " · " .. (cfg.fight and "FIGHT ACTIVE" or "FIGHT OFF"))
             footer.Text = app.lastNote or "INITIAL TEST RELEASE · SELECT FEATURES TO START"
             local upgrades = app.mode == "MATCH" and app.module(modules, "PlayerUpgradeDefinitions")
             if upgrades then
