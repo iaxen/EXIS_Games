@@ -23,7 +23,7 @@ local function setup()
  note=function()end
  built=function()end
  pos=function(m)return m.point end
- work={needs={},amounts={},resourceNeeds={},sent=0,campStash={},
+ work={boatId=function()return'boat'end,needs={},amounts={},resourceNeeds={},sent=0,campStash={},
   safeResource=function()return true end,noFood=function()return false end,
   bagState=function()return 0,10 end,canCollect=function()return true end,
   station=function()return zone,zone end,fireState=function()return{level=1}end,
@@ -112,10 +112,10 @@ test('craft execution uses the station/direct submission adapter and the correct
  local tick=assert(load(extract('    local function craftTick()', '    local function buildTick()')..'\nreturn craftTick'))()
  assert(tick()and stock.Axe2==1)
 end)
-test('craft goals needing materials precede non-survival construction goals',function()
+test('essential camp dependencies precede optional tool tier material goals',function()
  local craft=craftGoal();local building={key='build:bench',kind='build',rank=1,info={assetId='Bench'}}
  goals={building,craft};work.goalRunnable=function()return true end
- assert(work.chooseUpgrade()==craft)
+ assert(work.chooseUpgrade()==building)
 end)
 test('emergency fire maintenance remains ahead of crafting material goals',function()
  local craft=craftGoal();local survival={key='fuel',kind='fuel',maintenance=true,rank=2}
