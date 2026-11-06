@@ -2475,44 +2475,82 @@ local function runIslandEscape()
     end
     function work.interactPrompt(model, key)
         local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
-        if not prompt or not prompt.Enabled then return nil end
-        local triggered = false
+        if not prompt then return nil end
+        -- Pickup prompts initialize disabled for 0.5s. Do not bypass that setup.
+        if not prompt.Enabled then return false end
+        local triggered, heldFull = false, false
         local receipt = prompt.Triggered and prompt.Triggered:Connect(function() triggered = true end)
-        prompt:InputHoldBegin()
-        local ok, completed = pcall(work.pause, key, math.max(0, tonumber(prompt.HoldDuration) or 0))
+        local duration = math.max(0, tonumber(prompt.HoldDuration) or 0)
+        local previous = work.interaction
+        work.interaction = {key = key, untilTime = os.clock() + duration + 0.75}
+        local ok, completed = pcall(function()
+            prompt:InputHoldBegin()
+            if not work.pause(key, duration) then return false end
+            heldFull = true
+            -- Triggered can dispatch a frame after HoldDuration. Keep E held
+            -- until its receipt instead of releasing on the exact deadline.
+            local grace = os.clock() + 0.35
+            while not triggered and prompt.Enabled and model.Parent and os.clock() < grace do
+                if not work.pause(key, 0.05) then heldFull = false return false end
+            end
+            return triggered
+        end)
         pcall(function() prompt:InputHoldEnd() end)
         if receipt then receipt:Disconnect() end
+        work.interaction = previous
         if not ok then error(completed) end
-        if not completed then return false end
-        if not triggered and prompt.Enabled and model.Parent
-            and type(fireproximityprompt) == "function" then fireproximityprompt(prompt, 0) end
-        return true
+        if not completed then note(key, "E TRIGGER NOT CONFIRMED; CHECKING NATIVE INTERACTION") end
+        return completed, heldFull
     end
     function work.collectModel(model, key, bag, chestLoot)
-        if not work.dropAllowed(model) then return false end
+        if not work.dropAllowed(model) or not work.pickupEligible(model) then return false end
         local item = config().item.byDisplayName[model.Name]
+        local autoEquip = item and config().misc.useArmourCollectEquip and item.type == "armour"
         local taskPickup = key == "progression" or key == "gather" or key == "drops" or key == "chests"
         if not bag and not chestLoot and taskPickup and item and not work.needsDrop(item.id, key) then return false end
-        if not bag and not work.canCollect() then return false end
+        if not bag and not autoEquip and not work.canCollect() then return false end
         local radius = math.max(0.5, (tonumber(config().misc.collectRadius) or 3) * 1.5)
         local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
         if prompt and prompt.Enabled then radius = math.min(radius, math.max(0.5, prompt.MaxActivationDistance - 1)) end
-        if not travel(model, key, radius) then return false end
+        local approach = prompt and prompt.Parent or model.PrimaryPart or model
+        if approach and approach:IsA("Attachment") then approach = approach.Parent end
+        if not travel(approach, key, radius) then return false end
         local before, bagId = count(model.Name), player:GetAttribute("bagId")
-        local prompted = work.interactPrompt(model, key)
-        if prompted == false then return false end
-        if prompted == nil then call("ItemCollect", "collect", model) end
+        local prompted, heldFull = work.interactPrompt(model, key)
+        if prompted == false and not heldFull then return false end
+        if prompted ~= true then call("ItemCollect", "collect", model) end
         local confirmed = work.await(key, function()
             return bag and player:GetAttribute("bagId") ~= bagId or count(model.Name) > before
+                or autoEquip and not model.Parent
         end, 2)
         if confirmed then
             work.recordPickup(model) work.blockedBag = nil work.rejectedPickups = 0
-            if not bag and taskPickup and (work.activeGoal or work.objective) and not work.preempted then
+            if not bag and not chestLoot and taskPickup and (work.activeGoal or work.objective) and not work.preempted then
                 work.submitGoal(key, work.activeGoal or work.objective)
                 work.refreshAt = 0
             end
         end
         return confirmed
+    end
+    function work.pickupEligible(model)
+        local c = config()
+        local item = c.item.byDisplayName[model.Name]
+        if not item then return false end
+        local bags = c.bag and c.bag.byId or {}
+        local bag = bags[item.id]
+        if bag then
+            local owned = bags[player:GetAttribute("bagId")]
+            if owned and (bag.lvl or 0) <= (owned.lvl or 0) then return false end
+        end
+        local row = c.tool and c.tool.byDisplayName and c.tool.byDisplayName[model.Name]
+        if row and row.useSwapUpgrade and row.toolType then
+            for _, tool in ipairs(tools()) do
+                local owned = c.tool.byDisplayName[tool.Name]
+                if owned and owned.useSwapUpgrade and owned.toolType == row.toolType
+                    and (owned.lvl or 0) > 0 and (owned.lvl or 0) >= (row.lvl or 0) then return false end
+            end
+        end
+        return true
     end
     function work.treeDropContext(resource)
         local scene = world()
@@ -3542,19 +3580,27 @@ local function runIslandEscape()
         local radius = math.max(1, (tonumber(info.openDistance) or 10) - 1)
         local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
         if prompt and prompt.Enabled then radius = math.min(radius, math.max(0.5, prompt.MaxActivationDistance - 1)) end
-        if not travel(model, key, radius) then return false end
+        -- The prompt is attached to UpperTorso on humanoid chests, otherwise
+        -- PrimaryPart. A model pivot is not necessarily that activation point.
+        local approach = prompt and prompt.Parent or model.PrimaryPart or model
+        if approach and approach:IsA("Attachment") then approach = approach.Parent end
+        if not travel(approach, key, radius) then return false end
         work.chestResume = model
         if not state.requestedAt then
-            local prompted = work.interactPrompt(model, key)
-            if prompted == false then return false end
+            local prompted, heldFull = work.interactPrompt(model, key)
+            if prompted == false and not heldFull then return false end
             if prompted == nil then
                 if not work.pause(key, math.max(0, tonumber(info.openSec) or 0)) then return false end
-                call("ChestService", "requestOpen", model)
             end
+            -- Some executors do not dispatch synthetic prompt Triggered. Only
+            -- fall back to the verified native call after a complete E hold.
+            if prompted ~= true then call("ChestService", "requestOpen", model) end
             state.requestedAt = state.requestedAt or os.clock()
         end
         local character, serial = player.Character, motion.serial
-        local deadline = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
+        local maximum = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
+        local deadline = math.min(maximum, os.clock() + 15)
+        work.interaction = {key = key, untilTime = deadline}
         while model.Parent and work.running(key, character, serial) and os.clock() < deadline do
             local now = os.clock()
             if not state.acceptedAt and now >= (state.nextCheck or 0) then
@@ -3564,12 +3610,17 @@ local function runIslandEscape()
             if not state.acceptedAt and now - state.requestedAt > 3 then
                 state.requestedAt = nil
                 failed[model] = now + 0.5
+                work.interaction = nil
                 note(key, "CHEST DID NOT ACCEPT OPEN REQUEST; RETRYING")
                 return false
             end
             if state.acceptedAt then
                 local duration = work.chestDuration(model)
-                if duration then state.duration = math.max(state.duration or 0, duration) end
+                if duration then
+                    state.duration = math.max(state.duration or 0, duration)
+                    deadline = math.min(maximum, math.max(deadline, state.acceptedAt + state.duration + 3))
+                    work.interaction.untilTime = deadline
+                end
                 local target, sawNew, pendingLoot = nil, false, false
                 for _, drop in ipairs(work.models("drops")) do
                     local point, center = pos(drop), pos(model)
@@ -3577,29 +3628,35 @@ local function runIslandEscape()
                         and drop:GetAttribute("ownerName") == player.Name and (point - center).Magnitude <= 16 then
                         sawNew = true
                         local item = config().item.byDisplayName[drop.Name]
-                        if item and work.dropAllowed(drop) then
+                        if item and work.dropAllowed(drop) and work.pickupEligible(drop) then
                             pendingLoot = true
                             if work.safeResource(drop) and not (failed[drop] and failed[drop] > now) then target = target or drop end
                         end
                     end
                 end
                 if sawNew then state.sawLoot = true end
-                if target and not work.canCollect() and not work.bagRank(config().item.byDisplayName[target.Name].id) then
+                local targetItem = target and config().item.byDisplayName[target.Name]
+                local autoEquip = targetItem and config().misc.useArmourCollectEquip and targetItem.type == "armour"
+                if target and not work.canCollect() and not autoEquip and not work.bagRank(targetItem.id) then
                     work.chestResume = model
+                    work.interaction = nil
                     note(key, "CHEST LOOT SAVED; UNLOADING BAG AT CAMP")
                     return false
                 end
                 if target then
                     local item = config().item.byDisplayName[target.Name]
                     if work.collectModel(target, key, work.bagRank(item.id) ~= nil, true) then state.lastLootAt = os.clock()
-                    elseif work.preempted then return false
+                    elseif work.preempted then work.interaction = nil return false
                     else failed[target] = os.clock() + 1 end
                 else
                     local durationDone = now >= state.acceptedAt + (state.duration or 0.5)
                     local quiet = not state.lastLootAt or now - state.lastLootAt >= 0.25
-                    if durationDone and (state.sawLoot or (state.recoveredOpen and now - state.acceptedAt >= 1 and not duration))
+                    local emptyAnimationDone = state.duration and now >= state.acceptedAt + state.duration + 1
+                    if durationDone and (state.sawLoot or emptyAnimationDone
+                        or (state.recoveredOpen and now - state.acceptedAt >= 1 and not duration))
                         and quiet and not pendingLoot then
                         state.complete = true
+                        work.interaction = nil
                         if work.chestResume == model then work.chestResume = nil end
                         note(key, "CHEST OPENED; LOOT COLLECTION FINISHED")
                         return true
@@ -3609,6 +3666,8 @@ local function runIslandEscape()
             end
             task.wait()
         end
+        work.interaction = nil
+        if not work.preempted then failed[model] = os.clock() + 5 end
         note(key, work.preempted and "CHEST SAVED; RESUMING AFTER URGENT JOB" or "CHEST OPEN PENDING; WILL RESUME")
         return false
     end
@@ -4914,7 +4973,14 @@ local function runIslandEscape()
         end
         if os.clock() < (work.nextPriorityCheck or 0) then return true end
         work.nextPriorityCheck = os.clock() + 0.03
-        local job, rank = work.pick(work.jobs, os.clock(), work.rank(work.currentJob))
+        local ceiling = work.rank(work.currentJob)
+        local interaction = work.interaction
+        if interaction and interaction.key == key and os.clock() < interaction.untilTime then
+            -- Survival/defence can interrupt; routine crafting, rewards and
+            -- deposits wait for the current hold or chest batch to finish.
+            ceiling = math.min(ceiling, 3.5)
+        end
+        local job, rank = work.pick(work.jobs, os.clock(), ceiling)
         if job then
             if job.key == "evade" then work.captureEvadeIntent() end
             work.preempted = {from = work.active, to = job.key, rank = rank}
@@ -6020,6 +6086,7 @@ local function runIslandEscape()
                 work.bagSweepRank = nil
                 work.unloadRank, work.unloadWatch = nil, nil
                 work.activeGoal = nil
+                work.interaction = nil
                 work.active, work.currentJob = nil, nil
                 queueLabel.Text = "LAST JOB: " .. job.key:upper()
                 if not acted and not work.preempted then
@@ -6032,6 +6099,7 @@ local function runIslandEscape()
                 work.bagSweepRank = nil
                 work.unloadRank, work.unloadWatch = nil, nil
                 work.activeGoal = nil
+                work.interaction = nil
                 work.active, work.currentJob = nil, nil
                 motion.cancel("JOB ERROR")
             end

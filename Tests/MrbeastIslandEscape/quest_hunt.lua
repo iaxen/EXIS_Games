@@ -7,6 +7,7 @@ local function vec(x,y,z)return setmetatable({X=x,Y=y,Z=z},V)end
 V.__sub=function(a,b)return vec(a.X-b.X,a.Y-b.Y,a.Z-b.Z)end
 local now,cfg,held,scene,rows,ground,hunger,queue,handler,fetchResult,promptCalls
 local function setup()
+ note=function()end
  now=0;os.clock=function()return now end;held={};rows={};ground={};queue={};promptCalls={};hunger=true
  flags={quest=true,huntFood=false,autoFarm=true};opts={huntRadius=50};alive=true;connections={}
  cfg={item={byId={},byName={},byDisplayName={}},food={byId={}},mob={byId={}},itemDrop={byId={}}}
@@ -60,10 +61,10 @@ test('quest collection ignores other animals food and unrelated materials',funct
 test('food pickup accepts food but skips wood',function()flags.huntFood=true;drop('wood');local meat=drop('meat');assert(work.foodDropCandidate()==meat)end)
 test('expired kill drop records are removed',function()work.huntLoot={{expires=-1}};work.foodDropCandidate();assert(#work.huntLoot==0)end)
 local function promptModel(duration)
- local prompt={Enabled=true,HoldDuration=duration,InputHoldBegin=function()promptCalls[#promptCalls+1]='begin'end,InputHoldEnd=function()promptCalls[#promptCalls+1]='end'end}
+ local callback;local prompt={Enabled=true,HoldDuration=duration,Triggered={Connect=function(_,fn)callback=fn;return{Disconnect=function()end}end},InputHoldBegin=function()promptCalls[#promptCalls+1]='begin';if callback then callback()end end,InputHoldEnd=function()promptCalls[#promptCalls+1]='end'end}
  return{Parent=true,FindFirstChildWhichIsA=function()return prompt end}
 end
-test('E interaction holds for native duration before completing',function()fireproximityprompt=function()promptCalls[#promptCalls+1]='trigger'end;assert(work.interactPrompt(promptModel(2),'chests'));assert(now==2 and table.concat(promptCalls,',')=='begin,end,trigger')end)
+test('E interaction holds for native duration before completing',function()fireproximityprompt=function()promptCalls[#promptCalls+1]='trigger'end;assert(work.interactPrompt(promptModel(2),'chests'));assert(now==2 and table.concat(promptCalls,',')=='begin,end')end)
 test('native E trigger is not fired again through the executor',function()
  local fn;local disconnected=false
  local prompt={Enabled=true,HoldDuration=.1,Triggered={Connect=function(_,callback)fn=callback;return{Disconnect=function()disconnected=true end}end},InputHoldBegin=function()fn()end,InputHoldEnd=function()end}
