@@ -214,6 +214,15 @@ function Core.targetScore(distance, boss, bossFirst, previous)
     return (boss and bossFirst and 1000000 or 0) - distance + (previous and 3 or 0)
 end
 
+function Core.mapViewHeight(bounds, width, height, fov, top)
+    local aspect = math.max(0.1, width / math.max(1, height))
+    local tangent = math.tan(math.rad(fov) / 2)
+    local halfX = math.max(4, bounds.maxX - bounds.minX) / 2
+    local halfZ = math.max(4, bounds.maxZ - bounds.minZ) / 2
+    local usable = math.max(0.2, (height - (top or 0)) / math.max(1, height))
+    return math.max(halfZ / (tangent * usable), halfX / (tangent * aspect)) * 1.15
+end
+
 -- Runtime adapters. The planning functions above have no Roblox dependencies.
 local function run()
     if not game:IsLoaded() then game.Loaded:Wait() end
@@ -482,6 +491,113 @@ local function run()
         params.FilterDescendantsInstances = include or {player.Character, app.markers}
         params.IgnoreWater = false
         return workspace:Raycast(origin, direction, params)
+    end
+    -- A temporary top-down view of the live map, not a separate guessed map image.
+    function app.stopMapView()
+        local state = app.mapView
+        if not state then return end
+        app.mapView = nil
+        for part, original in pairs(state.transparency) do
+            if part.Parent then part.LocalTransparencyModifier = original end
+        end
+        for screen, enabled in pairs(state.screens) do if screen.Parent then screen.Enabled = enabled end end
+        for camera, snapshot in pairs(state.cameras) do
+            if camera.Parent then
+                camera.CameraType = snapshot.kind
+                camera.CameraSubject = snapshot.subject
+                camera.FieldOfView = snapshot.fov
+                camera.CFrame, camera.Focus = snapshot.frame, snapshot.focus
+            end
+        end
+        UIS.MouseBehavior, UIS.MouseIconEnabled = state.mouseBehavior, state.mouseIcon
+        game:GetService("ContextActionService"):UnbindAction("EXIS_MAP_NAV")
+    end
+    function app.mapLayer(layer)
+        local state = app.mapView
+        if not state then return false end
+        local floors = {}
+        local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
+        for _, part in ipairs(state.parts) do
+            if part.Parent then
+                local top = part.CFrame:PointToWorldSpace(Vector3.new(0, part.Size.Y / 2, 0))
+                local onLayer = math.abs(top.Y - layer) <= 3.1 and part.CFrame.UpVector.Y >= 0.65
+                -- Local cutaway makes the cave floor visible through its roof.
+                part.LocalTransparencyModifier = onLayer and state.transparency[part] or 1
+                if onLayer and (part.CanCollide or part.Transparency < 1) then
+                    floors[#floors + 1] = part
+                    for _, corner in ipairs({{-1, -1}, {1, -1}, {1, 1}, {-1, 1}}) do
+                        local p = part.CFrame:PointToWorldSpace(Vector3.new(corner[1] * part.Size.X / 2, part.Size.Y / 2, corner[2] * part.Size.Z / 2))
+                        minX, maxX, minZ, maxZ = math.min(minX, p.X), math.max(maxX, p.X), math.min(minZ, p.Z), math.max(maxZ, p.Z)
+                    end
+                end
+            end
+        end
+        if #floors == 0 then return false end
+        state.layer, state.floors = layer, floors
+        state.bounds = {minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ}
+        state.center = Vector3.new((minX + maxX) / 2, layer, (minZ + maxZ) / 2)
+        state.zoom, state.panX, state.panZ = 1, 0, 0
+        return true
+    end
+    function app.startMapView(layer)
+        app.stopMapView()
+        if not workspace.CurrentCamera then app.note("area", "CAMERA NOT READY") return false end
+        local state = {parts = {}, transparency = {}, screens = {}, cameras = {}, map = app.mapId,
+            mouseBehavior = UIS.MouseBehavior, mouseIcon = UIS.MouseIconEnabled}
+        app.mapView = state
+        local seen = {}
+        for _, folder in ipairs(app.mapFilters()) do
+            for _, part in ipairs(folder:GetDescendants()) do
+                if part:IsA("BasePart") and not seen[part] then
+                    seen[part] = true
+                    state.parts[#state.parts + 1] = part
+                    state.transparency[part] = part.LocalTransparencyModifier
+                end
+            end
+        end
+        if not app.mapLayer(layer) then
+            app.stopMapView()
+            app.note("area", "MAP FLOOR NOT LOADED; TRY AGAIN NEAR THE FLOOR")
+            return false
+        end
+        for _, name in ipairs({"Gameplay", "Toolbar", "TouchGui"}) do
+            local screen = pg:FindFirstChild(name)
+            if screen and screen:IsA("ScreenGui") then state.screens[screen] = screen.Enabled screen.Enabled = false end
+        end
+        game:GetService("ContextActionService"):BindActionAtPriority("EXIS_MAP_NAV", function()
+            return Enum.ContextActionResult.Sink
+        end, false, 10000, Enum.PlayerActions.CharacterForward, Enum.PlayerActions.CharacterBackward,
+            Enum.PlayerActions.CharacterLeft, Enum.PlayerActions.CharacterRight, Enum.PlayerActions.CharacterJump)
+        return true
+    end
+    function app.renderMapView()
+        local state = app.mapView
+        if not state or not app.editing then return end
+        local camera = workspace.CurrentCamera
+        if not camera then return end
+        if not state.cameras[camera] then
+            state.cameras[camera] = {kind = camera.CameraType, subject = camera.CameraSubject,
+                frame = camera.CFrame, focus = camera.Focus, fov = camera.FieldOfView}
+        end
+        local viewport = camera.ViewportSize
+        local height = Core.mapViewHeight(state.bounds, viewport.X - 16, viewport.Y, 50, 150) * state.zoom
+        state.height = math.clamp(height, 8, 20000)
+        local toolbarOffset = state.height * math.tan(math.rad(50) / 2) * math.min(150, viewport.Y * 0.8) / math.max(1, viewport.Y)
+        local center = state.center + Vector3.new(state.panX, 0, state.panZ - toolbarOffset)
+        UIS.MouseBehavior, UIS.MouseIconEnabled = Enum.MouseBehavior.Default, true
+        camera.CameraType, camera.FieldOfView = Enum.CameraType.Scriptable, 50
+        camera.CFrame = CFrame.lookAt(center + Vector3.new(0, state.height, 0), center, Vector3.new(0, 0, -1))
+        camera.Focus = CFrame.new(center)
+        if app.refreshMapDots then app.refreshMapDots(camera) end
+    end
+    function app.mapViewRay(screen)
+        local state, camera = app.mapView, workspace.CurrentCamera
+        if not state or not camera then return nil end
+        local inset = GuiService:GetGuiInset()
+        local ray = camera:ViewportPointToRay(screen.X - inset.X, screen.Y - inset.Y)
+        local hit = app.raycast(ray.Origin, ray.Direction * ((state.height or 1000) * 3 + 200), state.floors)
+        if not hit or hit.Material == Enum.Material.Water or hit.Normal.Y < 0.65 then return nil end
+        return hit
     end
     function app.resolveSurface()
         local saved = app.region().surface
@@ -1005,7 +1121,10 @@ local function run()
         end)
     end
     ui.draggable(titlebar, frame)
-    ui.draggable(icon, icon, function() frame.Visible = not frame.Visible end)
+    ui.draggable(icon, icon, function()
+        if app.editing and app.closeMapEditor then app.closeMapEditor(false)
+        else frame.Visible = not frame.Visible end
+    end)
     local grip = ui.new("TextButton", {Size = UDim2.fromOffset(17, 17), Position = UDim2.new(1, -18, 1, -18),
         Text = "◢", TextColor3 = ui.blue, BackgroundTransparency = 1, TextSize = 16, ZIndex = 4}, frame)
     local resizePointer, resizeStart, resizeSize
@@ -1168,54 +1287,126 @@ local function run()
         end
         ui.textLabel(selection, "Healing Station repairs defenses. Buff Barricade buffs players.", 32)
     end
-    local area = ui.group(areaPage, "MAP PART / DOT SELECTION")
-    ui.textLabel(area, "First two dots define the front. Tap map points, then CONNECT.", 32)
+    local area = ui.group(areaPage, "TOP VIEW MAP SELECTION")
+    ui.textLabel(area, "Open the map, tap your corners, then CONNECT. First edge = front.", 32)
     local areaLabel = ui.textLabel(area, "NO AREA SELECTED", 28)
-    local editor = ui.new("Frame", {AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 12),
-        Size = UDim2.fromOffset(310, 76), BackgroundColor3 = Color3.fromRGB(12, 23, 38), Visible = false}, gui)
+    local editor = ui.new("Frame", {AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 8),
+        Size = UDim2.fromOffset(370, 137), BackgroundColor3 = Color3.fromRGB(12, 23, 38), Visible = false,
+        ZIndex = 10}, gui)
     ui.round(editor)
     ui.stroke(editor, ui.blue)
-    local editorText = ui.textLabel(editor, "TAP MAP POINTS", 29)
-    local undo = ui.button(editor, "UNDO", function()
-        if app.draft then table.remove(app.draft) app.drawRegion(app.draft, false) end
-    end)
-    undo.Size, undo.Position = UDim2.fromOffset(74, 30), UDim2.fromOffset(6, 38)
-    local connect = ui.button(editor, "CONNECT", function()
+    local editorText = ui.textLabel(editor, "TOP VIEW · TAP CORNERS", 27)
+    editorText.TextSize = 10
+    local dotOverlay = ui.new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        Active = false, Visible = false, ZIndex = 5}, gui)
+    local dots, lines = {}, {}
+    function app.refreshMapDots(camera)
+        local points = app.draft or {}
+        for i = 1, 24 do
+            local dot, line = dots[i], lines[i]
+            if not dot then
+                dot = ui.new("TextLabel", {Size = UDim2.fromOffset(20, 20), AnchorPoint = Vector2.new(0.5, 0.5),
+                    Text = tostring(i), TextSize = 10, Font = Enum.Font.GothamBold, BackgroundColor3 = ui.blue,
+                    TextColor3 = Color3.fromRGB(255, 255, 255), BorderSizePixel = 0, ZIndex = 7, Active = false}, dotOverlay)
+                ui.round(dot, 10)
+                line = ui.new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0,
+                    BackgroundColor3 = ui.blue, ZIndex = 6, Active = false}, dotOverlay)
+                dots[i], lines[i] = dot, line
+            end
+            local point = points[i]
+            dot.Visible, line.Visible = false, false
+            if point then
+                local a, visible = camera:WorldToViewportPoint(Vector3.new(point.x, point.y, point.z))
+                dot.Position, dot.Visible = UDim2.fromOffset(a.X, a.Y), visible
+                dot.BackgroundColor3 = i == 1 and Color3.fromRGB(255, 190, 75) or ui.blue
+                local nextPoint = points[i + 1]
+                if nextPoint then
+                    local b = camera:WorldToViewportPoint(Vector3.new(nextPoint.x, nextPoint.y, nextPoint.z))
+                    local delta = Vector2.new(b.X - a.X, b.Y - a.Y)
+                    line.Position = UDim2.fromOffset((a.X + b.X) / 2, (a.Y + b.Y) / 2)
+                    line.Size = UDim2.fromOffset(delta.Magnitude, 2)
+                    line.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+                    line.BackgroundColor3 = i == 1 and Color3.fromRGB(255, 190, 75) or ui.blue
+                    line.Visible = a.Z > 0 and b.Z > 0
+                end
+            end
+        end
+    end
+    function app.closeMapEditor(saved)
+        app.stopMapView()
+        app.editing, app.pickPart, app.draftSurface, app.clearSurface = false, false, nil, nil
+        editor.Visible, dotOverlay.Visible, frame.Visible = false, false, true
+        app.drawRegion(saved and app.draft or app.region().points or {}, true)
+    end
+    function app.commitArea()
         local ok, reason = Core.validPolygon(app.draft or {})
-        if not ok then app.note("area", reason) return end
+        if not ok then app.editorMessage = reason app.note("area", reason) return false end
         local previous = app.region()
-        cfg.regions[app.mapId] = {points = app.draft, surface = app.draftSurface or previous.surface}
-        app.draftSurface = nil
-        app.editing, editor.Visible, frame.Visible = false, false, true
-        app.drawRegion(app.draft, true)
+        local surface = app.draftSurface or previous.surface
+        if app.clearSurface then surface = nil end
+        cfg.regions[app.mapId] = {points = app.draft, surface = surface}
+        app.closeMapEditor(true)
         app.changed()
-    end)
-    connect.Size, connect.Position = UDim2.fromOffset(109, 30), UDim2.fromOffset(85, 38)
-    local cancel = ui.button(editor, "CANCEL", function()
-        app.editing, app.pickPart, app.draftSurface, editor.Visible, frame.Visible = false, false, nil, false, true
-        app.drawRegion(app.region().points or {}, true)
-    end)
-    cancel.Size, cancel.Position = UDim2.fromOffset(104, 30), UDim2.fromOffset(200, 38)
-    ui.button(area, "PICK MAP PART", function()
-        if app.mode ~= "MATCH" then app.note("area", "JOIN A MAP FIRST") return end
-        app.editing, app.pickPart, app.draft, app.draftSurface = true, true, {}, nil
-        frame.Visible, editor.Visible = false, true
-        app.releaseFire() app.stopFlight()
-    end)
-    ui.button(area, "DRAW NEW DOT BOUNDARY", function()
-        if app.mode ~= "MATCH" or app.mapId == "Unknown" then app.note("area", "WAIT FOR THE MAP") return end
-        app.editing, app.pickPart, app.draft, app.draftSurface = true, false, {}, nil
-        frame.Visible, editor.Visible = false, true
-        app.clearMarkers() app.releaseFire() app.stopFlight()
-    end)
-    ui.button(area, "ADD CURRENT POSITION DOT", function()
+        return true
+    end
+    function app.openMapEditor(mode)
+        if app.mode ~= "MATCH" or app.mapId == "Unknown" then app.note("area", "JOIN A LOADED MAP FIRST") return end
         local root, human = app.root()
-        if not root then return end
-        local p = root.Position - Vector3.new(0, human.HipHeight + root.Size.Y / 2, 0)
-        app.editing, app.draft, editor.Visible = true, app.draft or {}, true
-        app.draft[#app.draft + 1] = {x = p.X, y = p.Y, z = p.Z}
-        app.drawRegion(app.draft, false)
+        if not root then app.note("area", "WAIT UNTIL YOUR CHARACTER IS ALIVE") return end
+        local saved = app.region().points or {}
+        local layer = root.Position.Y - human.HipHeight - root.Size.Y / 2
+        if #saved > 0 then layer = saved[1].y end
+        if not app.startMapView(layer) then return end
+        app.releaseFire() app.stopFlight()
+        app.editing, app.pickPart, app.draftSurface, app.editorMessage = true, mode == "part", nil, nil
+        app.draft, app.clearSurface = {}, mode == "new"
+        if mode == "saved" then for _, point in ipairs(saved) do app.draft[#app.draft + 1] = {x = point.x, y = point.y, z = point.z} end end
+        frame.Visible, editor.Visible, dotOverlay.Visible = false, true, true
+        app.clearMarkers()
+        app.renderMapView()
+    end
+    local function editorButton(text, x, width, y, callback)
+        local button = ui.button(editor, text, callback)
+        button.Size, button.Position = UDim2.new(width, -5, 0, 27), UDim2.new(x, 3, 0, y)
+        button.TextSize, button.ZIndex = 10, 11
+        return button
+    end
+    editorButton("UNDO", 0, 0.25, 30, function()
+        if app.draft then table.remove(app.draft) end
+        app.editorMessage = nil
     end)
+    editorButton("CLEAR", 0.25, 0.25, 30, function() app.draft, app.editorMessage = {}, nil end)
+    editorButton("CONNECT", 0.5, 0.25, 30, app.commitArea)
+    editorButton("CANCEL", 0.75, 0.25, 30, function() app.closeMapEditor(false) end)
+    local controls = {
+        {"−", function(s) s.zoom = math.min(2.5, s.zoom * 1.25) end},
+        {"+", function(s) s.zoom = math.max(0.03, s.zoom / 1.25) end},
+        {"←", function(s) s.panX = s.panX - s.height * 0.12 end},
+        {"→", function(s) s.panX = s.panX + s.height * 0.12 end},
+        {"↑", function(s) s.panZ = s.panZ - s.height * 0.12 end},
+        {"↓", function(s) s.panZ = s.panZ + s.height * 0.12 end},
+        {"FIT", function(s) s.zoom, s.panX, s.panZ = 1, 0, 0 end},
+    }
+    for index, control in ipairs(controls) do
+        editorButton(control[1], (index - 1) / 7, 1 / 7, 63, function()
+            if app.mapView then control[2](app.mapView) end
+        end)
+    end
+    editorButton("LOWER FLOOR", 0, 0.5, 97, function()
+        if app.mapView then
+            local old = app.mapView.layer
+            if not app.mapLayer(old - 6) then app.mapLayer(old) app.editorMessage = "NO LOWER FLOOR" end
+        end
+    end)
+    editorButton("HIGHER FLOOR", 0.5, 0.5, 97, function()
+        if app.mapView then
+            local old = app.mapView.layer
+            if not app.mapLayer(old + 6) then app.mapLayer(old) app.editorMessage = "NO HIGHER FLOOR" end
+        end
+    end)
+    ui.button(area, "OPEN TOP VIEW · NEW AREA", function() app.openMapEditor("new") end)
+    ui.button(area, "OPEN TOP VIEW · EDIT SAVED AREA", function() app.openMapEditor("saved") end)
+    ui.button(area, "OPEN TOP VIEW · PICK MAP PART", function() app.openMapEditor("part") end)
     ui.button(area, "SHOW SAVED BOUNDARY", function() app.drawRegion(app.region().points or {}, true) end)
     ui.button(area, "HIDE BOUNDARY", app.clearMarkers)
     ui.button(area, "REMOVE MAP PART LOCK", function()
@@ -1259,13 +1450,21 @@ local function run()
         if #pg:GetGuiObjectsAtPosition(screen.X, screen.Y) > 0 then
             -- Only our editor blocks selection; the game's transparent full-screen HUD does not.
             for _, object in ipairs(pg:GetGuiObjectsAtPosition(screen.X, screen.Y)) do
-                if object:IsDescendantOf(gui) then return end
+                if object:IsDescendantOf(editor) or object == icon or (frame.Visible and object:IsDescendantOf(frame)) then return end
             end
         end
-        local inset = GuiService:GetGuiInset()
-        local ray = camera:ViewportPointToRay(screen.X - inset.X, screen.Y - inset.Y)
-        local hit = app.raycast(ray.Origin, ray.Direction * 1000, app.mapFilters())
+        if not app.pickPart and #app.draft >= 3 then
+            local first = app.draft[1]
+            local pixel = camera:WorldToViewportPoint(Vector3.new(first.x, first.y, first.z))
+            local inset = GuiService:GetGuiInset()
+            if (Vector2.new(pixel.X + inset.X, pixel.Y + inset.Y) - screen).Magnitude <= 14 then
+                app.commitArea()
+                return
+            end
+        end
+        local hit = app.mapViewRay(screen)
         if not hit or not hit.Instance:IsA("BasePart") or hit.Normal.Y < 0.65 then app.note("area", "TAP A FLOOR SURFACE") return end
+        app.editorMessage = nil
         if app.pickPart then
             local part = hit.Instance
             local points = {}
@@ -1281,14 +1480,15 @@ local function run()
             local p = hit.Position
             app.draft[#app.draft + 1] = {x = p.X, y = p.Y, z = p.Z}
         end
-        app.drawRegion(app.draft, false)
+        if app.mapView then app.refreshMapDots(camera) end
     end)
     function app.stop()
         if not app.alive then return end
         app.alive = false
         app.save()
-        app.releaseFire() app.stopFlight() app.clearMarkers()
+        app.releaseFire() app.stopFlight() app.stopMapView() app.clearMarkers()
         RunService:UnbindFromRenderStep("EXIS_ZOMBIE_AIM")
+        RunService:UnbindFromRenderStep("EXIS_ZOMBIE_MAP")
         for _, connection in ipairs(app.connections) do connection:Disconnect() end
         app.connections = {}
         gui:Destroy()
@@ -1300,7 +1500,17 @@ local function run()
     ui.buildDefenses()
     ui.show("MAIN")
     app.connect(gui.Destroying, app.stop)
-    app.connect(player.CharacterRemoving, function() app.releaseFire() app.stopFlight() app.buildGoal = nil end)
+    app.connect(player.CharacterRemoving, function()
+        if app.editing then app.closeMapEditor(false) end
+        app.releaseFire() app.stopFlight() app.buildGoal = nil
+    end)
+    RunService:BindToRenderStep("EXIS_ZOMBIE_MAP", Enum.RenderPriority.Camera.Value + 20, function()
+        local ok, err = pcall(app.renderMapView)
+        if not ok then
+            app.note("area", err)
+            if app.editing then app.closeMapEditor(false) end
+        end
+    end)
     local tickTime = 0
     app.connect(RunService.Heartbeat, function(dt)
         tickTime = tickTime + dt
@@ -1325,6 +1535,7 @@ local function run()
                 local before = app.mapId .. tostring(app.className) .. app.mode
                 app.detect()
                 if before ~= app.mapId .. tostring(app.className) .. app.mode then
+                    if app.mapView and app.mapView.map ~= app.mapId then app.closeMapEditor(false) end
                     app.planKey, app.target, app.buildGoal, app.surface, app.defenseCache = nil, nil, nil, nil, nil
                     app.rejected, app.pendingPlacements = {}, {}
                     ui.buildClasses() ui.buildDefenses()
@@ -1364,7 +1575,8 @@ local function run()
                 .. "\nTARGET: " .. (app.target and ((app.target.boss and "BOSS · " or "") .. tostring(app.target.model:GetAttribute("ZombieVisualName") or app.target.model.Name)) or "NONE")
                 .. "\nCASH " .. tostring(app.balance("Cash") or "—") .. "  ·  ZOMBUX " .. tostring(app.balance("Zombux") or "—")
             areaLabel.Text = (app.mapName or "UNKNOWN") .. " · " .. #(app.region().points or {}) .. " DOTS"
-            editorText.Text = app.pickPart and "TAP THE MAP PART TO USE" or "DOTS " .. #(app.draft or {}) .. " · FIRST EDGE = FRONT"
+            editor.Size = UDim2.fromOffset(math.min(370, workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.X - 20 or 370), 137)
+            editorText.Text = app.editorMessage or (app.pickPart and "TOP VIEW · TAP THE FLOOR PART" or "TOP VIEW · DOTS " .. #(app.draft or {}) .. " · TAP FIRST DOT TO CLOSE")
             footer.Text = app.lastNote or "INITIAL TEST RELEASE · SELECT FEATURES TO START"
             local upgrades = app.mode == "MATCH" and app.module(modules, "PlayerUpgradeDefinitions")
             if upgrades then
