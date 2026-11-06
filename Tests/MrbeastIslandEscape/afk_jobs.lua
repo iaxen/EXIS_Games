@@ -21,7 +21,7 @@ local function model(name,point)
  return m
 end
 local function setup()
- now=0;inventory={Wood=0,Stone=0,Ore=0,Coal=0,Ingot=0,Meat=0};sceneRows={entities={},drops={},chests={}};schedule={};events={};status={};buildingSet={}
+ due={};now=0;inventory={Wood=0,Stone=0,Ore=0,Coal=0,Ingot=0,Meat=0};sceneRows={entities={},drops={},chests={}};schedule={};events={};status={};buildingSet={}
  os.clock=function()return now end
  opts={jobTimeout=15,onlyNeeded=true,settleTime=0,guardRadius=14,huntRadius=40}
  flags={autoFarm=true,progression=true,choiceRewards=true,smelt=true,tidyBag=true}
@@ -40,6 +40,7 @@ local function setup()
  work.bagState=function()local total=0 for _,n in pairs(inventory)do total=total+n end return total,5 end
  work.running=function()return not work.preempted end
  work.checkpoint=function()return not work.preempted end
+ work.isNight=function()return false end
  work.keyEnabled=function()return true end
  work.safeResource=function()return true end
  work.safeWorkPoint=function()return true end
@@ -103,7 +104,8 @@ test('config and attributes classify other passive creatures without a food-name
  assert(not work.isHostile(m,{atkDmg=0}))
  m.attrs.Hostile=false;assert(not work.isHostile(m,{atkDmg=10}))
 end)
-test('spiders and the Shadow still remain threats',function()
+test('spiders and nighttime Shadow remain threats',function()
+ work.isNight=function()return true end
  creature('Spider',{atkDmg=10});local shadow=creature('Shadow',{atkDmg=0,mobClass='Shadow'});shadow.Humanoid.Health=1000000
  local rows=work.hostiles();assert(#rows==2 and not rows[2].attackable)
 end)
@@ -405,18 +407,21 @@ test('routine crafting cannot interrupt a live hold but defence can',function()
  work.active='chests';work.currentJob={key='chests'};work.jobs={};work.rank=function()return 8 end
  work.nightPaused=function()return false end;work.interaction={key='chests',untilTime=10}
  local nextRank=3.5
- work.pick=function(_,_,ceiling)assert(ceiling==3.5);if nextRank<ceiling then return{key='combat'},nextRank end end
+ work.pick=function(_,_,ceiling,urgent)assert(ceiling==8 and urgent);if nextRank<3.5 then return{key='combat'},nextRank end end
  motion.cancel=function()motion.serial=motion.serial+1 end
  assert(work.checkpoint('chests')and not work.preempted)
  now=.05;nextRank=1.5
  assert(not work.checkpoint('chests')and work.preempted.to=='combat')
 end)
-test('expired interaction ownership cannot suppress routine jobs',function()
+test('routine work queues until seven seconds without progress',function()
  loadBody('    function work.checkpoint(', '    function work.pause(')
  work.active='chests';work.currentJob={key='chests'};work.jobs={};work.rank=function()return 8 end
  work.nightPaused=function()return false end;work.interaction={key='chests',untilTime=-1}
- work.pick=function(_,_,ceiling)assert(ceiling==8);return{key='craft'},3.5 end;motion.cancel=function()end
- assert(not work.checkpoint('chests')and work.preempted.to=='craft')
+ work.pick=function(_,_,ceiling,urgent)if not urgent then assert(work.skipJob=='chests');return{key='craft'},3.5 end end
+ motion.cancel=function()end
+ assert(work.checkpoint('chests')and not work.preempted)
+ now=6.99;assert(work.checkpoint('chests')and not work.preempted)
+ now=7.1;assert(not work.checkpoint('chests')and work.preempted.to=='craft')
 end)
 test('known animation with currency-only or empty loot does not wait forever',function()
  local m=chest();local accepted=false

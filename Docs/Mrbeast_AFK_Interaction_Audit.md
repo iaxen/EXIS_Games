@@ -1,3 +1,5 @@
+> Updated survival behavior and superseded limits are documented in `Mrbeast_Storm_Survival.md`.
+
 # MrBeast AFK interaction audit
 
 Scope: the supplied `MrbeastIslandEscapeIngameFiles.zip` export and the MrBeast module after PR #22. Relevant source was recovered from the Roblox binary chunks despite the exported files having `.txt` extensions. This is a source review and deterministic simulation, not a live Roblox certification. Cloud configuration and server-only services absent from the export cannot be fully validated offline.

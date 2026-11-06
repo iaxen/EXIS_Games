@@ -24,7 +24,7 @@ local function setup()
  built=function()end
  pos=function(m)return m.point end
  work={boatId=function()return'boat'end,needs={},amounts={},resourceNeeds={},sent=0,campStash={},
-  safeResource=function()return true end,noFood=function()return false end,
+  pickupEligible=function()return true end,safeResource=function()return true end,noFood=function()return false end,
   bagState=function()return 0,10 end,canCollect=function()return true end,
   station=function()return zone,zone end,fireState=function()return{level=1}end,
   bagRank=function()return 10 end,buildRank=function(info)return info.assetId=='Campfire'and 0 or 2 end,
@@ -99,12 +99,13 @@ test('owned outputs are not crafted again',function()
  stock.Wood=4;stock.Axe2=1;goals={craftGoal()}
  assert(work.nextReadyCraft()==nil)
 end)
-test('ready crafting runs after urgent survival but before rewards, unloading and routine work',function()
+test('ready crafting follows survival and equipment rewards before ordinary unloading',function()
  body('    function work.rank(job)', '    function work.pick(')
  assert(work.rank{key='craft'}>work.rank{key='fuel'})
  work.foodHuntReady=function()return true end
  assert(work.rank{key='craft'}>work.rank{key='hunt'})
- for _,key in ipairs({'mrbeastReward','unloadBag','gather','chests'})do assert(work.rank{key='craft'}<work.rank{key=key})end
+ assert(work.rank{key='mrbeastReward'}<work.rank{key='craft'})
+ for _,key in ipairs({'unloadBag','gather','chests'})do assert(work.rank{key='craft'}<work.rank{key=key})end
 end)
 test('craft execution uses the station/direct submission adapter and the correct job key',function()
  stock.Wood=4;goals={craftGoal()}
@@ -122,19 +123,30 @@ test('emergency fire maintenance remains ahead of crafting material goals',funct
  goals={craft,survival};work.goalRunnable=function()return true end
  assert(work.chooseUpgrade()==survival)
 end)
-test('a ready automatic craft interrupts routine gathering without enabling the manual toggle',function()
+test('a ready automatic craft takes over stalled gathering without enabling the manual toggle',function()
  stock.Wood=4;goals={craftGoal()}
  body('    function work.jobEnabled(', '    local function blueprintReady(')
  work.roundLost=function()return false end;work.nightPaused=function()return false end
+ work.isNight=function()return false end;work.signature=function()return '' end
+ work.interruptsInteraction=function()return false end
  local craft={key='craft',enabled=function()return flags.progression end,ready=function()return work.nextReadyCraft()~=nil end}
  work.jobs={craft};work.jobsByKey={craft=craft};work.currentJob={key='gather'};work.active='gather'
  motion={cancel=function()events[#events+1]='cancel' end}
+ work.checkpoint('gather');now=18
  assert(not work.checkpoint('gather')and work.preempted.to=='craft'and not flags.craft)
 end)
 test('bag upgrades alone do not activate a disabled manual selected craft',function()
  flags.progression=false;flags.craft=false;flags.bagUpgrade=true
  local goal=craftGoal();goal.key='selected:axe2';goals={goal};stock.Wood=4
  assert(work.nextReadyCraft()==nil)
+end)
+test('a progressing objective finishes before a newly queued routine upgrade',function()
+ local current=craftGoal();current.key='current'
+ local queued={key='quest:new',kind='quest',rank=-100,amounts={},info={}}
+ goals={current,queued};work.objective=current;work.objectiveSignature=work.signature();work.objectiveProgressAt=now
+ work.goalRunnable=function()return true end
+ assert(work.chooseUpgrade().key=='current')
+ now=now+8;assert(work.chooseUpgrade().key=='quest:new')
 end)
 assert(loadfile(path))
 print(passed..' reclaim and crafting-priority checks passed; complete module compiles')
