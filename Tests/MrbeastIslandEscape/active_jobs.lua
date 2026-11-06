@@ -7,7 +7,7 @@ local chunks={
  extract('    function work.submitUnits(', '    function work.bagState()'),
  extract('    function work.contribute(', '    local function craftTick()'),
  extract('    function work.goalRunnable(', '    function work.planProgression()'),
- extract('    function work.bagSubmissionReady()', '    function work.releaseHover()'),
+ extract('    function work.bagSubmissionReady()', '    function work.shelterNeeded()'),
  extract('    function work.nightPaused(', '    function work.resourceKind('),
  extract('    function work.cookCompatible(', '    function work.fuelItem()'),
 }
