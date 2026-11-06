@@ -159,7 +159,8 @@ end)
 test('chest opening waits for animation and delayed loot instead of only isOpened',function()
  local m=chest();local accepted=false
  work.chestDuration=function()return 2 end
- call=function(_,op)
+ call=function(service,op,arg)
+  if service=='ItemCollect'then inventory[arg.Name]=(inventory[arg.Name]or 0)+1;arg.Parent=false;return end
   events[#events+1]=op
   if op=='isOpened'then return accepted elseif op=='isLocked'then return false end
   if op=='requestOpen'then
@@ -172,7 +173,8 @@ end)
 test('chest interruption preserves its opening state and never sends a duplicate open request',function()
  local m=chest();local accepted=false
  work.chestDuration=function()return 1 end
- call=function(_,op)
+ call=function(service,op,arg)
+  if service=='ItemCollect'then inventory[arg.Name]=(inventory[arg.Name]or 0)+1;arg.Parent=false;return end
   events[#events+1]=op
   if op=='isOpened'then return accepted elseif op=='isLocked'then return false end
   if op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now;later(.2,function()work.preempted=true end)end
@@ -182,12 +184,16 @@ test('chest interruption preserves its opening state and never sends a duplicate
  assert(work.openChest());assert(countEvent('requestOpen')==1)
 end)
 test('locked chests do not send an open request',function()
- chest();call=function(_,op)events[#events+1]=op;return op=='isLocked'end
+ chest();call=function(service,op,arg)
+  if service=='ItemCollect'then inventory[arg.Name]=(inventory[arg.Name]or 0)+1;arg.Parent=false;return end
+ events[#events+1]=op;return op=='isLocked'end
  assert(not work.openChest()and countEvent('requestOpen')==0)
 end)
 test('chest with no loot receipt stays pending and retryable rather than falsely complete',function()
  local m=chest();local accepted=false
- call=function(_,op)if op=='isOpened'then return accepted end;if op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now end end
+ call=function(service,op,arg)
+  if service=='ItemCollect'then inventory[arg.Name]=(inventory[arg.Name]or 0)+1;arg.Parent=false;return end
+ if op=='isOpened'then return accepted end;if op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now end end
  assert(not work.openChest()and not work.chestState(m).complete and now>=15)
 end)
 test('chest travels within the actual configured opening distance',function()
@@ -197,7 +203,9 @@ test('chest travels within the actual configured opening distance',function()
  assert(not work.openChest()and radius==7)
 end)
 test('an already-open chest is cached and not revisited as if closed',function()
- local m=chest();call=function(_,op)return op=='isOpened'end
+ local m=chest();call=function(service,op,arg)
+  if service=='ItemCollect'then inventory[arg.Name]=(inventory[arg.Name]or 0)+1;arg.Parent=false;return end
+ return op=='isOpened'end
  assert(work.openChest()and work.chestState(m).complete and not work.chestCandidate())
 end)
 local function rewardUI()
@@ -269,6 +277,47 @@ test('an impossible direct craft does not collect a recipe larger than the bag c
  loadBody('    function work.goalRunnable(', '    function work.chooseUpgrade()')
  work.goalAmounts=function()return{wood=10}end
  assert(not work.goalRunnable{kind='craft',amounts={wood=10},info={displayName='Axe2'}})
+end)
+test('chest collection bypasses needed-only filtering for its own loot',function()
+ local m=chest();local accepted=false
+ work.needsDrop=function()return false end
+ work.chestDuration=function()return .1 end
+ call=function(service,op,arg)
+  if service=='ItemCollect'then inventory[arg.Name]=(inventory[arg.Name]or 0)+1;arg.Parent=false;return end
+  if op=='isOpened'then return accepted elseif op=='isLocked'then return false end
+  if op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now;later(.2,function()local d=model('Stone');d.attrs.ownerName=player.Name;sceneRows.drops={d}end)end
+ end
+ assert(work.openChest()and inventory.Stone==1)
+end)
+test('full chest bag stays pending, then returns to collect the remaining drops without reopening',function()
+ local m=chest();local accepted=false;local requests=0
+ work.chestDuration=function()return .1 end
+ work.needsDrop=function()return false end
+ call=function(service,op,arg)
+  if service=='ItemCollect'then inventory[arg.Name]=(inventory[arg.Name]or 0)+1;arg.Parent=false;return end
+  if op=='isOpened'then return accepted elseif op=='isLocked'then return false end
+  if op=='requestOpen'then
+   requests=requests+1;accepted=true;work.chestState(m).acceptedAt=now
+   later(.2,function()for i=1,6 do local d=model('Stone');d.attrs.ownerName=player.Name;sceneRows.drops[#sceneRows.drops+1]=d end end)
+  end
+ end
+ assert(not work.openChest()and inventory.Stone==5 and work.chestResume==m and not work.chestState(m).complete)
+ inventory.Stone=0
+ assert(work.openChest()and inventory.Stone==1 and work.chestResume==nil and requests==1)
+end)
+test('a rejected chest pickup stays pending until a later collection succeeds',function()
+ local m=chest();local accepted=false;local attempts=0
+ work.chestDuration=function()return .1 end
+ call=function(service,op,arg)
+  if service=='ItemCollect'then
+   attempts=attempts+1
+   if attempts>1 then inventory[arg.Name]=(inventory[arg.Name]or 0)+1;arg.Parent=false end
+   return
+  end
+  if op=='isOpened'then return accepted elseif op=='isLocked'then return false end
+  if op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now;later(.2,function()local d=model('Stone');d.attrs.ownerName=player.Name;sceneRows.drops={d}end)end
+ end
+ assert(work.openChest()and attempts==2 and inventory.Stone==1)
 end)
 os.clock=realClock
 assert(loadfile(path))

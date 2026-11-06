@@ -76,7 +76,7 @@ local function runIslandEscape()
     local alive = true
     local connections = {}
     local flags = {autoFarm = true, quest = true, bagUpgrade = true, combat = true, runShadow = true,
-        liveStatus = true, choiceRewards = true}
+        liveStatus = true, choiceRewards = true, unloadBag = true}
     local selected = {}
     local modules = {}
     local failed = {}
@@ -1354,7 +1354,7 @@ local function runIslandEscape()
         button(master, "APPLY LONG-RUN PRESET", function()
             for _, key in ipairs({"autoFarm", "eat", "fuel", "cook", "cooked", "huntFood", "buildCamp", "toolLadder",
                 "smelt", "smeltCollect", "tidyBag", "choiceRewards", "quest", "bagUpgrade", "combat", "runShadow",
-                "drops", "chopTrees", "mineStone", "mineIron", "liveStatus"}) do flags[key] = true end
+                "drops", "chopTrees", "mineStone", "mineIron", "liveStatus", "unloadBag"}) do flags[key] = true end
             flags.escape = false flags.buildBoat = false
             for _, render in pairs(toggles) do render() end
             save()
@@ -1381,7 +1381,8 @@ local function runIslandEscape()
         number(near, "shadowRadius", "SHADOW AVOIDANCE RADIUS", 20, 150)
         local food = group(p.camp, "FOOD / INVENTORY")
         toggle(food, "huntFood", "Hunt food when empty", "Looks for mobs with configured food drops. Does not chase the Shadow.")
-        toggle(food, "tidyBag", "Tidy bag by submitting materials", "Uses needed materials for quests, buildings or a bag upgrade. Never deletes or throws away arbitrary items.")
+        toggle(food, "tidyBag", "Tidy bag by submitting materials", "Submits usable materials to quests, buildings, crafting, cooking and smelting.")
+        toggle(food, "unloadBag", "Unload leftovers near campfire", "Submits first, then drops unused bag items at camp. Keeps tools and ingredients needed for direct crafting.")
         work.slider(food, "hunger", "EAT BELOW HUNGER (%)", 1, 100, 1)
         local projects = group(p.craft, "PROGRESSION GOALS")
         toggle(projects, "toolLadder", "Craft tool ladder")
@@ -1502,7 +1503,7 @@ local function runIslandEscape()
     toggle(rewards, "playtime", "Auto playtime rewards")
     toggle(rewards, "dailyQuest", "Claim completed daily quests")
     local chestUI = group(explore, "CHESTS AND PUZZLES")
-    toggle(chestUI, "chests", "Auto open unlocked chests", "Waits for opening and loot; collects needed items.")
+    toggle(chestUI, "chests", "Auto open unlocked chests", "Collects chest drops. Unloads at camp when full, then returns for the rest.")
     toggle(chestUI, "puzzles", "Auto interact with puzzle props")
     local escape = group(explore, "ESCAPE BOAT")
     toggle(escape, "escape", "Emergency auto escape", "Off by default. Only uses a ready boat when your enabled emergency conditions are met. Ends your run.")
@@ -1583,7 +1584,7 @@ local function runIslandEscape()
                 "cooked",
                 "smelt",
                 "smeltCollect",
-                "water",
+                "water", "unloadBag",
             },
         },
         {
@@ -2297,8 +2298,127 @@ local function runIslandEscape()
         end
         note("eat", "SELECT FOOD YOU OWN")
     end
+    function work.markCampDrop(model)
+        work.campStash = work.campStash or setmetatable({}, {__mode = "k"})
+        if work.campStash[model] then return work.campStash[model] end
+        local point = pos(model)
+        if not point or model:GetAttribute("ownerName") ~= player.Name then return end
+        for _, watch in ipairs(work.campDropWatches or {}) do
+            if os.clock() <= watch.expires and not watch.before[model]
+                and (watch.expected[model.Name] or 0) > 0 and (point - watch.point).Magnitude <= 24 then
+                local item = config().item.byDisplayName[model.Name]
+                if item then
+                    local record = {id = item.id, camp = watch.camp}
+                    work.campStash[model] = record
+                    watch.before[model] = true
+                    watch.expected[model.Name] = math.max(0, watch.expected[model.Name] - (tonumber(model:GetAttribute("count")) or 1))
+                    return record
+                end
+            end
+        end
+    end
+    function work.captureCampDrops()
+        local watches = work.campDropWatches
+        if not watches then return end
+        for i = #watches, 1, -1 do if os.clock() > watches[i].expires then table.remove(watches, i) end end
+        if #watches > 0 then
+            for _, model in ipairs(work.models("drops")) do if model.Parent then work.markCampDrop(model) end end
+        end
+    end
+    function work.stashWanted(model, record)
+        local c, goal = config(), work.activeGoal or work.objective
+        if goal and work.taskDemand(record.id, "progression") > 0 then
+            if goal.kind == "build" then
+                local folder = world() and world():FindFirstChild("Buildings")
+                local target = folder and folder:FindFirstChild(goal.info.assetId .. "_Construct")
+                return target and work.safeResource(target) or false
+            elseif goal.kind == "fuel" then
+                local state = work.fireState()
+                return state and not state.raining and state.remaining ~= nil
+                    and (not state.cap or state.remaining < state.cap) and work.safeResource(state.fire) or false
+            elseif goal.kind == "bag" or (goal.kind == "craft" and work.stationGoal(goal)) then
+                local _, zone = work.station()
+                return zone and work.safeResource(zone) or false
+            elseif goal.kind == "quest" then
+                local scene = world()
+                local npc = scene and scene:FindFirstChild("Mrbeast", true)
+                return npc and work.safeResource(npc) or false
+            elseif goal.kind == "craft" then return true end
+        end
+        local food = c.food and c.food.byId[record.id]
+        if food and work.noFood() then
+            local _, human = root()
+            local hunger = human and human:GetAttribute("hunger")
+            local maxHunger = human and (human:GetAttribute("maxHunger") or 100) or 100
+            return human and (human.Health / human.MaxHealth * 100 <= opts.health
+                or (hunger and hunger / maxHunger * 100 <= opts.hunger)) or false
+        end
+        return false
+    end
+    function work.unloadCount(tool)
+        local c = config()
+        local item = c.item.byDisplayName[tool.Name]
+        if not item or not item.isBagItem or not tool.Parent then return 0 end
+        if (c.tool and c.tool.byId[item.id]) or (c.bag and c.bag.byId[item.id])
+            or (c.armour and c.armour.byId[item.id]) or item.type == "tool"
+            or item.type == "armour" or item.type == "bag"
+            or (work.artifactNames and work.artifactNames[tool.Name]) then return 0 end
+        local goal = work.activeGoal or work.objective
+        -- Direct crafting consumes a complete recipe; retain its needed ingredients.
+        if goal and goal.kind == "craft" and not work.stationGoal(goal)
+            and (work.goalAmounts(goal)[item.id] or 0) > 0 then return 0 end
+        return math.max(0, tonumber(tool:GetAttribute("count")) or 1)
+    end
+    function work.unloadCandidate()
+        for _, tool in ipairs(tools()) do if work.unloadCount(tool) > 0 then return tool end end
+    end
+    function work.campDropAnchor()
+        local fire = built("Campfire")
+        if fire then return fire end
+        local info = config().build.byId.campfire
+        local folder = world() and world():FindFirstChild("Buildings")
+        return info and folder and folder:FindFirstChild(info.assetId .. "_Construct") or nil
+    end
+    function work.unloadBag()
+        local key, camp = "unloadBag", work.campDropAnchor()
+        if not camp or not work.safeResource(camp) then note(key, "WAITING FOR A SAFE CAMPFIRE AREA") return false end
+        local used, cap = work.bagState()
+        work.unloadRank = used >= cap and 3.9 or 4.05
+        -- Native submissions always get first use of the carried materials.
+        local acted = work.submitGoal(key, work.activeGoal or work.objective)
+        if work.preempted then return acted end
+        acted = work.tidyBag(key, true) or acted
+        if work.preempted or not work.unloadCandidate() then return acted end
+        if not travel(camp, key, 9) then return acted end
+        local r = root()
+        if not r then return acted end
+        local watch = {before = {}, expected = {}, point = r.Position, camp = camp, expires = os.clock() + 10}
+        for _, model in ipairs(work.models("drops")) do watch.before[model] = true end
+        work.campDropWatches = work.campDropWatches or {}
+        work.campDropWatches[#work.campDropWatches + 1] = watch
+        local character, serial = player.Character, motion.serial
+        local deadline = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
+        while work.running(key, character, serial) and os.clock() < deadline do
+            local tool = work.unloadCandidate()
+            if not tool then break end
+            work.unloadWatch = watch
+            local amount = work.batchDrop(tool, work.unloadCount(tool), key)
+            work.unloadWatch = nil
+            work.captureCampDrops()
+            if amount == 0 then note(key, "WAITING FOR CAMP DROP RECEIPT") return acted end
+            acted = true
+            work.blockedBag, work.rejectedPickups = nil, 0
+            watch.expires = os.clock() + 10
+            task.wait()
+        end
+        work.refreshAt = 0
+        note(key, "LEFTOVERS DROPPED AT CAMP; GATHERING CAN RESUME")
+        return acted
+    end
     function work.dropAllowed(model)
         if not model.Parent or model:GetAttribute("collecting") then return false end
+        local stashed = work.markCampDrop(model)
+        if stashed and not work.stashWanted(model, stashed) then return false end
         local owner = model:GetAttribute("ownerName")
         if owner and owner ~= player.Name then
             local lock = tonumber(model:GetAttribute("lockedFor_" .. owner)) or 0
@@ -2307,11 +2427,11 @@ local function runIslandEscape()
         end
         return true
     end
-    function work.collectModel(model, key, bag)
+    function work.collectModel(model, key, bag, chestLoot)
         if not work.dropAllowed(model) then return false end
         local item = config().item.byDisplayName[model.Name]
         local taskPickup = key == "progression" or key == "gather" or key == "drops" or key == "chests"
-        if not bag and taskPickup and item and not work.needsDrop(item.id, key) then return false end
+        if not bag and not chestLoot and taskPickup and item and not work.needsDrop(item.id, key) then return false end
         if not bag and not work.canCollect() then return false end
         local radius = math.max(0.5, (tonumber(config().misc.collectRadius) or 3) * 1.5)
         if not travel(model, key, radius) then return false end
@@ -2693,6 +2813,11 @@ local function runIslandEscape()
         work.activeDropBatch = batch
         for _, record in ipairs(batch.records) do
             work.pendingDrops[record.tool] = batch
+            if work.unloadWatch then
+                local watch = work.unloadWatch
+                watch.expected[record.tool.Name] = (watch.expected[record.tool.Name] or 0) + record.amount
+                watch.expires = os.clock() + 10
+            end
             for _ = 1, record.amount do call("PlayerInventory", "dropItem", record.tool) end
         end
         if not work.await(key, function() return acknowledged(batch) end, 3) then return 0 end
@@ -3287,6 +3412,10 @@ local function runIslandEscape()
     end
     function work.chestCandidate()
         local rows = config().chest.byId
+        local resume = work.chestResume
+        if resume and not resume.Parent then work.chestResume = nil end
+        if resume and resume.Parent and not (failed[resume] and failed[resume] > os.clock())
+            and work.safeResource(resume) then return resume end
         return nearest(work.models("chests"), function(model)
             local state = work.chestStates and work.chestStates[model]
             return model:IsA("Model") and rows[model.Name] and not (state and state.complete)
@@ -3317,6 +3446,7 @@ local function runIslandEscape()
         local info = config().chest.byId[model.Name]
         local radius = math.max(1, (tonumber(info.openDistance) or 10) - 1)
         if not travel(model, key, radius) then return false end
+        work.chestResume = model
         if not state.requestedAt then
             state.requestedAt = os.clock()
             call("ChestService", "requestOpen", model)
@@ -3338,31 +3468,37 @@ local function runIslandEscape()
             if state.acceptedAt then
                 local duration = work.chestDuration(model)
                 if duration then state.duration = math.max(state.duration or 0, duration) end
-                local target, sawNew = nil, false
+                local target, sawNew, pendingLoot = nil, false, false
                 for _, drop in ipairs(work.models("drops")) do
                     local point, center = pos(drop), pos(model)
                     if drop.Parent and point and center and not state.before[drop]
                         and drop:GetAttribute("ownerName") == player.Name and (point - center).Magnitude <= 16 then
                         sawNew = true
                         local item = config().item.byDisplayName[drop.Name]
-                        if item and work.dropAllowed(drop) and work.safeResource(drop)
-                            and (work.bagRank(item.id) or work.needsDrop(item.id, key)
-                                or (config().food.byId[item.id] and work.noFood() and not work.rawFoodOwned()))
-                            and not (failed[drop] and failed[drop] > now) then target = target or drop end
+                        if item and work.dropAllowed(drop) then
+                            pendingLoot = true
+                            if work.safeResource(drop) and not (failed[drop] and failed[drop] > now) then target = target or drop end
+                        end
                     end
                 end
                 if sawNew then state.sawLoot = true end
-                if target and work.canCollect() then
+                if target and not work.canCollect() and not work.bagRank(config().item.byDisplayName[target.Name].id) then
+                    work.chestResume = model
+                    note(key, "CHEST LOOT SAVED; UNLOADING BAG AT CAMP")
+                    return false
+                end
+                if target then
                     local item = config().item.byDisplayName[target.Name]
-                    if work.collectModel(target, key, work.bagRank(item.id) ~= nil) then state.lastLootAt = os.clock()
+                    if work.collectModel(target, key, work.bagRank(item.id) ~= nil, true) then state.lastLootAt = os.clock()
                     elseif work.preempted then return false
                     else failed[target] = os.clock() + 1 end
                 else
                     local durationDone = now >= state.acceptedAt + (state.duration or 0.5)
                     local quiet = not state.lastLootAt or now - state.lastLootAt >= 0.25
-                    if durationDone and state.sawLoot and quiet then
+                    if durationDone and state.sawLoot and quiet and not pendingLoot then
                         state.complete = true
-                        note(key, "CHEST OPENED; NEEDED LOOT COLLECTED OR LEFT FOR CAPACITY")
+                        if work.chestResume == model then work.chestResume = nil end
+                        note(key, "CHEST OPENED; LOOT COLLECTION FINISHED")
                         return true
                     end
                 end
@@ -4548,6 +4684,12 @@ local function runIslandEscape()
         if key == "cook" then return work.noFood() and 3.2 or 7.5 end
         if key == "hunt" then return work.foodHuntReady() and 3.3 or 8.8 end
         if key == "bagUpgrade" then return 4 end
+        if key == "unloadBag" then
+            if work.active == key and work.unloadRank then return work.unloadRank end
+            local used, cap = work.bagState()
+            return used >= cap and 3.9 or 4.05
+        end
+        if key == "chests" and work.chestResume then return 4.2 end
         if key == "tidyBag" then
             if work.active == "tidyBag" and work.bagSweepRank then return work.bagSweepRank end
             local used, cap = work.bagState()
@@ -4879,10 +5021,10 @@ local function runIslandEscape()
         end
         return false
     end
-    function work.tidyBag(key)
+    function work.tidyBag(key, force)
         key = key or "tidyBag"
         local used, cap = work.bagState()
-        if used < cap and not flags.tidyBag then return false end
+        if used < cap and not force and not flags.tidyBag then return false end
         if key == "tidyBag" then work.bagSweepRank = used >= cap and 4 or 5.8 end
         local acted = false
         local character, serial = player.Character, motion.serial
@@ -5187,6 +5329,16 @@ local function runIslandEscape()
             run = work.collectHuntedFood,
         },
         {
+            key = "unloadBag", priority = 3.9, cooldown = 0.1,
+            ready = function()
+                local used, cap = work.bagState()
+                -- Finish a chest batch before making a camp trip, unless full.
+                if work.chestResume and used < cap then return false end
+                return work.unloadCandidate() ~= nil and work.campDropAnchor() ~= nil
+            end,
+            run = work.unloadBag,
+        },
+        {
             key = "tidyBag", priority = 4, cooldown = 0.15,
             enabled = function()
                 return flags.tidyBag or work.progressionEnabled() or flags.gather or flags.chopTrees
@@ -5475,6 +5627,7 @@ local function runIslandEscape()
     work.jobs, work.jobsByKey = jobsList, {}
     for _, job in ipairs(jobsList) do work.jobsByKey[job.key] = job end
     function work.settleCuts()
+        work.captureCampDrops()
         work.pollLateDrops()
         work.dropQueue = work.dropQueue or {}
         for model, context in pairs(work.resourcePlans or {}) do
@@ -5627,6 +5780,7 @@ local function runIslandEscape()
                 end
                 work.waiting[job.key] = nil
                 work.bagSweepRank = nil
+                work.unloadRank, work.unloadWatch = nil, nil
                 work.activeGoal = nil
                 work.active, work.currentJob = nil, nil
                 queueLabel.Text = "LAST JOB: " .. job.key:upper()
@@ -5638,6 +5792,7 @@ local function runIslandEscape()
                 note("queue", "ERROR: " .. tostring(e))
                 say(e)
                 work.bagSweepRank = nil
+                work.unloadRank, work.unloadWatch = nil, nil
                 work.activeGoal = nil
                 work.active, work.currentJob = nil, nil
                 motion.cancel("JOB ERROR")
@@ -5664,5 +5819,6 @@ local function runIslandEscape()
     say("ISLAND ESCAPE LOADED • LONG RUN MODE • CONFIG SAVED PER GAME")
 end
 runIslandEscape()
+
 
 
