@@ -327,8 +327,9 @@ test('a rejected chest pickup stays pending until a later collection succeeds',f
 end)
 test('native chest E hold finishes before opening and looting',function()
  local m=chest();local accepted=false;local triggered=0
- local prompt={Enabled=true,HoldDuration=.8,MaxActivationDistance=7,
- InputHoldBegin=function()events[#events+1]='Ebegin'end,InputHoldEnd=function()events[#events+1]='Eend'end}
+ local receipt
+ local prompt={Enabled=true,HoldDuration=.8,MaxActivationDistance=7,Triggered={Connect=function(_,fn)receipt=fn;return{Disconnect=function()end}end},
+ InputHoldBegin=function()events[#events+1]='Ebegin';later(.82,function()receipt();triggered=triggered+1;accepted=true;later(.2,function()local d=model('Stone');d.attrs.ownerName=player.Name;sceneRows.drops={d}end)end)end,InputHoldEnd=function()events[#events+1]='Eend'end}
  m.FindFirstChildWhichIsA=function()return prompt end
  loadBody('    function work.interactPrompt(', '    function work.collectModel(')
  fireproximityprompt=function(p)
@@ -344,7 +345,8 @@ test('native chest E hold finishes before opening and looting',function()
 end)
 test('native pickup E prompt collects before completion is reported',function()
  local d=model('Stone');local pressed=0
- local prompt={Enabled=true,HoldDuration=0,MaxActivationDistance=5,InputHoldBegin=function()end,InputHoldEnd=function()end}
+ local receipt
+ local prompt={Enabled=true,HoldDuration=0,MaxActivationDistance=5,Triggered={Connect=function(_,fn)receipt=fn;return{Disconnect=function()end}end},InputHoldBegin=function()later(.02,function()receipt();pressed=pressed+1;inventory.Stone=1;d.Parent=false end)end,InputHoldEnd=function()end}
  d.FindFirstChildWhichIsA=function()return prompt end
  loadBody('    function work.interactPrompt(', '    function work.collectModel(')
  fireproximityprompt=function(p)assert(p==prompt);pressed=pressed+1;inventory.Stone=1;d.Parent=false end
@@ -355,6 +357,127 @@ end)
 test('already-open empty chests finish after checking for remaining loot',function()
  local m=chest();call=function(_,op)assert(op~='requestOpen');return op=='isOpened'end
  assert(work.openChest()and work.chestState(m).complete and now>=1)
+end)
+test('a delayed Triggered receipt keeps E down beyond the exact hold deadline',function()
+ local d=model('Stone');local receipt,endedAt
+ local p={Enabled=true,HoldDuration=2,Triggered={Connect=function(_,fn)receipt=fn;return{Disconnect=function()end}end},
+  InputHoldBegin=function()later(2.04,function()receipt()end)end,InputHoldEnd=function()endedAt=now end}
+ d.FindFirstChildWhichIsA=function()return p end
+ loadBody('    function work.interactPrompt(', '    function work.collectModel(')
+ fireproximityprompt=function()error('must not fake a zero-duration trigger')end
+ assert(work.interactPrompt(d,'chests')and endedAt>=2.04 and endedAt<2.4 and work.interaction==nil)
+ fireproximityprompt=nil
+end)
+test('a missing E receipt releases the hold and reports failure',function()
+ local d=model('Stone');local ended,disconnected=false,false
+ local p={Enabled=true,HoldDuration=1,Triggered={Connect=function()return{Disconnect=function()disconnected=true end}end},
+  InputHoldBegin=function()end,InputHoldEnd=function()ended=true end}
+ d.FindFirstChildWhichIsA=function()return p end
+ loadBody('    function work.interactPrompt(', '    function work.collectModel(')
+ assert(not work.interactPrompt(d,'chests')and ended and disconnected and now>=1.35 and now<1.5 and not work.interaction)
+end)
+test('disabled pickup initialization does not fall through to the collect remote',function()
+ local d=model('Stone');d.FindFirstChildWhichIsA=function()return{Enabled=false}end
+ loadBody('    function work.interactPrompt(', '    function work.collectModel(')
+ call=function()error('disabled prompt cannot collect')end
+ assert(not work.collectModel(d,'chests',false,true)and inventory.Stone==0)
+end)
+test('a chest batch never deposits its first item midway through looting',function()
+ buildGoal(3);local d=model('Wood')
+ work.submitGoal=function()error('must finish the chest batch before departing')end
+ assert(work.collectModel(d,'chests',false,true)and inventory.Wood==1)
+end)
+test('chest approach uses the prompt anchor instead of a remote model pivot',function()
+ local m=chest();local anchor=model('UpperTorso',vec(20,0,0))
+ m.FindFirstChildWhichIsA=function()return{Enabled=true,MaxActivationDistance=5,Parent=anchor}end
+ travel=function(target,_,radius)assert(target==anchor and radius==4);return false end
+ call=function()return false end
+ assert(not work.openChest())
+end)
+test('pickup approach uses its actual activation anchor too',function()
+ local d=model('Stone');local anchor=model('Handle',vec(20,0,0))
+ d.FindFirstChildWhichIsA=function()return{Enabled=true,MaxActivationDistance=3,Parent=anchor}end
+ travel=function(target,_,radius)assert(target==anchor and radius==2);return false end
+ assert(not work.collectModel(d,'chests',false,true))
+end)
+test('routine crafting cannot interrupt a live hold but defence can',function()
+ loadBody('    function work.checkpoint(', '    function work.pause(')
+ work.active='chests';work.currentJob={key='chests'};work.jobs={};work.rank=function()return 8 end
+ work.nightPaused=function()return false end;work.interaction={key='chests',untilTime=10}
+ local nextRank=3.5
+ work.pick=function(_,_,ceiling)assert(ceiling==3.5);if nextRank<ceiling then return{key='combat'},nextRank end end
+ motion.cancel=function()motion.serial=motion.serial+1 end
+ assert(work.checkpoint('chests')and not work.preempted)
+ now=.05;nextRank=1.5
+ assert(not work.checkpoint('chests')and work.preempted.to=='combat')
+end)
+test('expired interaction ownership cannot suppress routine jobs',function()
+ loadBody('    function work.checkpoint(', '    function work.pause(')
+ work.active='chests';work.currentJob={key='chests'};work.jobs={};work.rank=function()return 8 end
+ work.nightPaused=function()return false end;work.interaction={key='chests',untilTime=-1}
+ work.pick=function(_,_,ceiling)assert(ceiling==8);return{key='craft'},3.5 end;motion.cancel=function()end
+ assert(not work.checkpoint('chests')and work.preempted.to=='craft')
+end)
+test('known animation with currency-only or empty loot does not wait forever',function()
+ local m=chest();local accepted=false
+ work.chestDuration=function()return 1 end
+ call=function(_,op)if op=='isOpened'then return accepted elseif op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now end end
+ assert(work.openChest()and now>=2 and now<3 and work.chestState(m).complete)
+end)
+test('unconfirmed loot wait defers the chest so other jobs can progress',function()
+ local m=chest();local accepted=false
+ call=function(_,op)if op=='isOpened'then return accepted elseif op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now end end
+ assert(not work.openChest()and failed[m]>now and not work.chestCandidate()and not work.interaction)
+ now=failed[m]+.01;assert(work.chestCandidate()==m)
+end)
+test('native auto-equipped armour confirms without waiting for an inventory Tool',function()
+ cfg.misc.useArmourCollectEquip=true;cfg.item.byDisplayName.Stone.type='armour'
+ local d=model('Stone');work.canCollect=function()return false end
+ call=function()d.Parent=false end
+ assert(work.collectModel(d,'chests',false,true)and inventory.Stone==0)
+end)
+test('inferior bags and swap tools are left on the ground without blocking chest completion',function()
+ cfg.bag.byId={old={lvl=1},new={lvl=2}};player.GetAttribute=function()return'new'end
+ cfg.item.byDisplayName.Stone.id='old';assert(not work.pickupEligible(model('Stone')))
+ cfg.tool={byDisplayName={Stone={useSwapUpgrade=true,toolType='axe',lvl=1},Axe={useSwapUpgrade=true,toolType='axe',lvl=2}}}
+ cfg.item.byDisplayName.Stone.id='stone';tools=function()return{{Name='Axe'}}end
+ assert(not work.pickupEligible(model('Stone')))
+ cfg.tool.byDisplayName.Stone.lvl=3;assert(work.pickupEligible(model('Stone')))
+end)
+test('executor without prompt dispatch uses the native open call only after the full hold',function()
+ local m=chest();local accepted=false;local requestedAt
+ local p={Enabled=true,HoldDuration=2,MaxActivationDistance=8,
+  Triggered={Connect=function()return{Disconnect=function()end}end},InputHoldBegin=function()end,InputHoldEnd=function()end}
+ m.FindFirstChildWhichIsA=function()return p end
+ loadBody('    function work.interactPrompt(', '    function work.collectModel(')
+ work.chestDuration=function()return .1 end
+ call=function(service,op,arg)
+  if service=='ItemCollect'then inventory[arg.Name]=1;arg.Parent=false;return end
+  if op=='isOpened'then return accepted elseif op=='requestOpen'then
+   assert(now>=2.35);requestedAt=now;accepted=true
+   later(.2,function()local d=model('Stone');d.attrs.ownerName=player.Name;sceneRows.drops={d}end)
+  end
+ end
+ assert(work.openChest()and requestedAt and inventory.Stone==1)
+end)
+test('survival interruption never falls through to a native open fallback',function()
+ local m=chest()
+ m.FindFirstChildWhichIsA=function()return{Enabled=true,HoldDuration=2,MaxActivationDistance=8,
+  Triggered={Connect=function()return{Disconnect=function()end}end},InputHoldBegin=function()later(.2,function()work.preempted=true end)end,InputHoldEnd=function()end}end
+ loadBody('    function work.interactPrompt(', '    function work.collectModel(')
+ call=function(_,op)assert(op~='requestOpen');return false end
+ assert(not work.openChest()and now<2 and not work.interaction)
+end)
+test('unknown animation cannot monopolize the default 90-second job budget',function()
+ opts.jobTimeout=90;local m=chest();local accepted=false
+ call=function(_,op)if op=='isOpened'then return accepted elseif op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now end end
+ assert(not work.openChest()and now>=15 and now<16 and not work.chestState(m).complete)
+end)
+test('an observed long animation extends the wait instead of being abandoned at 15 seconds',function()
+ opts.jobTimeout=90;local m=chest();local accepted=false
+ work.chestDuration=function()return 20 end
+ call=function(_,op)if op=='isOpened'then return accepted elseif op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now end end
+ assert(work.openChest()and now>=21 and now<22 and work.chestState(m).complete)
 end)
 os.clock=realClock
 assert(loadfile(path))
