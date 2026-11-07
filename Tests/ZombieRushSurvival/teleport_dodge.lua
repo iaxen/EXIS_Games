@@ -163,4 +163,9 @@ test('a landing needs a body-width edge margin rather than only the old 1.2-stud
  end
  assert(not h.app.teleportLanding(vec(20,3,20)))
 end)
+test('a brief build handoff prevents a dodge between consecutive placement holds',function()
+ local h=setup();assert(h.app.teleportDodgeTick());h.advance(.31);h.app.placementResumeAt=.39
+ assert(not h.app.teleportDodgeTick()and h.teleports()==1)
+ h.advance(.11);assert(h.app.teleportDodgeTick()and h.teleports()==2)
+end)
 print(tests..' simulated ground teleport, landing, prediction and firing checks passed')
