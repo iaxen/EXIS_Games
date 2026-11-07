@@ -484,6 +484,33 @@ test('an observed long animation extends the wait instead of being abandoned at 
  call=function(_,op)if op=='isOpened'then return accepted elseif op=='requestOpen'then accepted=true;work.chestState(m).acceptedAt=now end end
  assert(work.openChest()and now>=21 and now<22 and work.chestState(m).complete)
 end)
+test('a stalled task yields to its queued successor even when its own rank is higher',function()
+ loadBody('    function work.nextQueuedJob(', '    function work.checkpoint(')
+ local current={key='chests'};local nextJob={key='craft'}
+ work.pendingHandoff='craft';work.jobsByKey={craft=nextJob}
+ work.pick=function(jobs,_,_,urgent)
+  if urgent then return end
+  if #jobs==1 then return jobs[1],3.5 end
+  return current,1
+ end
+ assert(work.nextQueuedJob({current,nextJob},now)==nextJob and not work.pendingHandoff)
+end)
+test('emergency takes priority without discarding the pending routine handoff',function()
+ loadBody('    function work.nextQueuedJob(', '    function work.checkpoint(')
+ local emergency={key='eat'};work.pendingHandoff='craft'
+ work.pick=function(_,_,_,urgent)assert(urgent);return emergency,2 end
+ assert(work.nextQueuedJob({},now)==emergency and work.pendingHandoff=='craft')
+end)
+test('a disabled queued successor cannot lock the scheduler',function()
+ loadBody('    function work.nextQueuedJob(', '    function work.checkpoint(')
+ local disabled={key='craft'};local fallback={key='stockpile'}
+ work.pendingHandoff='craft';work.jobsByKey={craft=disabled}
+ work.pick=function(jobs,_,_,urgent)
+  if urgent or jobs[1]==disabled then return end
+  return fallback,7.8
+ end
+ assert(work.nextQueuedJob({fallback},now)==fallback and not work.pendingHandoff)
+end)
 os.clock=realClock
 assert(loadfile(path))
 print(passed..' AFK transaction checks passed; complete module compiles')

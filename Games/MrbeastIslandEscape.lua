@@ -5149,6 +5149,21 @@ local function runIslandEscape()
         end
         return best, bestScore
     end
+    function work.nextQueuedJob(jobs, now)
+        local pending=work.pendingHandoff
+        if not pending then return work.pick(jobs,now) end
+        -- Re-check emergencies before honoring a routine handoff. Keep the
+        -- handoff queued if survival work needs to run first.
+        local emergency,rank=work.pick(jobs,now,nil,true)
+        if emergency then return emergency,rank end
+        work.pendingHandoff=nil
+        local job=work.jobsByKey and work.jobsByKey[pending]
+        if job then
+            local ready,score=work.pick({job},now)
+            if ready then return ready,score end
+        end
+        return work.pick(jobs,now)
+    end
     function work.checkpoint(key)
         if not work.active or not work.currentJob or not work.jobs then return true end
         if work.preempted then return false end
@@ -5177,7 +5192,7 @@ local function runIslandEscape()
             work.skipJob = key
             job, rank = work.pick(work.jobs, now)
             work.skipJob = nil
-            if job then due[key] = now + 1 end
+            if job then due[key] = now + 1 work.pendingHandoff = job.key end
         end
         if job then
             if job.key == "evade" then work.captureEvadeIntent() end
@@ -6782,7 +6797,7 @@ local function runIslandEscape()
                 work.nextPriorityCheck = 0
                 local now = os.clock()
                 local job = safely("queue readiness", function()
-                    return work.pick(jobsList, now)
+                    return work.nextQueuedJob(jobsList, now)
                 end)
                 if fish.state ~= "idle" and flags.fish and job and work.rank(job) < work.rank(work.jobsByKey.fish) then
                     cancelFishing()
@@ -6825,7 +6840,7 @@ local function runIslandEscape()
                 work.failures = work.failures or {}
                 work.failures[job.key] = (acted or work.preempted) and 0 or (work.failures[job.key] or 0) + 1
                 local backoff = math.min(2, 0.15 * 2 ^ math.min(4, work.failures[job.key]))
-                due[job.key] = os.clock() + (work.preempted and 0 or (acted and 0 or backoff))
+                due[job.key] = math.max(due[job.key] or 0, os.clock() + (work.preempted and 0 or (acted and 0 or backoff)))
                 if work.preempted then
                     local nextKey = work.preempted.to
                     due[nextKey] = os.clock()
