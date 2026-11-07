@@ -6,7 +6,7 @@ function Core.allowed(record,options,assets)
     if not info or options.excluded[record.AreaId] or options.excludedPets[record.AssetCategory] then return false end
     local rarity=info.Rarity and info.Rarity._id
     if options.rarities[rarity]==false then return false end
-    return record.State=="Slot" or record.State=="Dropped" or record.State=="GuardCarried"
+    return record.State=="Slot" or record.State=="Dropped"
 end
 function Core.choose(records,options,assets,position,blocked,now)
     local best,rank,distance
@@ -22,6 +22,14 @@ function Core.choose(records,options,assets,position,blocked,now)
 end
 function Core.firstSlot(record)
     if record.Uid:sub(1,13)=="FirstAreaEgg_" then return record.AreaId..":"..record.NestId end
+end
+function Core.claimReceipt(uid,category,before,after)
+    if after[uid] and not before[uid] then return true end
+    if not category then return false end
+    for id,record in pairs(after)do
+        if not before[id] and record.AssetCategory==category then return true end
+    end
+    return false
 end
 function Core.count(t)local n=0 for _ in pairs(t or {})do n=n+1 end return n end
 function Core.fuseGroup(inventory,equipped,assets,kernel,inputCount)
@@ -187,6 +195,59 @@ local function stopTraining()
     if ok==true then state.training=false return true end
     note("Treadmill exit unconfirmed; movement waits")return false
 end
+local function findPickupPrompt(uid)
+    for _,obj in ipairs(workspace:GetDescendants())do
+        if obj:IsA("ProximityPrompt") and obj.Name=="CarryAreaEgg" and obj.Enabled then
+            local ancestor=obj.Parent
+            while ancestor and ancestor~=workspace do
+                if ancestor.Name==uid then return obj end
+                ancestor=ancestor.Parent
+            end
+        end
+    end
+end
+local function promptPosition(prompt)
+    local parent=prompt.Parent
+    if parent and parent:IsA("Attachment")then return parent.WorldPosition end
+    if parent and parent:IsA("BasePart")then return parent.Position end
+end
+local function pickupEgg(egg)
+    local prompt,nextSearch=nil,0
+    if not await(function()
+        if os.clock()<nextSearch then return false end
+        nextSearch=os.clock()+.4;prompt=findPickupPrompt(egg.Uid);return prompt~=nil
+    end,4)then
+        note("No enabled CarryAreaEgg prompt for "..egg.Uid.."; not running home")return false
+    end
+    local r,h=character();local at=promptPosition(prompt)
+    if not r or not at then return false end
+    local reach=math.min(8,prompt.MaxActivationDistance)
+    if (r.Position-at).Magnitude>reach-1 then r.CFrame=CFrame.new(at+Vector3.new(2,1,0))end
+    h:MoveTo(r.Position)
+    h:UnequipTools()
+    local dispatched=false
+    local connection=prompt.Triggered:Connect(function(who)if who==player then dispatched=true end end)
+    state.pickupPending={uid=egg.Uid,at=os.clock()}
+    state.collectionHoldUntil=os.clock()+20
+    local ok,result=pcall(function()
+        if not prompt.Enabled or (r.Position-at).Magnitude>reach then return false end
+        prompt:InputHoldBegin()
+        if not pause(math.max(0,tonumber(prompt.HoldDuration)or 1.2))then return false end
+        prompt:InputHoldEnd()
+        if not dispatched and not carrying().IsCarrying then
+            if type(fireproximityprompt)=="function"then fireproximityprompt(prompt,prompt.HoldDuration)
+            elseif type(firesignal)=="function"then firesignal(prompt.Triggered,player)
+            else note("Pickup input unavailable: fireproximityprompt / firesignal missing")return false end
+        end
+        return await(function()local carry=carrying();return carry.IsCarrying and carry.Uid==egg.Uid end,5)
+    end)
+    pcall(function()prompt:InputHoldEnd()end)
+    connection:Disconnect()
+    if not ok then note("Pickup input failed: "..tostring(result))end
+    if ok and result then state.pickupPending=nil;state.collectionHoldUntil=nil;note("Pickup confirmed: "..egg.Uid)return true end
+    note("Pickup unconfirmed; staying at egg while reconciling")
+    return false
+end
 local function returnEgg()
     local carry=carrying();if not carry.IsCarrying then return false end
     if not stopTraining()then return false end
@@ -205,11 +266,12 @@ local function returnEgg()
     local before=api.eggs.ReadOwnerEggs(player.UserId)
     walk(base.PetArea.Position+Vector3.new(0,3,0),carry.Uid)
     if await(function()return not carrying().IsCarrying end,3)then
-        local owned=api.eggs.ReadOwnerEggs(player.UserId)
-        if owned[carry.Uid] or Core.count(owned)>Core.count(before)then
-            state.claimed=state.claimed+1;note("Egg redeemed at own base")return true
+        if await(function()
+            return Core.claimReceipt(carry.Uid,carry.AssetCategory,before,api.eggs.ReadOwnerEggs(player.UserId))
+        end,4)then
+            state.claimed=state.claimed+1;state.pickupPending=nil;note("Egg redeemed at own base")return true
         end
-        note("Carry ended without ownership receipt; egg may have been lost")
+        note("Carry ended without matching ownership receipt; egg may have been lost")
     end
     return false
 end
@@ -219,24 +281,22 @@ local function stealEgg()
     local owned=api.eggs.ReadOwnerEggs(player.UserId)
     if Core.count(owned)>=115 then note("Egg inventory full; hatch before stealing")return false end
     local records=api.eggs.ReadFieldEggs().Records
+    state.pickupAttempted=false
     local egg=Core.choose(records,options,api.assets.Directory,r.Position,blocked,os.clock())
     if not egg then return false end
+    state.pickupAttempted=true
     if not stopTraining()then return false end
     -- Only approach is teleported. Carried return movement never changes CFrame.
     if workspace.StreamingEnabled then pcall(function()player:RequestStreamAroundAsync(egg.BottomCFrame.Position,2)end)end
+    h:MoveTo(r.Position)
     r.CFrame=egg.BottomCFrame+Vector3.new(3,3,0)
+    h:MoveTo(r.Position)
     if not pause(.2)then return false end
     local live=api.eggs.ReadFieldEgg(egg.Uid)
     if not live or not Core.allowed(live,options,api.assets.Directory)then return false end
     if (r.Position-live.BottomCFrame.Position).Magnitude>8 then return false end
-    h:UnequipTools()
-    -- Same minimum as CarryAreaEgg; use the native method exactly once afterward.
-    if not pause(workspace:GetAttribute("FastEggPickupTime") and .25 or 1.2)then return false end
-    local ok,message=call("carry",api.eggs.CarryFieldEgg,egg.Uid,Core.firstSlot(egg))
-    if ok~=true then blocked[egg.Uid]=os.clock()+8;note("Steal rejected: "..tostring(message))return false end
-    if not await(function()local c=carrying()return c.IsCarrying and c.Uid==egg.Uid end,3)then
-        blocked[egg.Uid]=os.clock()+8;note("Carry receipt missing; reconciling before retry")return false
-    end
+    state.pickupAttempted=true
+    if not pickupEgg(live)then blocked[egg.Uid]=os.clock()+8;return false end
     return returnEgg()
 end
 local function plantOrHatch()
@@ -747,6 +807,7 @@ local function diagnosticsText()
   "Health "..tostring(h and math.floor(h.Health)).." | Save "..tostring(data~=nil).." | Base "..tostring(plot()~=nil),
   "Carrying "..tostring(carry.IsCarrying).." | Owned eggs "..Core.count(api.eggs.ReadOwnerEggs(player.UserId)),
   "Delivered "..state.claimed.." | Hatched "..state.hatches.." | Training "..tostring(state.training),
+  "Pickup "..tostring(state.pickupPending and state.pickupPending.uid or "none"),
   "Pending "..(#p>0 and table.concat(p,", ")or"none"),"Modules "..table.concat(modules,", "),
   "Hatch input "..tostring(type(fireproximityprompt)=="function").." | Files "..tostring(type(writefile)=="function"),
   "Native preferences "..tostring(preferences~=nil),"Recent log:",table.concat(state.trace,"\n")},"\n")
@@ -883,14 +944,20 @@ local function periodic(key,seconds,fn)
  if not ok then note(key..": "..tostring(result))return false end
  return result==true
 end
--- A single worker owns movement and requests. Carrying always finishes first.
-task.spawn(function()
- while alive do
-  if not active()then
-   if state.training then periodic("stop training",3,stopTraining)end
-  else
-   local ok,err=pcall(function()
-    if carrying().IsCarrying then returnEgg();return end
+local function farmStep()
+    if carrying().IsCarrying then state.pickupPending=nil;state.collectionHoldUntil=nil;returnEgg();return end
+    if state.pickupPending then
+     local attempt=state.pickupPending
+     if os.clock()-attempt.at<12 then state.job="waiting for pickup receipt";return end
+     blocked[attempt.uid]=os.clock()+8;state.pickupPending=nil
+     note("Pickup expired without carry receipt; retrying collection, not training")
+     return
+    end
+    if state.collectionHoldUntil and os.clock()<state.collectionHoldUntil then
+     state.job="retrying egg pickup"
+     if options.steal then periodic("steal",1,stealEgg)end
+     return
+    end
     if state.refreshSnapshots then
      state.refreshSnapshots=nil
      call("field sync",api.eggs.SyncFieldEggs)
@@ -908,9 +975,19 @@ task.spawn(function()
     if options.rewards then periodic("index",30,function()return rpc("Codex","AskRedeemAll")==true end)end
     if options.fusion then periodic("fusion",15,fuse)end
     if options.events and periodic("events",12,eventCollect)then return end
-    if options.steal and periodic("steal",1,stealEgg)then return end
+    if options.steal then
+     state.pickupAttempted=false
+     if periodic("steal",1,stealEgg)or state.pickupAttempted then return end
+    end
     if options.treadmill then periodic("training",3,train)end
-   end)
+end
+-- A single worker owns movement and requests. Carrying always finishes first.
+task.spawn(function()
+ while alive do
+  if not active()then
+   if state.training then periodic("stop training",3,stopTraining)end
+  else
+   local ok,err=pcall(farmStep)
    if not ok then note("Worker error: "..tostring(err))end
   end
   task.wait(.15)
