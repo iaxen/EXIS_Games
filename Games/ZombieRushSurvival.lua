@@ -304,7 +304,8 @@ end
 
 function Core.plan(poly, specs, limit, existing, yieldWork, middleSpacing)
     existing = existing or {}
-    limit = math.max(0,math.min(512,math.floor(limit)))
+    -- No runtime count cap: the selected geometry and native affordability bound placement.
+    limit = Core.finite(limit) and math.max(0,math.floor(limit)) or math.huge
     middleSpacing = Core.finite(middleSpacing) and math.max(6,math.min(40,middleSpacing)) or 12
     if not Core.validPolygon(poly) then return {}, "SELECT A VALID AREA" end
     local minX,maxX,minZ,maxZ,y=math.huge,-math.huge,math.huge,-math.huge,0
@@ -551,9 +552,11 @@ function Core.teleportClearance(point, mobs, horizon)
     for _, mob in ipairs(mobs) do
         local from={x=mob.x,z=mob.z}
         local to={x=mob.x+(mob.vx or 0)*horizon,z=mob.z+(mob.vz or 0)*horizon}
-        local distance=Core.edgeDistance(point,from,to)
-        clearance=math.min(clearance,distance)
-        margin=math.min(margin,distance-math.max(0,mob.range or 3)-3)
+        if not point.y or not mob.point or math.abs(point.y-mob.point.Y) <= math.max(8,(mob.range or 3)+4) then
+            local distance=Core.edgeDistance(point,from,to)
+            clearance=math.min(clearance,distance)
+            margin=math.min(margin,distance-math.max(0,mob.range or 3)-3)
+        end
     end
     return clearance,margin
 end
@@ -701,22 +704,20 @@ local function run()
     local cfg = {version = 1, layoutVersion = 2, enabled = true, autoSkip = false, buyClasses = {}, upgradeClasses = {},
         buyWeapons = {}, upgradeWeapons = {}, loadout = {}, autoLoadout = false,
         health = false, gun = false, melee = false, autoPlace = false, defenseTypes = {},
-        regions = {}, showBoundary = false, maxDefenses = 256, middleSpacing = 12, reserveCash = 0, fight = false, fly = false, turretLeash = 20,
+        regions = {}, showBoundary = false, middleSpacing = 12, reserveCash = 0, fight = false, fly = false, turretLeash = 20,
         headAim = true, bossFirst = true, dodgeTeleport = true, dodgeClearance = 35, dodgeInterval = 0.3, clearance = 14, moveMode = "Smooth", placeSpawnArea = false, fireInput = "Mobile", flyHeight = 14, orbitRadius = 16, flySpeed = 32}
     local file = storage.path("EXIS_ZombieRushSurvival_" .. player.UserId .. ".json")
     if type(readfile) == "function" then
         local ok, data = pcall(function() if storage.exists(file) then return Http:JSONDecode(storage.read(file)) end end)
         if ok and type(data) == "table" and data.version == 1 then
             for key, value in pairs(data) do if type(value) == type(cfg[key]) then cfg[key] = value end end
-            -- The original 18-slot default cannot support the requested four-row
-            -- perimeter. Preserve other explicit limits when migrating old saves.
-            if data.layoutVersion~=2 and data.maxDefenses==18 then cfg.maxDefenses=256 end
             cfg.layoutVersion=2
         end
     end
     -- Migrate old hover saves: combat now uses grounded dodging.
+    cfg.maxDefenses = nil -- Ignore legacy per-player limits, including saved values.
     cfg.fly, cfg.moveMode, cfg.placeSpawnArea = false, "Ground", false
-    for key, limits in pairs({dodgeClearance = {3,40}, dodgeInterval = {.12,1}, turretLeash = {8, 60}, maxDefenses = {1, 512}, middleSpacing = {6,40}, reserveCash = {0, 1e12}, flyHeight = {5, 50},
+    for key, limits in pairs({dodgeClearance = {3,40}, dodgeInterval = {.12,1}, turretLeash = {8, 60}, middleSpacing = {6,40}, reserveCash = {0, 1e12}, flyHeight = {5, 50},
         orbitRadius = {6, 90}, flySpeed = {8, 100}, clearance = {8, 60}}) do
         local value = cfg[key]
         cfg[key] = Core.finite(value) and math.clamp(value, limits[1], limits[2]) or limits[1]
@@ -945,11 +946,16 @@ local function run()
             local first = app.placementTask and app.placementTask.slot.role == "turret" and app.placementTask
                 or app.getPlacement("turret", true)
             if first then
-                if not first.affordable then app.note("economy", "SAVING FOR FIRST TURRET") app.buildGoal = nil return end
-                app.placementTask = first
-                local result = app.placeTick()
-                if result ~= nil then app.placementTask = nil end
-                return
+                if not first.affordable then
+                    first = app.getPlacement()
+                    if not first then app.note("economy", "WAITING FOR DEFENSE FUNDS / SPACE") app.buildGoal = nil end
+                end
+                if first then
+                    app.placementTask = first
+                    local result = app.placeTick()
+                    if result ~= nil then app.placementTask = nil end
+                    return
+                end
             end
         end
         if app.placementTask and not boss then
@@ -958,33 +964,17 @@ local function run()
             if app.matchMix and app.placementKey then Core.finishChoice(app.matchMix, app.placementKey) end
             app.placementTask, app.placementKey = nil, nil
         end
-        local keys, choices = {}, {}
-        for _, name in ipairs({"health", "gun", "melee"}) do
-            if app.upgradeCandidate(name) then keys[#keys + 1] = "upgrade:" .. name end
-        end
         if cfg.autoPlace and not boss then
-            local seen = {}
-            for _, slot in ipairs(app.layout()) do
-                if not seen[slot.name] then
-                    seen[slot.name] = true
-                    local candidate = app.getPlacement(slot.name)
-                    if candidate then
-                        local key = "place:" .. slot.name
-                        keys[#keys + 1], choices[key] = key, candidate
-                    end
-                end
+            local candidate = app.getPlacement()
+            if candidate then
+                app.placementTask = candidate
+                local result = app.placeTick()
+                if result ~= nil then app.placementTask = nil end
+                return
             end
         end
-        app.matchMix = app.matchMix or {}
-        local key = Core.fairChoice(app.matchMix, keys)
-        if not key then app.buildGoal = nil return end
-        if choices[key] then
-            app.placementTask, app.placementKey = choices[key], key
-            local result = app.placeTick()
-            if result == nil then return end
-            app.placementTask, app.placementKey = nil, nil
-        else app.upgradeTick(key:sub(9)) end
-        Core.finishChoice(app.matchMix, key)
+        app.buildGoal = nil
+        app.upgradeTick()
     end
     function app.skipTick()
         if app.mode ~= "MATCH" or not app.alive or not app.root() or app.editing then return end
@@ -1214,7 +1204,13 @@ local function run()
     end
     function app.inPlayableMap(point)
         local nav = app.navigation()
-        return #nav.hull >= 3 and Core.inside({x = point.X, z = point.Z}, nav.hull)
+        if #nav.hull >= 3 and Core.inside({x = point.X, z = point.Z}, nav.hull) then return true end
+        if cfg.autoPlace and app.buildGoal then
+            local poly = app.placementRegion().points or {}
+            return Core.validPolygon(poly) and Core.inside({x=point.X,z=point.Z}, poly)
+                and math.abs(point.Y - app.buildGoal.Y) <= 5
+        end
+        return false
     end
     function app.travelHit(origin, direction)
         if direction.Magnitude < 0.01 then return nil end
@@ -1380,32 +1376,53 @@ local function run()
     end
     function app.layout()
         local boxes = app.defenseBoxes()
-        local signatures, owned = {}, 0
+        local signatures = {}
         for _, box in ipairs(boxes) do
             signatures[#signatures+1] = table.concat({box.name or "?",box.x,box.z,box.w,box.d},":")
-            if box.owned then owned = owned + 1 end
         end
         for _, row in pairs(app.pendingPlacements or {}) do
             if os.clock() < row.expires then
                 local found = false
                 for _, box in ipairs(boxes) do if Core.overlap(row.slot,box,0) then found = true break end end
-                if not found then boxes = {table.unpack(boxes)};boxes[#boxes+1] = row.slot;owned = owned+1 end
+                if not found then boxes = {table.unpack(boxes)};boxes[#boxes+1] = row.slot end
                 signatures[#signatures+1] = "pending:"..row.slot.name..":"..row.slot.x..":"..row.slot.z
             end
         end
         table.sort(signatures)
-        local key = app.mapId .. ":" .. tostring(app.className) .. ":" .. app.revision .. ":" .. table.concat(signatures,";")
+        local selected = {}
+        for name, enabled in pairs(cfg.defenseTypes or {}) do selected[#selected+1] = name .. ":" .. tostring(enabled) end
+        table.sort(selected)
+        -- Templates may arrive after map/class data. Include the resolved specs
+        -- so a temporarily empty layout does not stay cached for the whole run.
+        local specs, specKeys = app.specs(), {}
+        for _, spec in ipairs(specs) do
+            specKeys[#specKeys+1] = table.concat({spec.name,spec.w,spec.d,spec.grid or 1,spec.range or 0}, ":")
+        end
+        local shape = tostring(cfg.middleSpacing) .. ":" .. table.concat(selected, ",") .. ":" .. table.concat(specKeys, ",")
+        local key = app.mapId .. ":" .. tostring(app.className) .. ":" .. app.revision .. ":" .. shape .. ":" .. table.concat(signatures,";")
         if key == app.planKey then return app.plan or {} end
-        local specs = app.specs()
         local map, class, revision = app.mapId, app.className, app.revision
         local poly = app.placementRegion().points or {}
-        local plan, reason, reserve, coverage = Core.plan(poly, specs, math.max(0,cfg.maxDefenses-owned), boxes,function()
-            task.wait()
-            if not app.alive or app.mapId ~= map or app.className ~= class or app.revision ~= revision then error("LAYOUT CHANGED; REPLANNING") end
-        end,cfg.middleSpacing)
+        local blueprintKey = map .. ":" .. tostring(class) .. ":" .. revision .. ":" .. shape
+        if app.blueprintKey ~= blueprintKey then
+            local plan, reason, reserve, coverage = Core.plan(poly, specs, nil, {}, function()
+                task.wait()
+                if not app.alive or app.mapId ~= map or app.className ~= class or app.revision ~= revision then error("LAYOUT CHANGED; REPLANNING") end
+            end, cfg.middleSpacing)
+            if app.mapId ~= map or app.className ~= class or app.revision ~= revision then return {} end
+            app.blueprintKey, app.blueprint, app.blueprintReason = blueprintKey, plan, reason
+            app.reserve, app.planCoverage = reserve, coverage
+        end
+        local plan = {}
+        for _, slot in ipairs(app.blueprint or {}) do
+            local occupied = false
+            for _, box in ipairs(boxes) do if Core.overlap(slot, box, 0) then occupied = true break end end
+            if not occupied then plan[#plan+1] = slot end
+        end
         if app.mapId ~= map or app.className ~= class or app.revision ~= revision then return {} end
-        app.plan, app.planKey, app.reserve, app.planCoverage = plan, key, reserve, coverage
-        app.note("layout", reason .. " · " .. #plan .. " NEW SLOTS")
+        app.plan, app.planKey = plan, key
+        app.note("layout", #plan == 0 and "AREA FULL / NO FITTING SLOTS; WAITING FOR FREE SPACE"
+            or app.blueprintReason .. " · " .. #plan .. " FREE SLOTS")
         return plan
     end
     function app.coverageStatus()
@@ -1457,16 +1474,15 @@ local function run()
         end
         return false
     end
+    function app.placementSafe(point)
+        local _, margin = Core.teleportClearance({x=point.X,y=point.Y,z=point.Z}, app.enemyRows(), .3)
+        return margin >= 2
+    end
     function app.getPlacement(preferred, allowUnfunded)
         if os.clock() < (app.next.place or 0) then return nil end
         if app.mode ~= "MATCH" or not cfg.autoPlace or app.editing or app.mapId == "Unknown" or not app.className then return nil end
         local client = app.module(app.find(player, "PlayerScripts", "Client"), "DeployableSystem")
-        if not client then return nil end
-        local folder, ownedCount = workspace:FindFirstChild("Deployables"), 0
-        for _, model in ipairs(folder and folder:GetChildren() or {}) do
-            if model:GetAttribute("OwnerUserId") == player.UserId and model:GetAttribute("Destroyed") ~= true then ownedCount = ownedCount + 1 end
-        end
-        if ownedCount >= cfg.maxDefenses then return nil end
+        if not client then app.note("defense", "WAITING FOR NATIVE DEPLOYABLE MODULE") return nil end
         local choices,root = {},app.root()
         for _,slot in ipairs(app.layout())do
             local key=app.mapId..":"..app.revision..":"..slot.name..":"..slot.x..":"..slot.z..":"..slot.facing
@@ -1485,15 +1501,22 @@ local function run()
         local prices={}
         -- A large layered layout must not perform hundreds of floor/risk
         -- queries per class type on every worker tick.
-        for index=1,math.min(32,#choices)do
+        local checked = 0
+        local map, class, revision = app.mapId, app.className, app.revision
+        for index=1,#choices do
             local row=choices[index];local slot=row.slot
             if not app.occupied(slot)then
                 local price=prices[slot.name]
                 if not price then local currency,cost=client.GetCurrentPrice(slot.name);price={currency,cost};prices[slot.name]=price end
                 local affordable=app.afford(price[1],price[2])
                 if affordable or allowUnfunded then
+                    checked = checked + 1
+                    if checked % 32 == 0 then
+                        task.wait()
+                        if not app.active() or app.editing or app.mapId ~= map or app.className ~= class or app.revision ~= revision then return nil end
+                    end
                     local hit=app.ground(slot.x,slot.z,slot.y)
-                    if hit and app.inPlayableMap(hit.Position)and app.airRisk(hit.Position)==0 then
+                    if hit and app.placementSafe(hit.Position) then
                         return{key=row.key,slot=slot,point=hit.Position,class=app.className,map=app.mapId,
                             revision=app.revision,affordable=affordable}
                     end
@@ -1513,26 +1536,32 @@ local function run()
         end
         local root, human = app.root()
         if not root then return false end
-        if app.airRisk(root.Position) > 0 or app.airRisk(candidate.point) > 0 then app.buildGoal = nil return false end
+        if not app.placementSafe(root.Position) or not app.placementSafe(candidate.point) then
+            app.buildGoal = nil app.note("defense", "WAITING FOR SAFE PLACEMENT OPENING") return false
+        end
+        local spec = candidate.slot.spec
+        local maxDistance = placement.GetPlacementDistances(spec.info, spec.grid or 1)
+        local inRange = (root.Position - candidate.point).Magnitude <= maxDistance
+        -- The native range is to the requested surface point. Do not force a
+        -- move to an arbitrary side/height when we can already place safely.
         local lift = human.HipHeight + root.Size.Y / 2
         local outward = Vector3.new(root.Position.X - candidate.point.X, 0, root.Position.Z - candidate.point.Z)
         if outward.Magnitude < 0.1 then outward = Vector3.new(1, 0, 0) end
         local side = candidate.point + outward.Unit * math.min(8, math.max(candidate.slot.w, candidate.slot.d) / 2 + 3)
         local sideHit = app.ground(side.X, side.Z, candidate.point.Y)
         local stand = (sideHit and sideHit.Position or candidate.point) + Vector3.new(0, lift, 0)
-        if app.airRisk(stand) > 0 or not app.inPlayableMap(stand) then
+        if not inRange and not app.placementSafe(stand) then
             local safe
             for i = 0, 7 do
                 local angle = i * math.pi / 4
                 local probe = candidate.point + Vector3.new(math.cos(angle) * 7, 0, math.sin(angle) * 7)
                 local floor = app.ground(probe.X, probe.Z, candidate.point.Y)
-                if floor and app.airRisk(floor.Position) == 0 and app.inPlayableMap(floor.Position) then safe = floor.Position + Vector3.new(0, lift, 0) break end
+                if floor and app.placementSafe(floor.Position) then safe = floor.Position + Vector3.new(0, lift, 0) break end
             end
             if not safe then return false end
             stand = safe
         end
-        local delta = stand - root.Position
-        if delta.Magnitude > 10 or math.abs(root.Position.Y - stand.Y) > 2 then
+        if not inRange then
             app.buildGoal = stand
             app.note("defense", "MOVING INTO PLACEMENT RANGE")
             return nil
@@ -1541,18 +1570,22 @@ local function run()
         -- Re-check after movement; selection, class, occupancy and cash can change.
         if candidate.class ~= app.className or candidate.map ~= app.mapId or candidate.revision ~= app.revision
             or not cfg.autoPlace or not app.active() or app.occupied(candidate.slot) then return false end
-        local spec = candidate.slot.spec
         local region = app.placementRegion()
         if not Core.fits(candidate.slot, candidate.slot.w, candidate.slot.d, region.points or {}, true) then return false end
         local client = app.module(app.find(player, "PlayerScripts", "Client"), "DeployableSystem")
         if not client then return false end
         local currency, price = client.GetCurrentPrice(candidate.slot.name)
         if not app.afford(currency, price) then return false end
+        app.stopWalk()
+        app.placing = true
         local result = app.invoke("place", app.find(RS, "DeployableSystem_Remotes", "Place"),
             candidate.slot.name, candidate.point, {Facing = candidate.slot.facing or spec.facing})
+        app.placing = false
         if type(result) == "table" and result.ok == true then
             app.pendingPlacements = app.pendingPlacements or {}
             app.pendingPlacements[candidate.key] = {slot = candidate.slot, expires = os.clock() + 5}
+            app.next.place = os.clock()
+            app.defenseCache = nil
             app.note("defense", "PLACED " .. candidate.slot.name:upper())
         elseif result then
             app.rejected[candidate.key] = os.clock() + 8
@@ -1871,24 +1904,27 @@ local function run()
         local mobs=app.enemyRows()
         if #mobs==0 and not app.buildGoal then return false end
         local horizon=math.max(.15,cfg.dodgeInterval or .3)
-        local _,currentMargin=Core.teleportClearance({x=root.Position.X,z=root.Position.Z},mobs,horizon)
+        local _,currentMargin=Core.teleportClearance({x=root.Position.X,y=root.Position.Y,z=root.Position.Z},mobs,horizon)
         local emergency=currentMargin<2 or now<(app.damageEvadeUntil or 0)
+        if app.placing and not emergency then return false end
         if now<(app.next.dodgeTeleport or 0)and not(emergency and now-(app.lastDodgeAt or -10)>=.12)then return false end
         local candidates,seen={},{}
         app.dodgeRejected=app.dodgeRejected or {}
         for key,expires in pairs(app.dodgeRejected)do if expires<=now then app.dodgeRejected[key]=nil end end
         local turret=app.turretAnchor()
+        -- Hold a safe arrived approach for the worker to issue its placement.
+        if app.buildGoal and (root.Position-app.buildGoal).Magnitude <= 3 and not emergency then return false end
         local function candidate(point,build)
             local dx,dz=point.X-root.Position.X,point.Z-root.Position.Z
             local distance=math.sqrt(dx*dx+dz*dz)
             if distance<(build and 3 or 10)or not app.inPlayableMap(point)then return end
             local key=math.floor(point.X/2)..":"..math.floor(point.Z/2)
             if seen[key]or app.dodgeRejected[key]then return end;seen[key]=true
-            local clearance,margin=Core.teleportClearance({x=point.X,z=point.Z},mobs,horizon)
+            local clearance,margin=Core.teleportClearance({x=point.X,y=point.Y,z=point.Z},mobs,horizon)
             if margin<2 then return end -- A smaller opening must still clear native attack reach.
             local preferred=clearance>=(cfg.dodgeClearance or 35)
             local score=(preferred and 100000 or 0)+math.min(100,margin)*100-distance*.05
-            if build then score=score+500 end
+            if build then score=score+200000 end
             if turret and(point-turret.point).Magnitude<=turret.radius then score=score+25 end
             for _,old in ipairs(app.dodgeHistory or {})do
                 if now-old.at<3 and(point-old.point).Magnitude<16 then score=score-800 end
@@ -1920,7 +1956,7 @@ local function run()
             if landing and app.active()and cfg.fight and cfg.dodgeTeleport then
                 -- Re-read both threats and character after all ground queries.
                 local fresh=app.root()
-                local _,margin=Core.teleportClearance({x=landing.X,z=landing.Z},app.enemyRows(),horizon)
+                local _,margin=Core.teleportClearance({x=landing.X,y=landing.Y,z=landing.Z},app.enemyRows(),horizon)
                 if fresh==root and margin>=2 and not root.Anchored then
                     human:MoveTo(root.Position)
                     root.CFrame=CFrame.new(landing)*root.CFrame.Rotation
@@ -1951,6 +1987,9 @@ local function run()
             app.orbitDirection = -(app.orbitDirection or 1)
         end
         app.observedHealth = human and human.Health
+        -- Do not leave native range while the server is processing a placement.
+        -- An incoming threat can still interrupt this brief hold.
+        if app.placing and root and app.placementSafe(root.Position) then return end
         local teleportMode=cfg.fight and cfg.dodgeTeleport
         if teleportMode then app.stopWalk();app.teleportDodgeTick() end
         local danger = not teleportMode and root and (app.airRisk(root.Position) > 0 or os.clock() < (app.damageEvadeUntil or 0))
@@ -2319,13 +2358,13 @@ end
     ui.toggle(upgrades, "AUTO HEALTH", cfg, "health")
     ui.toggle(upgrades, "AUTO GUN TIER", cfg, "gun")
     ui.toggle(upgrades, "AUTO MELEE", cfg, "melee")
-    ui.textLabel(upgrades, "Turret first, then mixed placements and upgrades. Low HP prioritizes health.", 30)
+    ui.textLabel(upgrades, "Low HP prioritizes health. Build affordable defenses first; upgrades run while waiting for funds or space.", 30)
     local upgradeState = ui.textLabel(upgradesPage, "", 50)
     function ui.buildDefenses()
         for _, child in ipairs(defensePage:GetChildren()) do if child:IsA("GuiObject") then child:Destroy() end end
         local group = ui.group(defensePage, "AUTO DEFENSE")
         ui.toggle(group, "AUTO PLACE CURRENT CLASS", cfg, "autoPlace")
-        ui.number(group, "MAX OWNED DEFENSES", "maxDefenses", 1, 512)
+        ui.textLabel(group, "NO COUNT LIMIT · Build when affordable; replace destroyed defenses when space opens.", 44)
         ui.number(group, "MIDDLE DEFENSE SPACING", "middleSpacing", 6, 40)
         ui.textLabel(group, "1 barricade row + 3 turret rows. Spaced middle barricades with nearby turrets; no solid center fill.", 44)
         app.coverageLabel = ui.textLabel(group,"SELECT A MAP PART FIRST",44)
@@ -2602,7 +2641,7 @@ end
                 if before ~= app.mapId .. tostring(app.className) .. app.mode then
                     if app.mapView and app.mapView.map ~= app.mapId then app.closeMapEditor(false) end
                     app.planKey, app.target, app.buildGoal, app.surface, app.defenseCache = nil, nil, nil, nil, nil
-                    app.rejected, app.pendingPlacements = {}, {}
+                    app.rejected, app.pendingPlacements, app.blueprintKey = {}, {}, nil
                     app.enemyCache, app.airGoal, app.navCache, app.spawnAnchor = nil, nil, nil, nil
                     app.turretCache, app.groundRouteCache, app.walkGoal, app.observedHealth = nil, nil, nil, nil
                     app.matchMix, app.placementTask = nil, nil

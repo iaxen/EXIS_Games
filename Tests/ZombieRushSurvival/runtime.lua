@@ -15,11 +15,11 @@ local function setup()
  local events={};local enum={UserInputType={MouseButton1=1},UserInputState={Begin=1},KeyCode={Unknown=0}}
  local environment=setmetatable({app=app,cfg=cfg,Core={fits=function()return true end},Vector3={new=v},Enum=enum,
   os={clock=function()return now end},RS={},UIS={InputEnded='ended'},player={},classes={},maps={AvailableData={Map1={DisplayName='Skyline'},Map2={DisplayName='Crystal Cave'}}},
-  game={PlaceId=87413622775071},workspace={GetAttribute=function()return'Map2'end},
+  placement={GetPlacementDistances=function()return 18 end},game={PlaceId=87413622775071},workspace={GetAttribute=function()return'Map2'end},
   firesignal=function(signal,token)events[#events+1]={signal=signal,token=token}end},{__index=_G})
  app.root=function()return{Position=v(7,3,0),Size=v(2,2,2)},{HipHeight=2}end
- app.module=function()return{GetCurrentPrice=function()return'Cash',10 end}end;app.afford=function()return true end;app.airRisk=function()return 0 end;app.inPlayableMap=function()return true end;app.find=function()return{}end
- app.note=function()end;app.region=function()return{points={}}end
+ app.module=function()return{GetCurrentPrice=function()return'Cash',10 end}end;app.afford=function()return true end;app.airRisk=function()return 0 end;app.placementSafe=function()return true end;app.inPlayableMap=function()return true end;app.find=function()return{}end
+ app.stopWalk=function()end;app.note=function()end;app.region=function()return{points={}}end
  app.occupied=function()return false end;app.active=function()return true end;app.placementRegion=app.region
  app.ground=function(x,z,y)return{Position=v(x,y,z)}end
  app.invoke=function(key,remote,...)events[#events+1]={key=key,args={...}};return{ok=true}end
@@ -90,5 +90,53 @@ end)
 test('native mouse mode works without a mobile fire button',function()
  local h=setup();h.cfg.fireInput='Native';h.env.UIS.InputBegan='nativeBegin';h.app.fireButton=function()return nil end
  h.app.holdFire(h.tool,{Automatic=true});assert(h.app.held and h.events[1].signal=='nativeBegin')
+end)
+test('native range allows placement without first reaching the arbitrary side spot',function()
+ local h=setup();h.app.root=function()return{Position=v(16,3,0),Size=v(2,2,2)},{HipHeight=2}end
+ assert(h.app.placeTick()==true and #h.events==1 and not h.app.buildGoal)
+ assert(h.app.next.place==0)
+end)
+test('unsafe placement waits without spending and resumes as soon as safe',function()
+ local h=setup();h.app.placementSafe=function()return false end
+ assert(h.app.placeTick()==false and #h.events==0)
+ h.app.placementSafe=function()return true end
+ assert(h.app.placeTick()==true and #h.events==1)
+end)
+test('money is rechecked immediately before placing',function()
+ local h=setup();h.app.afford=function()return false end
+ assert(h.app.placeTick()==false and #h.events==0)
+end)
+test('the selector reaches affordable slots beyond the first thirty-two expensive slots',function()
+ local h=setup();h.cfg.maxDefenses=1
+ local plan={}
+ for n=1,40 do plan[n]={name=n<=32 and 'Expensive' or 'Cheap',x=n,y=0,z=0,facing=0,layer='BARRICADE'}end
+ h.app.layout=function()return plan end
+ h.app.module=function()return{GetCurrentPrice=function(name)return'Cash',name=='Cheap'and 10 or 10000 end}end
+ h.app.afford=function(_,price)return price<=10 end
+ h.env.task={wait=function()end}
+ assert(load(extract('    function app.getPlacement(', '    function app.placeTick()'),'selector','t',h.env))()
+ local row=h.app.getPlacement();assert(row and row.slot.name=='Cheap'and row.affordable)
+end)
+test('the selector waits when full and resumes without toggling automation',function()
+ local h=setup();local full=true
+ local slot={name='Turret',x=0,y=0,z=0,facing=0}
+ h.app.layout=function()return full and{}or{slot}end
+ h.env.task={wait=function()end}
+ assert(load(extract('    function app.getPlacement(', '    function app.placeTick()'),'selector','t',h.env))()
+ assert(h.app.getPlacement()==nil);full=false;assert(h.app.getPlacement().slot==slot)
+end)
+test('placement reach ignores street zombies below a roof but blocks same-floor threats',function()
+ local h=setup();h.env.Core=assert(load(source:sub(1,assert(source:find('-- Runtime adapters.',1,true))-1)..'\nreturn Core'))()
+ h.app.enemyRows=function()return{{x=0,z=0,point=v(0,0,0),range=3}}end
+ assert(load(extract('    function app.placementSafe(', '    function app.getPlacement('),'safety','t',h.env))()
+ assert(h.app.placementSafe(v(0,20,0)))
+ assert(not h.app.placementSafe(v(0,3,0)))
+ assert(h.app.placementSafe(v(12,3,0)))
+end)
+test('placement holds movement while the remote is in flight and releases it afterward',function()
+ local h=setup();local stopped=false
+ h.app.stopWalk=function()stopped=true end
+ h.app.invoke=function()assert(stopped and h.app.placing);return{ok=true}end
+ assert(h.app.placeTick()==true and not h.app.placing)
 end)
 print(tests..' movement / placement / input checks passed')

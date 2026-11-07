@@ -141,4 +141,27 @@ test('Area exposes only part picking saved editing and the visibility switch',fu
  assert(#controls==3 and controls[1].text=='PICK MAP PART'and controls[2].text=='EDIT SAVED BOUNDARY'and controls[3].toggle)
  controls[1].fn();controls[2].fn();assert(opened[1]=='part'and opened[2]=='saved')
 end)
+test('an unlimited runtime plan can contain more than the former 512 slots',function()
+ local small={name='SmallTurret',role='turret',w=2,d=2,grid=1}
+ local plan=Core.plan(square(110),{small},nil)
+ assert(#plan>512,tostring(#plan))
+end)
+test('a full plan reopens the exact destroyed slot without shifting the remaining blueprint',function()
+ local boxes={};local specs={turret,wall}
+ local app={mapId='Map1',className='Rookie',revision=1,alive=true,pendingPlacements={}}
+ local cfg={maxDefenses=1,defenseTypes={},middleSpacing=12}
+ app.defenseBoxes=function()return boxes end;app.specs=function()return specs end
+ app.placementRegion=function()return{points=square(24)}end;app.note=function()end
+ local yields=0
+ local env=setmetatable({app=app,cfg=cfg,Core=Core,task={wait=function()yields=yields+1 end},os={clock=function()return 0 end}},{__index=_G})
+ assert(load(extract('    function app.layout()', '    function app.coverageStatus()'),'layout','t',env))()
+ local plan=app.layout();assert(#plan>1);local blueprint=app.blueprint
+ for _,slot in ipairs(plan)do boxes[#boxes+1]=slot end
+ assert(#app.layout()==0 and app.blueprint==blueprint)
+ local destroyed=table.remove(boxes,math.floor(#boxes/2));local before=yields
+ local free=app.layout();assert(#free==1 and free[1]==destroyed and app.blueprint==blueprint and yields==before)
+ -- Late template arrival must also invalidate an earlier empty layout.
+ specs={};assert(#app.layout()==0)
+ specs={turret,wall};assert(#app.layout()==1)
+end)
 print(tests..' layered border, spaced middle, repair and boundary controls checks passed')

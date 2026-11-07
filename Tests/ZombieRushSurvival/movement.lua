@@ -193,4 +193,12 @@ test('turret disappearance or destruction cannot retain a stale fight anchor',fu
  assert(load(extract('    function app.turretAnchor(', '    function app.safeAirGoal('),'turrets','t',h.env))()
  assert(h.app.turretAnchor()==nil)
 end)
+test('a selected building floor outside the spawn hull is allowed only for its active approach',function()
+ local h=setup();h.app.buildGoal=vec(80,3,0)
+ h.app.placementRegion=function()return{points={{x=60,y=0,z=-20},{x=100,y=0,z=-20},{x=100,y=0,z=20},{x=60,y=0,z=20}}}end
+ assert(h.app.inPlayableMap(vec(80,3,0)))
+ assert(not h.app.inPlayableMap(vec(110,3,0)))
+ assert(not h.app.inPlayableMap(vec(80,30,0)))
+ h.app.buildGoal=nil;assert(not h.app.inPlayableMap(vec(80,3,0)))
+end)
 print(tests..' playable-space movement and live-editor combat checks passed')
