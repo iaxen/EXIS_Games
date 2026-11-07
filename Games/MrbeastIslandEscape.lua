@@ -1,3 +1,109 @@
+-- Session diagnostics: bounded live view, complete persisted chunks, no network logging.
+local Diagnostics = {}
+function Diagnostics.traceback(err)
+    return debug and debug.traceback and debug.traceback(tostring(err), 2) or tostring(err)
+end
+function Diagnostics.level(message)
+    local value = tostring(message):upper()
+    for _, token in ipairs({"ERROR:", "FAILED", "REJECTED", "TIMED OUT", "UNAVAILABLE", "UNSUPPORTED"}) do
+        if value:find(token, 1, true) then return "ERROR" end
+    end
+    for _, token in ipairs({"WAIT", "BLOCKED", "UNCONFIRMED", "NOT CONFIRMED", "NO SAFE", "NO REACHABLE", "DEFERRED", "BAG FULL", "AREA FULL", "STORAGE FULL", "MISSING"}) do
+        if value:find(token, 1, true) then return "WAIT" end
+    end
+    return "INFO"
+end
+function Diagnostics.describe(value)
+    if type(value) ~= "table" then return tostring(value) end
+    local fields = {}
+    for _, key in ipairs({"ok", "reason", "message", "enabled", "success"}) do
+        if value[key] ~= nil then fields[#fields+1] = key .. "=" .. tostring(value[key]) end
+    end
+    return #fields > 0 and table.concat(fields, ", ") or "table response"
+end
+function Diagnostics.new(name, storage)
+    local log = {name=name, storage=storage, started=os.clock(), recent={}, chunk={}, parts={}, latest={}, failures={},
+        total=0, suppressed=0, discarded=0, serial=1, revision=0, savedRevision=-1, storageError=nil}
+    log.session = os.date("!%Y%m%d_%H%M%S") .. "_" .. tostring(math.floor(os.clock()*1000))
+    log.prefix = "diagnostic_" .. log.session
+    function log:currentFile()
+        return self.prefix .. "_" .. string.format("%06d", self.serial) .. ".log"
+    end
+    function log:flush()
+        if self.savedRevision == self.revision then return true end
+        if self.retryAt and os.clock() < self.retryAt then return false end
+        local ok, err = pcall(self.storage.write, self:currentFile(), table.concat(self.chunk, "\n") .. "\n")
+        if not ok then self.storageError=tostring(err) self.retryAt=os.clock()+3 return false end
+        self.storageError=nil self.retryAt=nil self.savedRevision=self.revision
+        return true
+    end
+    function log:record(key, message, level, force)
+        key, message = tostring(key), tostring(message)
+        level = level or Diagnostics.level(message)
+        self.total = self.total + 1
+        if level == "ERROR" then
+            local failure=self.failures[key] or {count=0}
+            failure.count, failure.reason, failure.at = failure.count+1, message, os.clock()-self.started
+            self.failures[key]=failure
+        end
+        local previous = self.latest[key]
+        if previous and previous.message == message and previous.level == level then
+            previous.count = previous.count + 1
+            if not force then self.suppressed=self.suppressed+1 return end
+        else self.latest[key]={message=message, level=level, count=1} end
+        if #self.chunk >= 200 and self:flush() then
+            self.parts[#self.parts+1]=self:currentFile()
+            self.serial=self.serial+1 self.chunk={} self.savedRevision=-1
+        end
+        -- File-less executors retain a bounded buffer and explicitly report any loss.
+        if #self.chunk >= 2000 then table.remove(self.chunk,1) self.discarded=self.discarded+1 end
+        local line=string.format("[%s +%.2fs] [%s] [%s] %s",os.date("!%Y-%m-%dT%H:%M:%SZ"),os.clock()-self.started,level,key,message)
+        self.chunk[#self.chunk+1]=line self.recent[#self.recent+1]=line self.revision=self.revision+1
+        if #self.recent>80 then table.remove(self.recent,1) end
+    end
+    function log:summary(short)
+        local lines={"SESSION "..self.session,"EVENTS "..self.total.." | UNCHANGED REPEATS "..self.suppressed}
+        local keys={};for key in pairs(self.failures)do keys[#keys+1]=key end;table.sort(keys)
+        lines[#lines+1]="FAILED ACTIONS / LAST REASON"
+        if #keys==0 then lines[#lines+1]="NONE RECORDED" end
+        for _,key in ipairs(keys)do local row=self.failures[key]
+            local reason=short and #row.reason>700 and row.reason:sub(1,700).." [full reason in export]" or row.reason
+            lines[#lines+1]=string.format("%s (%d) +%.2fs: %s",key,row.count,row.at,reason)
+        end
+        lines[#lines+1]="CURRENT WAITING / BLOCKED ACTIONS"
+        local waiting={};for key,row in pairs(self.latest)do if row.level=="WAIT"then waiting[#waiting+1]=key..": "..row.message end end
+        table.sort(waiting);lines[#lines+1]=#waiting>0 and table.concat(waiting,"\n")or"NONE"
+        lines[#lines+1]="LOG FILE: "..self.storage.path(self:currentFile())
+        if self.storageError then lines[#lines+1]="LOG SAVE FAILED: "..self.storageError end
+        if self.discarded>0 then lines[#lines+1]="INCOMPLETE LOG: "..self.discarded.." oldest entries lost while file saving was unavailable" end
+        return table.concat(lines,"\n")
+    end
+    function log:tail()
+        local lines={}
+        for _,line in ipairs(self.recent)do lines[#lines+1]=#line>700 and line:sub(1,700).." [full entry in export]" or line end
+        return table.concat(lines,"\n")
+    end
+    function log:report(snapshot)
+        local lines={"EXIS "..self.name.." DIAGNOSTICS",tostring(snapshot or ""),self:summary(),"\nFULL SESSION LOG (UTC; unchanged statuses counted above)"}
+        for _,file in ipairs(self.parts)do
+            local ok,data=pcall(self.storage.read,file)
+            lines[#lines+1]=ok and data or("[LOG READ FAILED: "..self.storage.path(file)..": "..tostring(data).."]")
+        end
+        lines[#lines+1]=table.concat(self.chunk,"\n")
+        return table.concat(lines,"\n")
+    end
+    function log:saveReport(snapshot)
+        local file=self.prefix.."_report.txt"
+        local ok,err=pcall(self.storage.write,file,self:report(snapshot))
+        if not ok then self.storageError=tostring(err) return nil,tostring(err) end
+        return self.storage.path(file)
+    end
+    log:record("session","STARTED "..name,"INFO",true)
+    return log
+end
+local diagnostic
+-- End session diagnostics.
+
 -- EXIScript: Island Escape module. Client APIs verified against the supplied export.
 local function runIslandEscape()
     -- Executor-workspace storage. Old root files remain readable during migration.
@@ -53,6 +159,7 @@ local function runIslandEscape()
         return ok
     end
 
+    diagnostic = Diagnostics.new("MrbeastIslandEscape", storage)
     local Players = game:GetService("Players")
     local RS = game:GetService("ReplicatedStorage")
     local UIS = game:GetService("UserInputService")
@@ -61,6 +168,7 @@ local function runIslandEscape()
     local pg = player:WaitForChild("PlayerGui")
     local engineReady = RS:WaitForChild("Engine", 30)
     if not engineReady or not engineReady:WaitForChild("Service", 15) or not engineReady.Service:WaitForChild("Config", 15) then
+        diagnostic:record("startup", "ERROR: Island Escape services are not loaded", "ERROR") diagnostic:flush()
         warn("EXIScript: Island Escape services are not loaded")
         return
     end
@@ -273,6 +381,7 @@ local function runIslandEscape()
         b.Activated:Connect(function()
             local ok, e = pcall(fn)
             if not ok then
+                diagnostic:record("button " .. text, e, "ERROR")
                 warn("EXIScript: " .. tostring(e))
             end
         end)
@@ -294,9 +403,10 @@ local function runIslandEscape()
     end
     local function note(key, message)
         taskStatus[key] = message
+        if diagnostic then diagnostic:record(key, message) end
     end
     local function safely(key, fn)
-        local ok, result = pcall(fn)
+        local ok, result = xpcall(fn, Diagnostics.traceback)
         if not ok then
             local message = tostring(result):gsub("^.-:%d+: ", "")
             note(key, "ERROR: " .. message)
@@ -377,6 +487,7 @@ local function runIslandEscape()
                 storage.write("exis_island_session_" .. player.UserId .. ".json", payload)
             end)
             if not ok then
+                note("config", "CONFIG SAVE FAILED: " .. tostring(e))
                 say(e)
             end
         end
@@ -505,16 +616,25 @@ local function runIslandEscape()
     opts.retreatHealth = math.clamp(opts.retreatHealth, 5, 90)
     function work.boundedRead(read, label)
         local done, result = false, nil
+        if diagnostic then diagnostic:record(label,"REQUEST STARTED","INFO",true) end
         local thread=task.spawn(function() result=table.pack(pcall(read)) done=true end)
         local deadline=os.clock()+6.5
         repeat
             if done then
-                if not result[1] then error(result[2]) end
+                if not result[1] then
+                    if diagnostic then diagnostic:record(label,result[2],"ERROR",true) end
+                    error(result[2])
+                end
+                if diagnostic then
+                    local rejected=type(result[2])=="table" and (result[2].ok==false or result[2].success==false)
+                    diagnostic:record(label,"RESPONSE: "..Diagnostics.describe(result[2]),rejected and "ERROR" or "INFO",true)
+                end
                 return table.unpack(result,2,result.n)
             end
             task.wait()
         until not alive or os.clock()>=deadline
         task.cancel(thread)
+        if diagnostic then diagnostic:record(label,"READ TIMED OUT; queue can continue","ERROR",true) end
         error(tostring(label).." read timed out; queue can continue")
     end
     local function module(name)
@@ -544,6 +664,7 @@ local function runIslandEscape()
         local source = (engine and engine:FindFirstChild("Service") and engine.Service:FindFirstChild(name)) or (lib and lib:FindFirstChild("Service") and lib.Service:FindFirstChild(name))
         if not source then
             failed[name] = os.clock()
+            note("module "..name,"UNAVAILABLE IN THIS SERVER")
             return
         end
         local ok, m = pcall(require, source)
@@ -552,6 +673,7 @@ local function runIslandEscape()
             return m
         end
         failed[name] = os.clock()
+        note("module "..name,"ERROR: "..tostring(m))
         say(name .. " unavailable")
     end
     local remoteActions = {
@@ -622,7 +744,8 @@ local function runIslandEscape()
             else
                 remote:FireServer(...)
             end
-            note(name .. "." .. action, "REQUEST SENT")
+            note(name .. "." .. action, "REQUEST SENT (AWAITING GAME CONFIRMATION)")
+            if diagnostic then diagnostic:record(name.."."..action,"REQUEST SENT","INFO",true) end
             return true
         end
         local m = module(name)
@@ -1520,6 +1643,7 @@ local function runIslandEscape()
     local espPage=page("ESP")
     local statusPage=page("Status")
     local settings=page("Settings")
+    work.diagnosticsPage=page("Diagnostics")
     local survival = group(foodPage, "MEALS / THRESHOLDS")
     toggle(survival, "eat", "Auto eat", "Uses selected food when health or hunger is low. No selection uses food listed in the game config.")
     number(survival, "health", "HEALTH BELOW (%)", 1, 100)
@@ -1690,7 +1814,7 @@ local function runIslandEscape()
         Text = "×", TextColor3 = white, TextSize = 16, BackgroundTransparency = 1, Font = Enum.Font.BuilderSans}, work.liveLabel)
     hideLive.Activated:Connect(function() flags.liveStatus = false work.liveLabel.Visible = false
         if toggles.liveStatus then toggles.liveStatus() end save() end)
-    local diag = group(settings, "DIAGNOSTICS")
+    local diag = group(work.diagnosticsPage, "FAILURES AND FULL SESSION LOG")
     button(diag, "CHECK GAME SERVICES", function()
         local ready = {}
         for _, n in ipairs({
@@ -1708,19 +1832,46 @@ local function runIslandEscape()
         say(table.concat(ready, " | "))
     end)
     local diagnosticText = text(diag, "NO ERRORS RECORDED")
+    diagnosticText.LayoutOrder = 100000
     local function refreshDiagnostics()
         local lines = {}
         for key in pairs(toggles) do
             lines[#lines + 1] = key:upper() .. ": " .. (flags[key] and (taskStatus[key] or "WAITING") or "OFF")
         end
         table.sort(lines)
-        diagnosticText.Text = "QUEUE: " .. tostring(taskStatus.queue or "IDLE") .. "\nMOVEMENT: " .. tostring(motion.owner or "IDLE") .. "\nHOSTILE SCAN: "..tostring(opts.threatScanRadius).." STUDS\nMRBEAST: "..tostring(work.questStatus or "WAITING").."\n"..tostring(questInfo.Text).."\n" .. table.concat(lines, "\n") .. "\n\nRECENT ERRORS\n" .. (#recentErrors > 0 and table.concat(recentErrors, "\n") or "NONE")
+        local _, human = root()
+        local scene = world()
+        local day = scene and scene:FindFirstChild("Day")
+        local phase = scene and scene:FindFirstChild("Phase")
+        local used, capacity = 0, 0
+        if work.bagState then used, capacity = work.bagState() end
+        work.diagnosticSnapshot = "PLACE "..game.PlaceId.." | DAY "..tostring(day and day.Value or "UNKNOWN").." | PHASE "..tostring(phase and phase.Value or "UNKNOWN")
+            .."\nHP "..tostring(human and human.Health or "NO CHARACTER").." | BAG "..tostring(used).."/"..tostring(capacity).." | REQUESTS "..work.sent
+            .."\nAUTO FARM "..tostring(flags.autoFarm).." | CURRENT JOB "..tostring(work.active or "NONE").."\nQUEUE: " .. tostring(taskStatus.queue or "IDLE") .. "\nMOVEMENT: " .. tostring(motion.owner or "IDLE") .. "\nHOSTILE SCAN: "..tostring(opts.threatScanRadius).." STUDS\nMRBEAST: "..tostring(work.questStatus or "WAITING").."\n"..tostring(questInfo.Text).."\n" .. table.concat(lines, "\n") .. "\n\nRECENT ERRORS\n" .. (#recentErrors > 0 and table.concat(recentErrors, "\n") or "NONE")
+        diagnosticText.Text = work.diagnosticSnapshot .. "\n\n" .. diagnostic:summary(true) .. "\n\nRECENT LOG\n" .. diagnostic:tail()
     end
     button(diag, "COPY DIAGNOSTICS", function()
         refreshDiagnostics()
         assert(type(setclipboard) == "function", "Clipboard unavailable")
-        setclipboard(diagnosticText.Text)
+        setclipboard(diagnostic:report(work.diagnosticSnapshot))
         say("DIAGNOSTICS COPIED")
+    end)
+    button(diag, "SAVE FULL LOG", function()
+        refreshDiagnostics()
+        local file, err = diagnostic:saveReport(work.diagnosticSnapshot)
+        assert(file, err)
+        say("LOG SAVED: " .. file)
+    end)
+    task.spawn(function()
+        while alive do
+            safely("diagnostic view", function()
+                if work.selectedPage == "Diagnostics" then refreshDiagnostics() end
+                if os.clock() >= (work.nextLogFlush or 0) then
+                    diagnostic:flush() work.nextLogFlush = os.clock() + 3
+                end
+            end)
+            task.wait(0.5)
+        end
     end)
     local modeLabel = text(main, "SERVER: CHECKING")
     local clockLabel = text(main, "DAY / PHASE: WAITING")
@@ -1860,6 +2011,7 @@ local function runIslandEscape()
         end
     end)
     gui.Destroying:Connect(function()
+        diagnostic:record("session","STOPPED: UI CLOSED","INFO",true) diagnostic:flush()
         alive = false
         motion.cancel("UI CLOSED")
         for _, c in ipairs(connections) do
@@ -1947,6 +2099,7 @@ local function runIslandEscape()
             end
         end)
         if not ok then
+            if diagnostic then diagnostic:record("background setup",e,"ERROR") end
             say(e)
         end
     end)
@@ -7426,8 +7579,8 @@ local function runIslandEscape()
                 motion.cancel("JOB ERROR")
             end
             if os.clock() >= (work.nextDiagnosticAt or 0) then
-                refreshDiagnostics()
-                work.nextDiagnosticAt = os.clock() + 0.2
+                safely("diagnostic view", refreshDiagnostics)
+                work.nextDiagnosticAt = os.clock() + 0.5
             end
             local wakeAt = os.clock() + math.max(0, opts.interval)
             repeat
@@ -7455,7 +7608,11 @@ local function runIslandEscape()
     end)
     say("ISLAND ESCAPE LOADED • LONG RUN MODE • CONFIG SAVED PER GAME")
 end
-runIslandEscape()
+local ok, err = xpcall(runIslandEscape, Diagnostics.traceback)
+if not ok then
+    if diagnostic then diagnostic:record("startup",err,"ERROR") diagnostic:flush() end
+    warn("EXIScript / MrbeastIslandEscape: " .. tostring(err))
+end
 
 
 

@@ -1,11 +1,11 @@
 local source=assert(io.open('Games/MrbeastIslandEscape.lua')):read('*a')
 local function extract(a,b)local i=assert(source:find(a,1,true),a);local j=assert(source:find(b,i+#a,true),b);return source:sub(i,j-1)end
-local pages,controls,values={},{},{}
+local pages,controls,values,order={},{},{},{}
 work={slider=function(parent,key)values[key]=values[key]or{};values[key][#values[key]+1]=parent.page end}
 flags={};opts={evadeMove='Teleport',move='Walk',codes=''};toggles={};motion={};connections={};selected={}
 Color3={fromRGB=function()return{}end};UDim2={new=function()return{}end,fromOffset=function()return{}end};Enum={Font={BuilderSans='Sans'}}
 pg={};gui={};blue={};white={};save=function()end;corner=function()end
-page=function(name)local p={page=name};pages[name]=p;return p end
+page=function(name)order[#order+1]=name;local p={page=name};pages[name]=p;return p end
 group=function(parent,name)assert(parent,'missing parent for '..name);return{page=parent.page,title=name}end
 text=function()return{}end
 button=function(_,label)return{Text=label}end
@@ -33,3 +33,6 @@ for _,name in ipairs({'Main','Survival','Combat','Food','Inventory','Gather','Ca
 print('PASS related game settings have dedicated pages within the universal shell')
 assert(controls.redeemCodes=='Rewards'and controls.liveStatus=='Status')
 print('PASS reward codes and live display no longer sit in unrelated round and master groups')
+
+assert(order[#order]=='Diagnostics'and order[#order-1]=='Settings')
+print('PASS diagnostics is the final sidebar category')

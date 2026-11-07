@@ -13,7 +13,7 @@ local function setup()
  local app={mapId='Map1',mode='MATCH',className='Medic',revision=1,next={},alive=true,rejected={}}
  local cfg={fight=false,autoPlace=true,bossFirst=true,enabled=true}
  local events={};local enum={UserInputType={MouseButton1=1},UserInputState={Begin=1},KeyCode={Unknown=0}}
- local environment=setmetatable({app=app,cfg=cfg,Core={fits=function()return true end},Vector3={new=v},Enum=enum,
+ local environment=setmetatable({app=app,cfg=cfg,Core={strictFits=function()return true end,placementBox=function(slot)return slot end},Vector3={new=v},Enum=enum,
   os={clock=function()return now end},RS={},UIS={InputEnded='ended'},player={},classes={},maps={AvailableData={Map1={DisplayName='Skyline'},Map2={DisplayName='Crystal Cave'}}},
   placement={GetPlacementDistances=function()return 18 end},game={PlaceId=87413622775071},workspace={GetAttribute=function()return'Map2'end},
   firesignal=function(signal,token)events[#events+1]={signal=signal,token=token}end},{__index=_G})
@@ -54,7 +54,7 @@ test('placement moves into native range before spending currency',function()
  h.app.placeTick();assert(h.app.buildGoal and #h.events==0)
 end)
 test('full-footprint boundary failure blocks a placement request',function()
- local h=setup();h.env.Core.fits=function()return false end;h.app.placeTick();assert(#h.events==0)
+ local h=setup();h.env.Core.strictFits=function()return false end;h.app.placeTick();assert(#h.events==0)
 end)
 test('placement rejection backs off without disabling auto place',function()
  local h=setup();h.app.invoke=function()return{ok=false,reason='occupied'}end
@@ -138,5 +138,14 @@ test('placement holds movement while the remote is in flight and releases it aft
  h.app.stopWalk=function()stopped=true end
  h.app.invoke=function()assert(stopped and h.app.placing);return{ok=true}end
  assert(h.app.placeTick()==true and not h.app.placing)
+end)
+test('the live Place call rejects crossing or touching the saved border and accepts a complete interior footprint',function()
+ local h=setup();h.env.Core=assert(load(source:sub(1,assert(source:find('-- Runtime adapters.',1,true))-1)..'\nreturn Core'))()
+ h.app.region=function()return{points={{x=0,y=0,z=0},{x=20,y=0,z=0},{x=20,y=0,z=20},{x=0,y=0,z=20}}}end
+ h.app.placementRegion=h.app.region
+ h.candidate.slot.spec.grid=1;h.candidate.slot.x=1.5;h.candidate.slot.z=5
+ h.candidate.point=v(1.5,0,5);assert(h.app.placeTick()==false and #h.events==0)
+ h.candidate.point=v(-.5,0,5);assert(h.app.placeTick()==false and #h.events==0)
+ h.candidate.point=v(5.5,0,5.5);assert(h.app.placeTick()==true and #h.events==1)
 end)
 print(tests..' movement / placement / input checks passed')
