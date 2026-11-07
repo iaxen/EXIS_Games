@@ -923,4 +923,6 @@ local ok,err=pcall(run)
 if not ok then
     warn("EXIS Steal an Egg startup: "..tostring(err))
     if startup.label and startup.label.Parent then startup.label.Text="EXIS STARTUP FAILED\n"..tostring(err).."\nCopy this error for diagnostics." end
+    return false, tostring(err)
 end
+return true
