@@ -71,7 +71,7 @@ test('ground destinations need playable floor support',function()
  assert(h.app.flightPoint(vec(10,5,0))==nil)
 end)
 test('movement point stays at native standing height under a cave ceiling',function()
- local h=setup();local n=0;h.app.raycast=function()n=n+1;if n==1 then return{Position=vec(10,0,0),Normal=vec(0,1,0),Material='Concrete'}end;return{Position=vec(10,10,0)}end
+ local h=setup();h.app.raycast=function(origin)return{Position=vec(origin.X,0,origin.Z),Normal=vec(0,1,0),Material='Concrete'}end
  local goal=h.app.flightPoint(vec(10,4,0));assert(goal and goal.Y==3)
 end)
 test('a stale blocked placement approach is released rather than held forever',function()
@@ -200,5 +200,41 @@ test('a selected building floor outside the spawn hull is allowed only for its a
  assert(not h.app.inPlayableMap(vec(110,3,0)))
  assert(not h.app.inPlayableMap(vec(80,30,0)))
  h.app.buildGoal=nil;assert(not h.app.inPlayableMap(vec(80,3,0)))
+end)
+test('a destination cannot fall from a roof to distant lower terrain',function()
+ local h=setup();h.root.Position=vec(0,33,0)
+ h.app.raycast=function(origin,direction,filters,solid)
+  assert(direction.Y>=-12 and solid==true)
+  return{Position=vec(origin.X,0,origin.Z),Normal=vec(0,1,0),Material='Concrete'}
+ end
+ assert(h.app.flightPoint(vec(20,33,0))==nil)
+end)
+test('walking routes reject unsupported shoulders even with floor beneath the centerline',function()
+ local h=setup()
+ assert(load(extract('    function app.groundRoute(', '    function app.placementRegion()'),'route','t',h.env))()
+ h.app.raycast=function(origin)
+  if origin.Z>1 then return nil end
+  return{Position=vec(origin.X,0,origin.Z),Normal=vec(0,1,0),Material='Concrete'}
+ end
+ assert(not h.app.groundRoute(vec(0,3,0),vec(12,3,0)))
+end)
+test('an unsafe blocked route cancels horizontal momentum while preserving gravity',function()
+ local h=setup();h.root.AssemblyLinearVelocity=vec(24,-5,0);h.app.routeHop=function()return nil end
+ h.app.move(vec(20,3,0),.02)
+ assert(h.root.AssemblyLinearVelocity.X==0 and h.root.AssemblyLinearVelocity.Y==-5)
+end)
+test('support rays require collidable terrain in the real character collision group',function()
+ local h=setup();local captured
+ h.env.player={Character={}}
+ h.world.Raycast=function(_,origin,direction,params)captured=params;return nil end
+ assert(load(extract('    function app.raycast(', '    function app.stopMapView()'),'raycast','t',h.env))()
+ h.app.raycast(vec(0,5,0),vec(0,-9,0),{{floor=true}},true)
+ assert(captured.RespectCanCollide and captured.CollisionGroup=='Characters')
+end)
+test('long walking corridors bound their physical support query count',function()
+ local h=setup();local queries=0
+ assert(load(extract('    function app.groundRoute(', '    function app.placementRegion()'),'route','t',h.env))()
+ h.app.raycast=function(origin)queries=queries+1;return{Position=vec(origin.X,0,origin.Z),Normal=vec(0,1,0),Material='Concrete'}end
+ assert(h.app.groundRoute(vec(0,3,0),vec(128,3,0))and queries<=210)
 end)
 print(tests..' playable-space movement and live-editor combat checks passed')

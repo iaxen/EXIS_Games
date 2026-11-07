@@ -1163,11 +1163,16 @@ local function run()
         end
         return result
     end
-    function app.raycast(origin, direction, include)
+    function app.raycast(origin, direction, include, solidFloor)
         local params = RaycastParams.new()
         params.FilterType = include and Enum.RaycastFilterType.Include or Enum.RaycastFilterType.Exclude
         params.FilterDescendantsInstances = include or {player.Character, app.markers}
         params.IgnoreWater = false
+        if solidFloor then
+            local root = app.root()
+            params.RespectCanCollide = true
+            if root then params.CollisionGroup = root.CollisionGroup end
+        end
         return workspace:Raycast(origin, direction, params)
     end
     function app.stopMapView()
@@ -1378,21 +1383,43 @@ local function run()
         -- Sweep a character-sized volume, not just a ray through its center.
         return workspace:Blockcast(CFrame.new(origin), Vector3.new(3, 4, 3), direction, params)
     end
+    function app.floorSupport(point, tolerance, offsets)
+        local root, human = app.root()
+        if not root then return false end
+        local feet = point.Y-human.HipHeight-root.Size.Y/2
+        -- Check a margin around the whole body, including diagonal corners.
+        -- Decorative/non-colliding parts must never count as a floor.
+        local radius = math.max(root.Size.X,root.Size.Z)/2+1
+        local filters = app.mapFilters()
+        for _,offset in ipairs(offsets or {{0,0},{radius,0},{-radius,0},{0,radius},{0,-radius},
+            {radius,radius},{radius,-radius},{-radius,radius},{-radius,-radius}}) do
+            local hit=app.raycast(Vector3.new(point.X+offset[1],feet+4,point.Z+offset[2]),
+                Vector3.new(0,-9,0),filters,true)
+            if not hit or hit.Material==Enum.Material.Water or hit.Normal.Y<.65
+                or math.abs(hit.Position.Y-feet)>(tolerance or 1.25) then return false end
+        end
+        return true
+    end
     function app.groundRoute(a, b)
         local cached = app.groundRouteCache
         if cached and os.clock() < cached.untilTime and (cached.a - a).Magnitude < 1
             and (cached.b - b).Magnitude < 1 then return cached.ok end
         local root, human = app.root()
         if not root then return false end
-        local delta, lift = b - a, human.HipHeight + root.Size.Y / 2
-        local steps = math.ceil(delta.Magnitude / 4)
-        local ok = steps <= 32
+        local delta = b - a
+        local steps = math.ceil(delta.Magnitude / 2)
+        local ok = steps <= 64
+        local flat=math.sqrt(delta.X*delta.X+delta.Z*delta.Z)
+        local radius=math.max(root.Size.X,root.Size.Z)/2+1
+        local sideX,sideZ=flat>.01 and -delta.Z/flat*radius or radius,flat>.01 and delta.X/flat*radius or 0
+        local shoulders={{0,0},{sideX,sideZ},{-sideX,-sideZ}}
         if ok then
             for i = 0, math.max(1, steps) do
                 local point = a + delta * (i / math.max(1, steps))
-                local hit = app.raycast(point + Vector3.new(0, 4, 0), Vector3.new(0, -12, 0), app.mapFilters())
-                if not hit or hit.Material == Enum.Material.Water or hit.Normal.Y < 0.65
-                    or math.abs(hit.Position.Y - (point.Y - lift)) > 3.5 then ok = false break end
+                -- Full endpoint footprints, then a dense center/shoulder strip.
+                -- This protects route width without nine duplicate rays at every step.
+                local offsets = i>0 and i<steps and shoulders or nil
+                if not app.floorSupport(point,2,offsets) then ok = false break end
             end
         end
         app.groundRouteCache = {a = a, b = b, ok = ok, untilTime = os.clock() + 0.2}
@@ -1922,8 +1949,11 @@ local function run()
                 app.placementTask, app.placementKey, app.buildGoal = nil, nil, nil
             end
             human:MoveTo(root.Position)
+            local velocity=root.AssemblyLinearVelocity
+            if velocity then root.AssemblyLinearVelocity=Vector3.new(0,velocity.Y,0) end
             app.walkGoal = nil
             app.airGoal = nil
+            app.note("movement","BLOCKED UNSUPPORTED / UNSAFE ROUTE; STOPPING AT EDGE")
             return
         end
         app.routeBlockedSince = nil
@@ -1978,12 +2008,15 @@ local function run()
     end
     function app.flightPoint(point)
         if not app.inPlayableMap(point) then return nil end
-        local hit = app.raycast(point + Vector3.new(0, 3, 0), Vector3.new(0, -256, 0), app.mapFilters())
-        if not hit or hit.Material == Enum.Material.Water or hit.Normal.Y < 0.6 then return nil end
         local root, human = app.root()
         if not root then return nil end
-        local lift = human.HipHeight + root.Size.Y / 2
-        local base = hit.Position + Vector3.new(0, lift, 0)
+        local lift=human.HipHeight+root.Size.Y/2
+        -- Never turn a missing roof/platform into a teleport to distant terrain.
+        local hit=app.raycast(point+Vector3.new(0,3,0),Vector3.new(0,-12,0),app.mapFilters(),true)
+        if not hit or hit.Material==Enum.Material.Water or hit.Normal.Y<.65
+            or math.abs(hit.Position.Y-(root.Position.Y-lift))>3 then return nil end
+        local base=hit.Position+Vector3.new(0,lift,0)
+        if not app.floorSupport(base) then return nil end
         return base
     end
     function app.turretAnchor()
@@ -2084,12 +2117,9 @@ local function run()
         for _,part in ipairs(workspace:GetPartBoundsInBox(CFrame.new(goal),Vector3.new(3,4,3),params))do
             if part.CanCollide then return nil end
         end
-        -- Check the feet around the destination, not just a single floor ray.
-        for _,offset in ipairs({{1.2,0},{-1.2,0},{0,1.2},{0,-1.2}})do
-            local hit=app.raycast(goal+Vector3.new(offset[1],3,offset[2]),Vector3.new(0,-16,0),app.mapFilters())
-            local _,human=app.root()
-            if not human or not hit or hit.Material==Enum.Material.Water or hit.Normal.Y<.65
-                or math.abs(hit.Position.Y-(goal.Y-human.HipHeight-root.Size.Y/2))>2 then return nil end
+        if not app.floorSupport(goal) then
+            app.note("movement","REJECTED LANDING: missing solid floor / too close to edge")
+            return nil
         end
         return goal
     end
