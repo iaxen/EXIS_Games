@@ -56,5 +56,18 @@ end)
 test('native rarity and biome directories drive the selection UI',function()
  assert(source:find('pairs(api.areas.Directory)',1,true)and source:find('api.rarity.Rarities[a].Rank',1,true))
 end)
+test('startup waits for native modules that arrive after execution',function()
+ startup={};local lookups=0
+ resolve=function()lookups=lookups+1;if lookups>=3 then return{}end end
+ task={wait=function()now=now+.1 end};bounded=function()return{ready=true}end
+ local loadAPI=fn('loadAPI','loadAPI("eggs"')
+ loadAPI('sample','Client.Sample');assert(api.sample.ready and lookups==3 and now>=.2)
+end)
+test('missing native module names the startup failure after a bounded wait',function()
+ startup={};resolve=function()end;task={wait=function()now=now+.1 end}
+ local loadAPI=fn('loadAPI','loadAPI("eggs"')
+ local ok,message=pcall(loadAPI,'missing','Client.Missing')
+ assert(not ok and tostring(message):find('Client.Missing',1,true)and now>=15 and now<16)
+end)
 assert(loadfile('Games/StealAnEgg.lua'))
 print(n..' native transaction and scheduler guard checks passed; module compiles')

@@ -1,6 +1,6 @@
 # Steal an Egg: native automation and verified coverage
 
-Entry point: `Games/StealAnEgg.lua`. Run the standalone file in the same client environment used for the other EXIS scripts. Configure categories, use Enable core automation, then Master. The default master is off. No loader in this repository currently dispatches game IDs automatically.
+Entry point: `Games/StealAnEgg.lua`. Run the standalone file in the same client environment used for the other EXIS scripts. Configure categories, use Enable core automation, then Master. The default master is off. The paired EXIScript universal-loader update adds Place 107778070777162 and native EggState/PlotState detection. Both repository updates must reach main when using the universal loader; the standalone game file can also be executed directly.
 
 The script uses the supplied Place 107778070777162 export. The decoded source was inspected for the contracts below; the export contains client code and shared schemas, not the complete authoritative server implementation. User descriptions of event schedules and popularity were not used as executable rules.
 
@@ -41,3 +41,14 @@ No live Roblox session was available. Teleport approach may be rejected by the c
 ## Verification
 
 Run `texlua Tests/StealAnEgg/core.lua` and `texlua Tests/StealAnEgg/runtime.lua` from the repository root. Tests cover rarity-first ordering, ties, exclusions, states, retry backoff, first-area payloads, duplicate-only fusion, return ownership receipts, carry loss, unavailable base, treadmill exit, in-flight mutation leases and complete-module compilation. Existing MrBeast, ZombieRush, UI and storage tests remain part of regression verification.
+
+
+## Startup, performance and universal EXIS tools
+
+The original universal loader did not contain a Steal an Egg route. The companion EXIScript change adds the route and tests actual downloaded-chunk execution, not just route-table text. The game now shows a startup stage panel before requiring native adapters, waits for initially absent module paths, and displays the failing module/error instead of only printing a warning. A failed startup still requires the actual displayed error to diagnose runtime-specific failures.
+
+Performance has separate controls for other-plot ToUpdate visuals, native Shared.Preferences HideOtherPets/HideSelfPets/DisableVideos, plain materials, removed textures/shadows and disabled visual effects. The native hide-pet preferences suppress rendering work in ActiveAssetsController. Other-pen hiding never destroys objects or changes collisions, physics, prompts or record tables. Property snapshots restore on mode changes and close; the script also attempts to restore the native preferences it changed. Newly streamed visuals are processed through descendant listeners. FPS improvements are device-dependent and were not measured live.
+
+Tools include current FPS/task/save/base/carry/module/pending-request diagnostics, recent log, copy/print/save diagnostics, settings save/reload while paused, queued snapshot refresh, anti-idle input, optional teleport execution, manual rejoin and connection-loss reconnect. Reconnect handles error 277/279 and connection-loss text without a different explicit error code. Teleport autorun reads saved autoExecute at execution time so disabling it cancels a previously queued launcher. New sessions remain paused. Files and clipboard/teleport hooks depend on executor capabilities; failure is reported rather than silently assumed successful.
+
+Performance/session tools work independently of the farm master. They do not clear uncertain mutation leases. Rejoin controls intentionally leave the session when clicked. The new performance tests verify property ownership/restoration, exclusion of own plot, preserved collisions/prompts and distinct mode invalidation signatures. No live executor startup or FPS benchmark has been performed.
