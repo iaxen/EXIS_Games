@@ -1,3 +1,109 @@
+-- Session diagnostics: bounded live view, complete persisted chunks, no network logging.
+local Diagnostics = {}
+function Diagnostics.traceback(err)
+    return debug and debug.traceback and debug.traceback(tostring(err), 2) or tostring(err)
+end
+function Diagnostics.level(message)
+    local value = tostring(message):upper()
+    for _, token in ipairs({"ERROR:", "FAILED", "REJECTED", "TIMED OUT", "UNAVAILABLE", "UNSUPPORTED"}) do
+        if value:find(token, 1, true) then return "ERROR" end
+    end
+    for _, token in ipairs({"WAIT", "BLOCKED", "UNCONFIRMED", "NOT CONFIRMED", "NO SAFE", "NO REACHABLE", "DEFERRED", "BAG FULL", "AREA FULL", "STORAGE FULL", "MISSING"}) do
+        if value:find(token, 1, true) then return "WAIT" end
+    end
+    return "INFO"
+end
+function Diagnostics.describe(value)
+    if type(value) ~= "table" then return tostring(value) end
+    local fields = {}
+    for _, key in ipairs({"ok", "reason", "message", "enabled", "success"}) do
+        if value[key] ~= nil then fields[#fields+1] = key .. "=" .. tostring(value[key]) end
+    end
+    return #fields > 0 and table.concat(fields, ", ") or "table response"
+end
+function Diagnostics.new(name, storage)
+    local log = {name=name, storage=storage, started=os.clock(), recent={}, chunk={}, parts={}, latest={}, failures={},
+        total=0, suppressed=0, discarded=0, serial=1, revision=0, savedRevision=-1, storageError=nil}
+    log.session = os.date("!%Y%m%d_%H%M%S") .. "_" .. tostring(math.floor(os.clock()*1000))
+    log.prefix = "diagnostic_" .. log.session
+    function log:currentFile()
+        return self.prefix .. "_" .. string.format("%06d", self.serial) .. ".log"
+    end
+    function log:flush()
+        if self.savedRevision == self.revision then return true end
+        if self.retryAt and os.clock() < self.retryAt then return false end
+        local ok, err = pcall(self.storage.write, self:currentFile(), table.concat(self.chunk, "\n") .. "\n")
+        if not ok then self.storageError=tostring(err) self.retryAt=os.clock()+3 return false end
+        self.storageError=nil self.retryAt=nil self.savedRevision=self.revision
+        return true
+    end
+    function log:record(key, message, level, force)
+        key, message = tostring(key), tostring(message)
+        level = level or Diagnostics.level(message)
+        self.total = self.total + 1
+        if level == "ERROR" then
+            local failure=self.failures[key] or {count=0}
+            failure.count, failure.reason, failure.at = failure.count+1, message, os.clock()-self.started
+            self.failures[key]=failure
+        end
+        local previous = self.latest[key]
+        if previous and previous.message == message and previous.level == level then
+            previous.count = previous.count + 1
+            if not force then self.suppressed=self.suppressed+1 return end
+        else self.latest[key]={message=message, level=level, count=1} end
+        if #self.chunk >= 200 and self:flush() then
+            self.parts[#self.parts+1]=self:currentFile()
+            self.serial=self.serial+1 self.chunk={} self.savedRevision=-1
+        end
+        -- File-less executors retain a bounded buffer and explicitly report any loss.
+        if #self.chunk >= 2000 then table.remove(self.chunk,1) self.discarded=self.discarded+1 end
+        local line=string.format("[%s +%.2fs] [%s] [%s] %s",os.date("!%Y-%m-%dT%H:%M:%SZ"),os.clock()-self.started,level,key,message)
+        self.chunk[#self.chunk+1]=line self.recent[#self.recent+1]=line self.revision=self.revision+1
+        if #self.recent>80 then table.remove(self.recent,1) end
+    end
+    function log:summary(short)
+        local lines={"SESSION "..self.session,"EVENTS "..self.total.." | UNCHANGED REPEATS "..self.suppressed}
+        local keys={};for key in pairs(self.failures)do keys[#keys+1]=key end;table.sort(keys)
+        lines[#lines+1]="FAILED ACTIONS / LAST REASON"
+        if #keys==0 then lines[#lines+1]="NONE RECORDED" end
+        for _,key in ipairs(keys)do local row=self.failures[key]
+            local reason=short and #row.reason>700 and row.reason:sub(1,700).." [full reason in export]" or row.reason
+            lines[#lines+1]=string.format("%s (%d) +%.2fs: %s",key,row.count,row.at,reason)
+        end
+        lines[#lines+1]="CURRENT WAITING / BLOCKED ACTIONS"
+        local waiting={};for key,row in pairs(self.latest)do if row.level=="WAIT"then waiting[#waiting+1]=key..": "..row.message end end
+        table.sort(waiting);lines[#lines+1]=#waiting>0 and table.concat(waiting,"\n")or"NONE"
+        lines[#lines+1]="LOG FILE: "..self.storage.path(self:currentFile())
+        if self.storageError then lines[#lines+1]="LOG SAVE FAILED: "..self.storageError end
+        if self.discarded>0 then lines[#lines+1]="INCOMPLETE LOG: "..self.discarded.." oldest entries lost while file saving was unavailable" end
+        return table.concat(lines,"\n")
+    end
+    function log:tail()
+        local lines={}
+        for _,line in ipairs(self.recent)do lines[#lines+1]=#line>700 and line:sub(1,700).." [full entry in export]" or line end
+        return table.concat(lines,"\n")
+    end
+    function log:report(snapshot)
+        local lines={"EXIS "..self.name.." DIAGNOSTICS",tostring(snapshot or ""),self:summary(),"\nFULL SESSION LOG (UTC; unchanged statuses counted above)"}
+        for _,file in ipairs(self.parts)do
+            local ok,data=pcall(self.storage.read,file)
+            lines[#lines+1]=ok and data or("[LOG READ FAILED: "..self.storage.path(file)..": "..tostring(data).."]")
+        end
+        lines[#lines+1]=table.concat(self.chunk,"\n")
+        return table.concat(lines,"\n")
+    end
+    function log:saveReport(snapshot)
+        local file=self.prefix.."_report.txt"
+        local ok,err=pcall(self.storage.write,file,self:report(snapshot))
+        if not ok then self.storageError=tostring(err) return nil,tostring(err) end
+        return self.storage.path(file)
+    end
+    log:record("session","STARTED "..name,"INFO",true)
+    return log
+end
+local diagnostic
+-- End session diagnostics.
+
 -- EXIScript | Zombie Rush Survival | initial test release
 -- Lobby: 82457571485380. Both gameplay maps: 87413622775071.
 -- Each EXIS game keeps its own module and configuration.
@@ -547,6 +653,40 @@ function Core.plan(poly, specs, limit, existing, yieldWork, middleSpacing)
     return result,reason,reserve,coverage
 end
 
+-- Runtime placements must stay clear of the drawn boundary, including their
+-- entire server-snapped footprint. The raw planner remains usable for geometry tests.
+function Core.placementBox(slot, x, z)
+    local grid = slot.spec and slot.spec.grid or 1
+    local w, d = slot.w/grid, slot.d/grid
+    return {x=(math.floor(x/grid-w/2+.5)+w/2)*grid,
+        z=(math.floor(z/grid-d/2+.5)+d/2)*grid,w=slot.w,d=slot.d}
+end
+function Core.strictFits(box, poly)
+    return Core.fits(box, box.w+.1, box.d+.1, poly, false)
+end
+function Core.planInside(poly, specs, limit, existing, yieldWork, middleSpacing)
+    if not Core.validPolygon(poly) then return {}, "SELECT A VALID AREA" end
+    local inset = Core.insetPolygon(poly, 1)
+    if not inset or not Core.validPolygon(inset) then return {}, "NO DEFENSE FITS INSIDE THE BORDER GAP" end
+    local minX,maxX,minZ,maxZ,grid=math.huge,-math.huge,math.huge,-math.huge,1
+    for _,p in ipairs(inset)do minX,maxX,minZ,maxZ=math.min(minX,p.x),math.max(maxX,p.x),math.min(minZ,p.z),math.max(maxZ,p.z)end
+    for _,spec in ipairs(specs)do grid=math.max(grid,spec.grid or 1)end
+    local rectangle=#inset==4
+    for _,p in ipairs(inset)do
+        if math.min(math.abs(p.x-minX),math.abs(p.x-maxX))>.0001
+            or math.min(math.abs(p.z-minZ),math.abs(p.z-maxZ))>.0001 then rectangle=false end
+    end
+    if rectangle then
+        minX,maxX,minZ,maxZ=math.ceil(minX/grid)*grid,math.floor(maxX/grid)*grid,math.ceil(minZ/grid)*grid,math.floor(maxZ/grid)*grid
+        inset={{x=minX,y=poly[1].y,z=minZ},{x=maxX,y=poly[1].y,z=minZ},{x=maxX,y=poly[1].y,z=maxZ},{x=minX,y=poly[1].y,z=maxZ}}
+        if not Core.validPolygon(inset) then return {}, "NO DEFENSE FITS INSIDE THE BORDER GAP" end
+    end
+    local plan,reason,reserve,coverage=Core.plan(inset,specs,limit,existing,yieldWork,middleSpacing)
+    local safe={}
+    for _,slot in ipairs(plan)do if Core.strictFits(slot,poly)then safe[#safe+1]=slot end end
+    return safe,"INSIDE ONLY · 1 STUD BORDER GAP · "..reason,reserve,coverage
+end
+
 function Core.teleportClearance(point, mobs, horizon)
     local clearance, margin = math.huge, math.huge
     for _, mob in ipairs(mobs) do
@@ -687,6 +827,7 @@ end
 
 -- Runtime adapters. The planning functions above have no Roblox dependencies.
 local function run()
+    diagnostic = Diagnostics.new("ZombieRushSurvival", storage)
     if not game:IsLoaded() then game.Loaded:Wait() end
     local Players = game:GetService("Players")
     local RS = game:GetService("ReplicatedStorage")
@@ -725,7 +866,8 @@ local function run()
     function app.save()
         if type(writefile) == "function" then
             local ok, err = pcall(function() storage.write(file, Http:JSONEncode(cfg)) end)
-            if not ok then app.notes.config = "CONFIG SAVE FAILED: " .. tostring(err) end
+            if not ok then app.notes.config = "CONFIG SAVE FAILED: " .. tostring(err)
+                if diagnostic then diagnostic:record("config", app.notes.config, "ERROR") end end
         end
     end
     function app.changed()
@@ -736,7 +878,11 @@ local function run()
         task.delay(0.3, function() app.saveQueued = false if app.alive then app.save() end end)
     end
     function app.connect(signal, callback)
-        local connection = signal:Connect(callback)
+        local connection = signal:Connect(function(...)
+            local args=table.pack(...)
+            local ok,err=xpcall(function() callback(table.unpack(args,1,args.n)) end,Diagnostics.traceback)
+            if not ok and diagnostic then diagnostic:record("callback",err,"ERROR") end
+        end)
         app.connections[#app.connections + 1] = connection
         return connection
     end
@@ -766,6 +912,7 @@ local function run()
         local ok, result = pcall(require, object)
         if ok then app.cache[object] = result return result end
         app.notes.modules = name .. ": " .. tostring(result)
+        if diagnostic then diagnostic:record("module "..name,result,"ERROR") end
     end
     local shared = RS:WaitForChild("Shared", 15)
     if not shared then error("Zombie Rush Shared folder did not load") end
@@ -805,22 +952,27 @@ local function run()
     function app.note(key, value)
         app.notes[key] = tostring(value)
         app.lastNote = key:upper() .. " · " .. tostring(value)
+        if diagnostic then diagnostic:record(key, value) end
     end
     function app.invoke(key, remote, ...)
-        if not app.alive or (not cfg.enabled and key ~= "skip") or not remote or not remote:IsA("RemoteFunction") then return nil end
+        if not app.alive or (not cfg.enabled and key ~= "skip") then return nil end
+        if not remote or not remote:IsA("RemoteFunction") then
+            app.note(key, "UNAVAILABLE: native RemoteFunction is missing") return nil
+        end
         if os.clock() < (app.next[key] or 0) then return nil end
         app.next[key] = os.clock() + 1
+        if diagnostic then diagnostic:record(key,"REQUEST STARTED","INFO",true) end
         local ok, result = pcall(remote.InvokeServer, remote, ...)
         if not app.alive then return nil end
         if not ok then
             app.next[key] = os.clock() + 5
-            app.note(key, result)
+            app.note(key, "ERROR: " .. tostring(result))
             return nil
         end
         if type(result) == "table" and result.ok == false then
             app.next[key] = os.clock() + (result.reason == "funds" and 3 or 5)
-            app.note(key, result.reason or "REJECTED")
-        else app.note(key, "REQUEST CONFIRMED") end
+            app.note(key, "REJECTED: " .. tostring(result.reason or "UNKNOWN"))
+        else app.note(key, "RESPONSE RECEIVED: " .. (diagnostic and Diagnostics.describe(result) or tostring(result))) end
         return result
     end
     function app.ownedClass(name)
@@ -1405,7 +1557,7 @@ local function run()
         local poly = app.placementRegion().points or {}
         local blueprintKey = map .. ":" .. tostring(class) .. ":" .. revision .. ":" .. shape
         if app.blueprintKey ~= blueprintKey then
-            local plan, reason, reserve, coverage = Core.plan(poly, specs, nil, {}, function()
+            local plan, reason, reserve, coverage = Core.planInside(poly, specs, nil, {}, function()
                 task.wait()
                 if not app.alive or app.mapId ~= map or app.className ~= class or app.revision ~= revision then error("LAYOUT CHANGED; REPLANNING") end
             end, cfg.middleSpacing)
@@ -1498,7 +1650,7 @@ local function run()
             if a.distance~=b.distance then return a.distance<b.distance end
             return a.key<b.key
         end)
-        local prices={}
+        local prices, funded={},0
         -- A large layered layout must not perform hundreds of floor/risk
         -- queries per class type on every worker tick.
         local checked = 0
@@ -1509,6 +1661,7 @@ local function run()
                 local price=prices[slot.name]
                 if not price then local currency,cost=client.GetCurrentPrice(slot.name);price={currency,cost};prices[slot.name]=price end
                 local affordable=app.afford(price[1],price[2])
+                if affordable then funded=funded+1 end
                 if affordable or allowUnfunded then
                     checked = checked + 1
                     if checked % 32 == 0 then
@@ -1521,9 +1674,12 @@ local function run()
                             revision=app.revision,affordable=affordable}
                     end
                     app.rejected[row.key]=os.clock()+(hit and .5 or 8)
+                    if diagnostic then diagnostic:record("placement probe",slot.name.." @ "..slot.x..","..slot.z..": "..
+                        (hit and "WAITING: enemies can reach this slot" or "WAITING: selected floor has no valid support here"),"WAIT") end
                 end
             else app.rejected[row.key]=os.clock()+.2 end
         end
+        if #choices>0 and funded==0 and not allowUnfunded then app.note("defense","WAITING FOR CASH: no selected defense is affordable") end
         return nil
     end
     function app.placeTick()
@@ -1571,7 +1727,11 @@ local function run()
         if candidate.class ~= app.className or candidate.map ~= app.mapId or candidate.revision ~= app.revision
             or not cfg.autoPlace or not app.active() or app.occupied(candidate.slot) then return false end
         local region = app.placementRegion()
-        if not Core.fits(candidate.slot, candidate.slot.w, candidate.slot.d, region.points or {}, true) then return false end
+        local snapped = Core.placementBox(candidate.slot, candidate.point.X, candidate.point.Z)
+        if not Core.strictFits(snapped, region.points or {}) then
+            app.note("defense", "REJECTED: complete defense footprint must stay inside the selected border")
+            return false
+        end
         local client = app.module(app.find(player, "PlayerScripts", "Client"), "DeployableSystem")
         if not client then return false end
         local currency, price = client.GetCurrentPrice(candidate.slot.name)
@@ -2291,6 +2451,7 @@ end
     local defensePage = ui.page("DEFENSE")
     local areaPage = ui.page("AREA")
     local settings = ui.page("SETTINGS")
+    ui.diagnosticsPage = ui.page("DIAGNOSTICS")
     local contextLabel = ui.textLabel(main, "DETECTING CLASS / MAP", 42)
     contextLabel.TextColor3, contextLabel.Font = ui.text, Enum.Font.BuilderSansMedium
     local fight = ui.group(main, "FIGHT MODE")
@@ -2366,7 +2527,7 @@ end
         ui.toggle(group, "AUTO PLACE CURRENT CLASS", cfg, "autoPlace")
         ui.textLabel(group, "NO COUNT LIMIT · Build when affordable; replace destroyed defenses when space opens.", 44)
         ui.number(group, "MIDDLE DEFENSE SPACING", "middleSpacing", 6, 40)
-        ui.textLabel(group, "1 barricade row + 3 turret rows. Spaced middle barricades with nearby turrets; no solid center fill.", 44)
+        ui.textLabel(group, "Inside only: 1-stud gap from boundary. 1 barricade row + 3 turret rows, with spaced middle defenses.", 44)
         app.coverageLabel = ui.textLabel(group,"SELECT A MAP PART FIRST",44)
         local selection = ui.group(defensePage, "CLASS DEFENSE SELECTION")
         for _, name in ipairs(classes.GetDeployableSlots(app.className or classes.DefaultClass)) do
@@ -2521,12 +2682,22 @@ end
         cfg.fight, cfg.autoPlace = false, false
         app.releaseFire() app.stopFlight() app.stopWalk() app.buildGoal = nil app.changed()
     end)
-    local diagnostics = ui.group(settings, "DIAGNOSTICS")
+    local diagnostics = ui.group(ui.diagnosticsPage, "FAILURES AND FULL SESSION LOG")
     local diagnosticLabel = ui.textLabel(diagnostics, "", 150)
     diagnosticLabel.TextYAlignment = Enum.TextYAlignment.Top
     diagnosticLabel.AutomaticSize = Enum.AutomaticSize.Y
+    diagnosticLabel.LayoutOrder = 100000
     ui.button(diagnostics, "COPY DIAGNOSTICS", function()
-        if type(setclipboard) == "function" then setclipboard(diagnosticLabel.Text) app.note("diagnostics", "COPIED") end
+        assert(type(setclipboard) == "function", "Clipboard unavailable; use SAVE FULL LOG")
+        setclipboard(diagnostic:report(app.diagnosticSnapshot)) app.note("diagnostics", "COPIED FULL LOG")
+    end)
+    ui.button(diagnostics, "SAVE FULL LOG", function()
+        local file, err = diagnostic:saveReport(app.diagnosticSnapshot)
+        assert(file, err)
+        app.note("diagnostics", "LOG SAVED: " .. file)
+    end)
+    task.spawn(function()
+        while app.alive do diagnostic:flush() task.wait(3) end
     end)
     local inputOptions = ui.group(settings, "FIRE INPUT MODE")
     ui.button(inputOptions, "USE MOBILE FIRE BUTTON", function()
@@ -2586,6 +2757,7 @@ end
     end)
     function app.stop()
         if not app.alive then return end
+        diagnostic:record("session","STOPPED","INFO",true) diagnostic:flush()
         app.alive = false
         app.save()
         app.releaseFire() app.stopFlight() app.stopWalk() app.stopMapView() app.clearMarkers()
@@ -2611,7 +2783,7 @@ end
     RunService:BindToRenderStep("EXIS_ZOMBIE_MAP", Enum.RenderPriority.Camera.Value + 20, function()
         local ok, err = pcall(app.renderMapView)
         if not ok then
-            app.note("area", err)
+            app.note("area", "ERROR: " .. tostring(err))
             if app.editing then app.closeMapEditor(false) end
         end
     end)
@@ -2624,14 +2796,14 @@ end
                 if cfg.fight and app.active() and app.mode == "MATCH" and app.mapId ~= "Unknown" then app.target = app.chooseTarget()
                 else app.target = nil end
             end)
-            if not ok then app.note("target", err) end
+            if not ok then app.note("target", "ERROR: " .. tostring(err)) end
         end
         local ok, err = pcall(app.combatTick, dt)
-        if not ok then app.releaseFire() app.stopFlight() app.stopWalk() app.note("combat", err) end
+        if not ok then app.releaseFire() app.stopFlight() app.stopWalk() app.note("combat", "ERROR: " .. tostring(err)) end
     end)
     RunService:BindToRenderStep("EXIS_ZOMBIE_AIM", Enum.RenderPriority.Camera.Value + 5, function()
         local ok, err = pcall(app.aimTick)
-        if not ok then app.note("aim", err) end
+        if not ok then app.note("aim", "ERROR: " .. tostring(err)) end
     end)
     task.spawn(function()
         while app.alive do
@@ -2662,19 +2834,20 @@ end
                     end
                 end
             end)
-            if not ok then app.note("worker", err) end
+            if not ok then app.note("worker", "ERROR: " .. tostring(err)) end
             task.wait(0.2)
         end
     end)
     task.spawn(function()
         while app.alive do
             local ok, err = pcall(app.skipTick)
-            if not ok then app.note("skip", err) end
+            if not ok then app.note("skip", "ERROR: " .. tostring(err)) end
             task.wait(2)
         end
     end)
     task.spawn(function()
         while app.alive do
+            local ok, err = xpcall(function()
             app.resize()
             local round = RS:FindFirstChild("RoundInfo")
             local root, human = app.root()
@@ -2698,16 +2871,24 @@ end
             local coverage = app.coverageStatus()
             if app.coverageLabel then app.coverageLabel.Text = coverage end
             local lines = {coverage, "PLACE " .. game.PlaceId, "MAP " .. app.mapId, "CLASS " .. tostring(app.className),
+                liveLabel.Text, "MASTER "..tostring(cfg.enabled).." | AUTO PLACE "..tostring(cfg.autoPlace).." | FIGHT "..tostring(cfg.fight),
+                "EDITING "..tostring(app.editing==true).." | BUILD TASK "..tostring(app.placementTask and app.placementTask.slot.name or "NONE"),
                 "FIRE SIGNAL " .. tostring(type(firesignal) == "function"), "CONFIG WRITE " .. tostring(type(writefile) == "function")}
             local keys = {}
             for key in pairs(app.notes) do keys[#keys + 1] = key end
             table.sort(keys)
             for _, key in ipairs(keys) do lines[#lines + 1] = key:upper() .. ": " .. app.notes[key] end
-            diagnosticLabel.Text = table.concat(lines, "\n")
+            app.diagnosticSnapshot = table.concat(lines, "\n")
+            diagnosticLabel.Text = app.diagnosticSnapshot .. "\n\n" .. diagnostic:summary(true) .. "\n\nRECENT LOG\n" .. diagnostic:tail()
+            end, Diagnostics.traceback)
+            if not ok then app.note("diagnostic view", "ERROR: " .. tostring(err)) end
             task.wait(0.5)
         end
     end)
 end
 
-local ok, err = pcall(run)
-if not ok then warn("EXIScript / ZombieRushSurvival: " .. tostring(err)) end
+local ok, err = xpcall(run, Diagnostics.traceback)
+if not ok then
+    if diagnostic then diagnostic:record("startup",err,"ERROR") diagnostic:flush() end
+    warn("EXIScript / ZombieRushSurvival: " .. tostring(err))
+end

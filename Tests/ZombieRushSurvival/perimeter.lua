@@ -164,4 +164,27 @@ test('a full plan reopens the exact destroyed slot without shifting the remainin
  specs={};assert(#app.layout()==0)
  specs={turret,wall};assert(#app.layout()==1)
 end)
+test('runtime layouts leave a clear gap inside every drawn edge after native grid snapping',function()
+ for _,poly in ipairs({square(40),{{x=.4,y=0,z=.7},{x=40.4,y=0,z=.7},{x=40.4,y=0,z=40.7},{x=.4,y=0,z=40.7}}})do
+  local plan,reason=Core.planInside(poly,{turret,wall},nil)
+  assert(#plan>10 and reason:find('BORDER GAP',1,true))
+  for _,slot in ipairs(plan)do
+   local snapped=Core.placementBox(slot,slot.x,slot.z)
+   assert(Core.strictFits(snapped,poly))
+   for _,corner in ipairs(Core.rectangle(snapped,snapped.w,snapped.d))do
+    for n,a in ipairs(poly)do assert(Core.edgeDistance(corner,a,poly[n%#poly+1])>=.999)end
+   end
+  end
+ end
+end)
+test('runtime rotated and concave selections never permit a footprint to cross the chosen polygon',function()
+ local shapes={{{x=0,y=0,z=30},{x=30,y=0,z=0},{x=60,y=0,z=30},{x=30,y=0,z=60}},
+ {{x=0,y=0,z=0},{x=60,y=0,z=0},{x=60,y=0,z=60},{x=40,y=0,z=60},{x=40,y=0,z=20},{x=20,y=0,z=20},{x=20,y=0,z=60},{x=0,y=0,z=60}}}
+ for _,poly in ipairs(shapes)do
+  local plan=Core.planInside(poly,{turret,wall},nil)
+  for _,slot in ipairs(plan)do assert(Core.strictFits(Core.placementBox(slot,slot.x,slot.z),poly))end
+ end
+ assert(not Core.strictFits({x=1.5,z=5,w=3,d=3},square(40)))
+ assert(not Core.strictFits({x=-1,z=5,w=3,d=3},square(40)))
+end)
 print(tests..' layered border, spaced middle, repair and boundary controls checks passed')
