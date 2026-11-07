@@ -69,5 +69,27 @@ test('missing native module names the startup failure after a bounded wait',func
  local ok,message=pcall(loadAPI,'missing','Client.Missing')
  assert(not ok and tostring(message):find('Client.Missing',1,true)and now>=15 and now<16)
 end)
+test('a failed return route retries without waiting while still carrying',function()
+ walk=function()return false end
+ await=function()error('must not stand waiting with a chasing guardian')end
+ assert(not fn('returnEgg','local function stealEgg(')()and carry.IsCarrying)
+end)
+test('confirmed carry starts its return during guardian waking instead of waiting',function()
+ carry.RunBackWakeDelayRequired=true;carry.AreaId='Forest'
+ workspace={FindFirstChild=function()error('must not wait for Chasing')end}
+ local calls=0;api.eggs.ReadOwnerEggs=function()calls=calls+1;return calls==1 and{}or{u={}}end
+ assert(fn('returnEgg','local function escapePreflight(')()and walked and now==0)
+end)
+test('late carry acknowledgement during streaming cancels the next teleport approach',function()
+ local egg={Uid='next',AreaId='Forest'}
+ local old=Core.choose;Core.choose=function()return egg end
+ local root=setmetatable({Position=0},{__newindex=function(_,key)error('must not teleport a carried egg: '..key)end})
+ character=function()return root,{}end;active=function()return true end;escapePreflight=function()return true end;blocked={}
+ api.eggs.ReadFieldEggs=function()return{Records={egg}}end;api.assets={Directory={}}
+ workspace={StreamingEnabled=true};player.RequestStreamAroundAsync=function()carry={IsCarrying=true,Uid='late'}end
+ egg.BottomCFrame={Position=0};carry={IsCarrying=false}
+ local ok,result=pcall(fn('stealEgg','local function plantOrHatch('));Core.choose=old
+ assert(ok and not result and carry.Uid=='late')
+end)
 assert(loadfile('Games/StealAnEgg.lua'))
 print(n..' native transaction and scheduler guard checks passed; module compiles')
