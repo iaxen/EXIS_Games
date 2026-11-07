@@ -148,4 +148,40 @@ test('the live Place call rejects crossing or touching the saved border and acce
  h.candidate.point=v(-.5,0,5);assert(h.app.placeTick()==false and #h.events==0)
  h.candidate.point=v(5.5,0,5.5);assert(h.app.placeTick()==true and #h.events==1)
 end)
+test('a safe player can deploy toward a threatened slot without standing on that slot',function()
+ local h=setup();h.app.placementSafe=function(point)return point.X>6 end
+ assert(h.app.placeTick()==true and #h.events==1)
+end)
+test('the selector keeps a supported target even when zombies occupy its destination',function()
+ local h=setup();local slot={name='Turret',x=0,y=0,z=0,facing=0}
+ h.app.layout=function()return{slot}end;h.app.placementSafe=function()return false end
+ assert(load(extract('    function app.getPlacement(', '    function app.placeTick()'),'selector','t',h.env))()
+ assert(h.app.getPlacement().slot==slot)
+end)
+test('an immediately reachable interior slot beats a distant outer barricade slot',function()
+ local h=setup()
+ local far={name='Wall',role='wall',layer='BARRICADE',x=100,y=0,z=0,facing=0}
+ local near={name='Turret',role='turret',layer='TURRET 3',x=10,y=0,z=4,facing=0}
+ h.app.layout=function()return{far,near}end
+ assert(load(extract('    function app.getPlacement(', '    function app.placeTick()'),'selector','t',h.env))()
+ local candidate=h.app.getPlacement();assert(candidate.slot==near and candidate.inRange)
+end)
+test('a distant threatened target uses a safe stand-off approach inside native range',function()
+ local h=setup();h.app.root=function()return{Position=v(30,3,0),Size=v(2,2,2)},{HipHeight=2}end
+ h.app.placementSafe=function(point)return math.sqrt(point.X*point.X+point.Z*point.Z)>10 end
+ assert(h.app.placeTick()==nil and #h.events==0)
+ assert(h.app.buildGoal.X>10 and(h.app.buildGoal-h.candidate.point).Magnitude<=18)
+end)
+test('being horizontally close does not bypass the native elevation limit',function()
+ local h=setup();h.app.root=function()return{Position=v(0,10,0),Size=v(2,2,2)},{HipHeight=2}end
+ assert(h.app.placeTick()==nil and #h.events==0 and h.app.buildGoal.Y==3)
+end)
+test('placement diagnostics show funds and valid-floor blockers instead of silently returning nil',function()
+ local h=setup();h.app.layout=function()return{{name='Turret',x=0,y=0,z=0,facing=0}}end
+ assert(load(extract('    function app.getPlacement(', '    function app.placeTick()'),'selector','t',h.env))()
+ h.app.afford=function()return false end;assert(h.app.getPlacement()==nil)
+ assert(h.app.placementReadiness:find('WAITING FOR CASH',1,true))
+ h.app.afford=function()return true end;h.app.ground=function()return nil end;assert(h.app.getPlacement()==nil)
+ assert(h.app.placementReadiness:find('no valid support',1,true))
+end)
 print(tests..' movement / placement / input checks passed')

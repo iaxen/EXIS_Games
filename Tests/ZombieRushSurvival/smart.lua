@@ -132,4 +132,13 @@ test('boss combat prevents placement approaches while upgrades can still run',fu
  h.app.getPlacement=function()error('no placement during boss engagement')end
  h.app.matchTick();assert(h.requests[1].args[1]=='PurchaseWeaponTierUpgrade')
 end)
+test('a far initial turret cannot block an affordable defense already in placement range',function()
+ local h=setup();h.cfg.autoPlace=true;h.app.turretEstablished=function()return false end
+ h.app.getPlacement=function(preferred)
+  if preferred then return{affordable=true,inRange=false,slot={role='turret'}}end
+  return{affordable=true,inRange=true,slot={role='wall'}}
+ end
+ h.app.placeTick=function()assert(h.app.placementTask.slot.role=='wall');return true end
+ h.app.matchTick()
+end)
 print(tests..' smart scheduling and route-geometry checks passed')
