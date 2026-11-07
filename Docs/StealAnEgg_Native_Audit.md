@@ -8,8 +8,8 @@ The script uses the supplied Place 107778070777162 export. The decoded source wa
 
 | Source module | Verified contract and usage |
 | --- | --- |
-| Client.EggState / Shared.Types.AreaEggs | Field snapshot has Records containing Uid, AreaId, NestId, AssetCategory, State, BottomCFrame, BoundsCFrame and BoundsSize. Eligible states are Slot, Dropped and GuardCarried. CarryFieldEgg(uid, optionalSlotKey), ReadCarryState and ownership changes drive the loop. Carried and Claimed entries are excluded. |
-| AreaEggsController / AreaEggSlotIdentity | CarryAreaEgg normally holds 1.2 seconds, or 0.25 with workspace FastEggPickupTime. The native call gets `AreaId:NestId` only for FirstAreaEgg_ UIDs. The script waits the same minimum before one native call. |
+| Client.EggState / Shared.Types.AreaEggs | Field snapshot has Records containing Uid, AreaId, NestId, AssetCategory, State, BottomCFrame, BoundsCFrame and BoundsSize. Eligible states match the native prompt controller: Slot and Dropped. GuardCarried is excluded until the native controller exposes a pickup prompt. CarryFieldEgg(uid, optionalSlotKey), ReadCarryState and ownership changes drive the loop. Carried and Claimed entries are excluded. |
+| AreaEggsController / AreaEggSlotIdentity | CarryAreaEgg normally holds 1.2 seconds, or 0.25 with workspace FastEggPickupTime. The native call gets `AreaId:NestId` only for FirstAreaEgg_ UIDs. The script holds the exact selected egg's enabled CarryAreaEgg prompt for its live duration, then uses available native prompt input if needed. It does not make a duplicate raw CarryFieldEgg call after a prompt dispatch. |
 | CarryRunBackEffects | Some eggs wait for the area's Guard.GuardState to become Chasing. Honor this before walking. No CFrame changes during return; no fabricated safe-zone claim. |
 | Client.PlotState | ResolvePlot(userId) returns PlotFolder, CenterPoint and PetArea. Own base and placement are resolved at runtime; no fixed world coordinates. |
 | EggPlacementController / Client.EggState | PlantEgg(uid, localCFrame) expects a frame relative to CenterPoint. Grid placement stays within PetArea, separates existing eggs and requires replicated Placement. Attempts are bounded so a full plot cannot starve ready hatches. |
@@ -57,3 +57,12 @@ Performance/session tools work independently of the farm master. They do not cle
 ## Launch-stage follow-up
 
 The loader now shows detecting/download/compile/startup stages and retains actual failures. Its download URL includes a build/time query. The Steal an Egg file explicitly returns `false, error` after a caught startup failure so the loader cannot mistake it for success. A complete-script mocked client test reaches the main panel and separately verifies missing-adapter propagation. Roblox Luau compilation also passes. These checks do not reproduce the reported live executor failure; the displayed stage/error remains necessary to diagnose it. Both repositories' READMEs include the current fresh-launch command and troubleshooting guide.
+
+
+## Pickup acknowledgement follow-up
+
+A failed steal could fall through to idle treadmill movement, which also walks home, making the sequence look like a completed steal. Pickup now goes through the selected UID's actual enabled CarryAreaEgg prompt, including its real attachment position and hold duration. Native prompt dispatch and exact-UID carry acknowledgement are separate checks. A naturally triggered hold is never dispatched a second time; unavailable input, missing prompt or missing receipt remains an explicit failure.
+
+While reconciling an attempted pickup, hatch/event/training movement is paused. A failed attempt cannot fall through to the treadmill in the same scheduler step. GuardCarried is no longer selectable because the native prompt renderer only exposes Slot and Dropped records. Successful return waits for replication of the exact UID or a newly owned matching egg category; an unrelated inventory-count increase is insufficient. This category fallback is necessary because a redeemed field egg can receive a new inventory UID; it cannot prove identity against simultaneous same-category rewards.
+
+New tests execute the actual pickup helper and scheduler step for hold timing, natural-trigger deduplication, neighbouring prompt rejection, absent/wrong carry receipts, interrupted input cleanup and prevention of fallback home movement. Live executor pickup/guardian behavior still requires verification.
