@@ -19,7 +19,7 @@ local function setup()
  scene={FindFirstChild=function(_,n)if n=='Mrbeast'then return{}end end,GetDescendants=function()return{}end}
  world=function()return scene end;task={spawn=function(fn)queue[#queue+1]=fn end}
  nearest=function(list,pred)for _,m in ipairs(list)do if pred(m)then return m end end end
- work={noFood=function()return hunger end,rawFoodOwned=function()return false end,canCollect=function()return true end,
+ work={boundedRead=function(fn)return fn()end,noFood=function()return hunger end,rawFoodOwned=function()return false end,canCollect=function()return true end,
   meleeWeapon=function()return{},{}end,creatures=function()return rows end,insideBorder=function()return true end,
   safeResource=function()return true end,safeWorkPoint=function()return true end,progressionEnabled=function()return false end,
   questDrops=function()return{}end,questTotal=function(req)return count(req.itemId)end,
@@ -50,7 +50,7 @@ test('nil quest push clears the request instead of retaining stale collection',f
 test('quest updates invalidate old candidate and attack caches',function()work.readQuest();work.goalProbes={};work.attackPlanCache={};handler(1,2,2);assert(work.goalProbes==nil and work.attackPlanCache==nil)end)
 test('quest mode hunts the exact animal yield',function()work.questRequirement={itemId='crab',count=2};local chicken=animal('Chicken');local crab=animal('Crab');assert(work.huntCandidate(work.huntWanted())==crab and not work.huntEligible(chicken))end)
 test('request quota prevents unnecessary extra hunting',function()work.questRequirement={itemId='crab',count=2};held.crab=2;animal('Crab');assert(not work.huntCandidate(work.huntWanted()))end)
-test('quest selection does not replace a higher priority building material goal',function()work.questRequirement={itemId='crab',count=2};work.progressionEnabled=function()return true end;work.objective={kind='build'};assert(next(work.huntWanted())==nil)end)
+test('current quest hunting remains active while another upgrade is selected',function()work.questRequirement={itemId='crab',count=2};work.progressionEnabled=function()return true end;work.objective={kind='build'};assert(work.huntWanted().crab==2)end)
 test('active material hunt stays exact even with unrestricted hunt enabled',function()flags.hunt=true;work.huntingNeeds={crab=1};assert(not work.huntEligible(animal('Chicken'))and work.huntEligible(animal('Crab')))end)
 test('empty food inventory can hunt chickens or crabs',function()flags.huntFood=true;assert(work.huntEligible(animal('Chicken'))and work.huntEligible(animal('Crab')))end)
 test('raw food already in bag stops more food hunting',function()flags.huntFood=true;work.rawFoodOwned=function()return true end;assert(not work.huntEligible(animal('Chicken')))end)
@@ -107,4 +107,41 @@ test('an isolated hit does not interrupt an otherwise manageable active fight',f
 test('low health overrides combat and retreats',function()local h,enemy=threatSetup();work.active='combat';h.Health=20;assert(work.personalThreat()==enemy)end)
 test('damage while surrounded triggers retreat',function()local h,enemy=threatSetup();work.active='combat';work.observedHealth=100;h.Health=95;work.danger=function()return 100,enemy,3 end;assert(work.personalThreat()==enemy)end)
 test('Shadow avoidance stays above attempts to fight',function()local h,enemy=threatSetup();work.shadowThreat=function()return enemy end;assert(work.personalThreat()==enemy)end)
+test('on-sight food mode cannot replace the exact material hunt for MrBeast',function()
+ flags.killFoodOnSight=true;work.isPassiveFood=function()return true end
+ work.huntingNeeds={crab=1}
+ assert(not work.huntEligible(animal('Chicken'))and work.huntEligible(animal('Crab')))
+end)
+test('a quest read timeout clears pending state so the next poll can retry',function()
+ fetchResult={1,1,1}
+ work.boundedRead=function()error('read timed out')end
+ work.readQuest(true);queue[1]();assert(not work.questFetchPending)
+ work.boundedRead=function(fn)return fn()end
+ work.readQuest(true);queue[2]();assert(work.questCache and work.questRequirement.itemId=='wood')
+end)
+test('quest scheduler dispatches partial delivery instead of a false ready loop',function()
+ local a=assert(source:find('            key = "quest",',1,true))
+ local b=assert(source:find('        {\n            key = "drops",',a,true))
+ local job=assert(load('return {\n'..source:sub(a,b-1):gsub('},%s*$','}')))()
+ questTick=function(key,partial)assert(key=='quest'and partial==true)return true end
+ assert(job.run())
+end)
+test('native quest delivery stages a partial stack before the bag is full',function()
+ math.clamp=function(v,a,b)return math.max(a,math.min(b,v))end
+ local a=assert(source:find('    local function questTick(',1,true))
+ local b=assert(source:find('    function work.waterDrop()',a,true))
+ local tick=assert(load(source:sub(a,b-1)..'\nreturn questTick'))()
+ local req={itemId='wood',count=5};local staged={};held.wood=2
+ questInfo={};itemLabel=function(_,_,item)return item.displayName end
+ work.readQuest=function()return req,1,1,7,{}end
+ work.questDrops=function()return staged end;work.questTotal=function()return held.wood+#staged end
+ work.bagState=function()return held.wood,15 end
+ work.running=function()return true end
+ local tool={Name='wood',GetAttribute=function()return held.wood end}
+ tools=function()return held.wood>0 and {tool}or{}end
+ scene.FindFirstChild=function()return{FindFirstChild=function()return{}end}end
+ travel=function()return true end;work.batchDrop=function(_,n)held.wood=held.wood-n;for j=1,n do staged[#staged+1]={}end;return n end
+ work.await=function(_,predicate)return predicate()end;motion={serial=1};opts.jobTimeout=15
+ assert(tick('quest',true)and held.wood==0 and #staged==2)
+end)
 assert(loadfile(path));print(passed..' quest, wildlife, prompt, storage and essential-base checks passed; full module compiles')

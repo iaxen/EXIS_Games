@@ -100,7 +100,7 @@ local function runIslandEscape()
         settleTime = 0.12,
         guardRadius = 14,
         shadowRadius = 60,
-        hoverHeight = 20,
+        hoverHeight = 8, lowHoverVersion = 1,
         roundWait = 20,
         espDistance = 600,
         espLimit = 120,
@@ -403,6 +403,7 @@ local function runIslandEscape()
                 end
                 if type(d.options) == "table" then
                     opts.survivalLoaded = d.options.survivalVersion == 3
+                    opts.lowHoverLoaded = d.options.lowHoverVersion == 1
                     for key, range in pairs({chestHoldPadding={0,4},foodReserve={2,50},stormReserve={6,100},carryFood={1,20}}) do
                         local n = tonumber(d.options[key])
                         if n and n == n then opts[key] = math.clamp(n, range[1], range[2]) end
@@ -441,7 +442,7 @@ local function runIslandEscape()
                     end
                     if type(d.options.codes) == "string" then opts.codes = d.options.codes:sub(1, 4096) end
                     for name, limits in pairs({settleTime = {0, 2}, guardRadius = {6, 80}, shadowRadius = {20, 150},
-                        hoverHeight = {4, 80}, roundWait = {5, 120}, espDistance = {30, 5000}, espLimit = {20, 500},
+                        hoverHeight = {4, 12}, roundWait = {5, 120}, espDistance = {30, 5000}, espLimit = {20, 500},
                         dangerRadius = {8, 60}, baseRadius = {15, 100}}) do
                         local n = tonumber(d.options[name])
                         if n and n == n then opts[name] = math.clamp(n, limits[1], limits[2]) end
@@ -476,6 +477,11 @@ local function runIslandEscape()
         -- Long-run survival remains the goal; preparation does not activate escape.
         flags.escape, flags.nightHover, opts.emergencyEscape = false, true, false
         flags.holdNight, flags.redeemCodes, flags.emergencyHover = true, true, true
+    end
+    if not opts.lowHoverLoaded then
+        opts.hoverHeight = 8
+        flags.emergencyHover = false
+        flags.quest, flags.choiceRewards = true, true
     end
     if not opts.taskMaterialsVersionLoaded then opts.onlyNeeded = true end
     if not opts.schedulerVersionLoaded then opts.interval = 0 end
@@ -1398,7 +1404,7 @@ local function runIslandEscape()
                 "drops", "chopTrees", "mineStone", "mineIron", "liveStatus", "unloadBag", "autoAttack", "killFoodOnSight",
                 "stormStock", "useStorage", "structureCraft", "scavengeAll", "followFootprints", "artifacts", "chests", "puzzles", "autoSprint"}) do flags[key] = true end
             flags.escape = false flags.buildBoat = true
-            flags.nightHover,flags.holdNight,flags.emergencyHover,flags.redeemCodes=true,true,true,true
+            flags.nightHover,flags.holdNight,flags.emergencyHover,flags.redeemCodes=true,true,false,true
             for _, render in pairs(toggles) do render() end
             save()
         end)
@@ -1441,9 +1447,8 @@ local function runIslandEscape()
         toggle(group(p.explore, "ARTIFACTS"), "artifacts", "Fetch the four artifacts", "Compass, Map, Plastic Bucket and Radio. Locked or unsafe locations are skipped.")
         local night = group(p.main, "NIGHT SURVIVAL")
         toggle(night, "holdNight", "Pause routine work at night", "Optional. Turn off to keep working at safe targets inside the border. Defence and urgent survival always take priority.")
-        toggle(night, "nightHover", "Shelter above camp at night", "Finishes the current action, then shelters. Fuel and cooked meals remain available; height does not guarantee safety.")
-        toggle(night, "emergencyHover", "Emergency shelter when overwhelmed", "Returns to camp above the ground when badly hurt or surrounded. Resumes after healing and a clear landing.")
-        number(night, "hoverHeight", "HOVER HEIGHT (STUDS)", 4, 80)
+        toggle(night, "nightHover", "Low hover above camp at night", "Uses a fixed low height. No automatic climb or daytime emergency flight; fuel and cooked meals remain available.")
+        number(night, "hoverHeight", "LOW HOVER HEIGHT (STUDS)", 4, 12)
         local escape = group(p.explore, "LONG RUN / ESCAPE")
         text(escape, "LONG DAYS FIRST • AUTO ESCAPE IS OFF BY DEFAULT")
         switch(escape, "EMERGENCY CONDITIONS ONLY", function() return opts.emergencyEscape end, function(v) opts.emergencyEscape = v end)
@@ -3897,7 +3902,9 @@ local function runIslandEscape()
             work.questFetchPending = true
             local character, generation = player.Character, work.questGeneration or 0
             task.spawn(function()
-                local ok, newIndex, newAlt, newRevision = pcall(q.client.fetchQuest)
+                local ok, newIndex, newAlt, newRevision = pcall(function()
+                    return work.boundedRead(q.client.fetchQuest,"MrBeast quest")
+                end)
                 work.questFetchPending = nil
                 if alive and ok and player.Character == character and scene == world()
                     and generation == (work.questGeneration or 0) then
@@ -3907,6 +3914,7 @@ local function runIslandEscape()
                 end
             end)
         end
+        cache = work.questCache
         local req = cache and cache.index and q.getQuestRequirement(cache.index, cache.alt)
         work.questRequirement = req
         if cache then return req, cache.index, cache.alt, cache.revision, q end
@@ -4592,6 +4600,15 @@ local function runIslandEscape()
         end
         local req = flags.quest and work.questRequirement
         if req then
+            local requested=c.item.byId[req.itemId]
+            if requested and requested.recipeId and count(requested.displayName)==0
+                and work.questTotal(req)<req.count then
+                -- Produce a requested craft through its native recipe, deliver
+                -- that output, then re-read the remaining quest before repeating.
+                result[#result+1]={key="questCraft:"..req.itemId,kind="craft",id=req.itemId,
+                    questFor=req.itemId,info=requested,rank=5.9,name="MRBEAST REQUEST: "..requested.displayName,
+                    amounts=work.recipeAmounts(requested)}
+            end
             result[#result + 1] = {key = "quest:" .. tostring(req.itemId), kind = "quest", itemId = req.itemId, rank = 6,
                 name = "MRBEAST REQUEST", amounts = {[req.itemId] = math.max(0, req.count - #work.questDrops(req))}}
         end
@@ -4825,7 +4842,7 @@ local function runIslandEscape()
         for id, amount in pairs(amounts) do
             local item = config().item.byId[id]
             if amount > 0 and item and count(item.displayName) > 0
-                and (goal.kind == "fuel" or goal.kind == "build" or goal.kind == "bag" or work.stationGoal(goal)) then return true end
+                and (goal.kind == "quest" or goal.kind == "fuel" or goal.kind == "build" or goal.kind == "bag" or work.stationGoal(goal)) then return true end
         end
         if not work.canCollect() then return false end
         local c = config()
@@ -4864,7 +4881,7 @@ local function runIslandEscape()
         return ready
     end
     function work.goalQueueRank(goal)
-        if goal.kind == "quest" then return -170 end
+        if goal.kind == "quest" or goal.questFor then return -170 end
         if goal.kind == "fuel" and not goal.maintenance then return -115 end
         if goal.kind == "fuel" and (goal.maintenance or campData.isOnFire == false) then return -200 end
         if goal.kind == "build" and work.buildRank(goal.info) == 0 then return -190 end
@@ -4888,9 +4905,12 @@ local function runIslandEscape()
         local pinned=work.objective and os.clock()-(work.objectiveProgressAt or 0)<7 and work.objective.key
         table.sort(candidates, function(a, b)
             local ar, br = work.goalQueueRank(a), work.goalQueueRank(b)
-            local ae=a.kind=="fuel" and a.maintenance
-            local be=b.kind=="fuel" and b.maintenance
+            local ae=a.kind=="fuel" and a.maintenance==true
+            local be=b.kind=="fuel" and b.maintenance==true
             if ae~=be then return ae==true end
+            local aq=a.kind=="quest" or a.questFor~=nil
+            local bq=b.kind=="quest" or b.questFor~=nil
+            if aq~=bq then return aq end
             if pinned and ((a.key==pinned)~=(b.key==pinned)) then return a.key==pinned end
             return ar < br or (ar == br and a.key < b.key)
         end)
@@ -5085,7 +5105,7 @@ local function runIslandEscape()
         if key == "evade" then return 0 end
         if key == "combat" then return (flags.combat and work.baseThreat()) and 1 or 1.5 end
         if key == "escape" and opts.emergencyEscape then return 0.8 end
-        if key == "mrbeastReward" then return 3.25 end
+        if key == "mrbeastReward" then return 3.005 end
         if key == "eat" then return 2 end
         if key == "fuel" then return 3 end
         if key == "craft" then return 3.5 end
@@ -5101,7 +5121,7 @@ local function runIslandEscape()
         if key == "autoAttack" then return 1.6 end
         if key == "structures" then return 3.55 end
         if key == "stockpile" then return 7.8 end
-        if key == "quest" then return 3.35 end
+        if key == "quest" then return 3.01 end
         if key == "bagUpgrade" then return 4 end
         if key == "unloadBag" then
             if work.active == key and work.unloadRank then return work.unloadRank end
@@ -5118,7 +5138,7 @@ local function runIslandEscape()
             local goal = work.objective
             if goal and goal.kind == "fuel" then return (goal.maintenance or campData.isOnFire == false) and 3 or 3.45 end
             if goal and goal.kind == "bag" then return 4.1 end
-            if goal and goal.kind == "quest" then return 3.4 end
+            if goal and (goal.kind == "quest" or goal.questFor) then return 3.015 end
             if goal and goal.id and goal.id == work.boatId() then return 9 end
             return 5
         end
@@ -5285,7 +5305,7 @@ local function runIslandEscape()
     work.counts = {felled = 0, picked = 0, guarded = 0, escapes = 0}
     work.artifactNames = {Compass = true, Map = true, ["Plastic Bucket"] = true, Radio = true}
     function work.progressionEnabled()
-        return flags.progression or flags.toolLadder or flags.buildCamp or flags.buildBoat or flags.tidyBag or flags.fuel
+        return flags.quest or flags.progression or flags.toolLadder or flags.buildCamp or flags.buildBoat or flags.tidyBag or flags.fuel
     end
     function work.isNight()
         local scene = world()
@@ -5446,7 +5466,7 @@ local function runIslandEscape()
             local item = c.item.byDisplayName[model.Name]
             if not item or not work.dropAllowed(model) or not work.safeResource(model) then return false end
             local questNeeded = req and item.id == req.itemId and work.questTotal(req) < req.count
-            if questNeeded and (not work.progressionEnabled() or (work.objective and work.objective.kind == "quest")) then return true end
+            if questNeeded then return true end
             if foodNeeded and c.food.byId[item.id] then return true end
             for _, context in ipairs(work.huntLoot or {}) do
                 local point = pos(model)
@@ -5496,8 +5516,7 @@ local function runIslandEscape()
         local wanted, c = {}, config()
         local req = flags.quest and work.questRequirement
         local goal = work.activeGoal or work.objective
-        if req and (not work.progressionEnabled() or goal and goal.kind == "quest")
-            and work.questTotal(req) < req.count then wanted[req.itemId] = req.count - work.questTotal(req) end
+        if req and work.questTotal(req) < req.count then wanted[req.itemId] = req.count - work.questTotal(req) end
         if flags.killFoodOnSight or flags.stormStock and work.foodShortage()
             or flags.huntFood and work.noFood() and not work.rawFoodOwned() and (campData.readyCount or 0) == 0 then
             for id in pairs(c.food.byId) do wanted[id] = math.max(1, wanted[id] or 0) end
@@ -5505,6 +5524,7 @@ local function runIslandEscape()
         return wanted
     end
     function work.huntEligible(model)
+        if work.huntingNeeds then return work.mobYields(model,work.huntingNeeds) end
         if flags.killFoodOnSight and work.isPassiveFood and work.isPassiveFood(model) then return true end
         return (not work.huntingNeeds and flags.hunt) or work.mobYields(model, work.huntWanted())
     end
@@ -5602,11 +5622,7 @@ local function runIslandEscape()
         return acted
     end
     function work.shelterNeeded()
-        if flags.nightHover and work.isNight() then return true end
-        local r, human = root()
-        if not flags.emergencyHover or not r or not human then return false end
-        local _, _, crowd = work.danger(r.Position, opts.dangerRadius)
-        return human.Health/human.MaxHealth*100 <= (work.hover and 75 or opts.retreatHealth) or (crowd or 0) >= 4
+        return flags.nightHover and work.isNight() or false
     end
     function work.releaseHover(force)
         local state = work.hover
@@ -5640,7 +5656,7 @@ local function runIslandEscape()
         local r,human = root()
         if not fire or not r then return false end
         if work.hover and work.hover.character ~= player.Character then work.releaseHover(true) end
-        if not work.hover and (flags.nightHover or flags.emergencyHover) then
+        if not work.hover and flags.nightHover then
             local center=pos(fire)
             local ground=center and motion.floor(center+Vector3.new(10,0,0),fire,20,20)
             if not ground then note("nightHold","NO VERIFIED GROUND AT CAMP") return false end
@@ -5652,13 +5668,8 @@ local function runIslandEscape()
             return travel(fire,"nightHold",9)
         end
         local state=work.hover
-        if state and human.Health < state.health then
-            state.height=math.min(80,state.height+8)
-            r.CFrame=state.land+Vector3.new(0,state.height,0)
-            note("nightHold","DAMAGE DURING HOVER; RAISING ALTITUDE • NOT IMMUNITY")
-        end
         if state then state.health=human.Health end
-        note("nightHold","SHELTER ABOVE CAMP • MONITORING HEALTH / FUEL / COOKED FOOD")
+        note("nightHold","LOW HOVER ABOVE CAMP • NO ALTITUDE ESCALATION")
         return true
     end
     function work.evaluateLost()
@@ -5923,10 +5934,6 @@ local function runIslandEscape()
         local key=job.key
         if key=="evade" then return not work.retaliatingUntil or os.clock()>=work.retaliatingUntil end
         if key=="combat" or key=="eat" or key=="autoAttack" then return true end
-        if key=="nightHold" and flags.emergencyHover then
-            local _,human=root()
-            return human and human.Health/human.MaxHealth*100<=opts.retreatHealth or false
-        end
         if key=="escape" then return opts.emergencyEscape==true end
         if key=="fuel" then
             local state=work.fireState()
@@ -6552,7 +6559,7 @@ local function runIslandEscape()
                 local used, cap = work.bagState()
                 return work.questTotal(req) >= req.count or count(config().item.byId[req.itemId].displayName) > 0
             end,
-            run = questTick,
+            run = function() return questTick("quest", true) end,
         },
         {
             key = "drops",

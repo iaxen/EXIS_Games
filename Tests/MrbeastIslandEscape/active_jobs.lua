@@ -226,4 +226,17 @@ test('fuel batch is capped to current fire capacity and confirms the full deduct
  assert(#events==6 and inventory.Wood==6 and work.fuelPending==nil)
 end)
 os.clock=realClock
+test('a crafted MrBeast request produces a native recipe goal before delivery',function()
+ assert(load(extract('    function work.upgradeCandidates()', '    function work.goalRunnable(')))()
+ flags.quest=true;configData.tool={byId={},byDisplayName={}};configData.armour={byId={},byDisplayName={}}
+ configData.item.byId.requested={id='requested',displayName='Requested',recipeId='requestedRecipe'}
+ work.questRequirement={itemId='requested',count=3};work.questDrops=function()return{}end
+ work.questTotal=function()return inventory.Requested or 0 end;work.campfireGoal=function()end
+ work.recipeAmounts=function()return{wood=2}end
+ local found
+ for _,goal in ipairs(work.upgradeCandidates())do if goal.questFor then found=goal end end
+ assert(found and found.kind=='craft'and found.id=='requested'and found.amounts.wood==2)
+ inventory.Requested=1
+ for _,goal in ipairs(work.upgradeCandidates())do assert(not goal.questFor)end
+end)
 print(passed..' production-helper regression checks passed')
