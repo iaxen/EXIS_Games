@@ -66,3 +66,10 @@ A failed steal could fall through to idle treadmill movement, which also walks h
 While reconciling an attempted pickup, hatch/event/training movement is paused. A failed attempt cannot fall through to the treadmill in the same scheduler step. GuardCarried is no longer selectable because the native prompt renderer only exposes Slot and Dropped records. Successful return waits for replication of the exact UID or a newly owned matching egg category; an unrelated inventory-count increase is insufficient. This category fallback is necessary because a redeemed field egg can receive a new inventory UID; it cannot prove identity against simultaneous same-category rewards.
 
 New tests execute the actual pickup helper and scheduler step for hold timing, natural-trigger deduplication, neighbouring prompt rejection, absent/wrong carry receipts, interrupted input cleanup and prevention of fallback home movement. Live executor pickup/guardian behavior still requires verification.
+
+
+## Egg lists and shared switch controls
+
+The Eggs page now includes the native egg-name catalogue, rarity labels, pet-category identities, search, pagination and include/exclude-all controls. An independent saved eggTypes map filters collection before rarity/distance ranking. A live map list displays native egg names, current biome, rarity and field state with pagination. Shared names retain their pet-category identity so selecting a Forest Egg variant is unambiguous. EggRecords.DisplayName is used when available; native asset egg labels provide a fallback.
+
+The dot-text buttons have been replaced throughout Steal an Egg by the shared Fuzzotopia track/knob switch design. Whole-script UI tests create and click the actual controls to verify on/off knob movement. READMEs intentionally contain only the original launch command and supported game list; technical coverage/limitations remain in this audit.

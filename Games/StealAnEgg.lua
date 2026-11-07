@@ -3,7 +3,8 @@
 local Core={}
 function Core.allowed(record,options,assets)
     local info=assets[record.AssetCategory]
-    if not info or options.excluded[record.AreaId] or options.excludedPets[record.AssetCategory] then return false end
+    if not info or options.excluded[record.AreaId] or options.excludedPets[record.AssetCategory]
+        or options.eggTypes and options.eggTypes[record.AssetCategory]==false then return false end
     local rarity=info.Rarity and info.Rarity._id
     if options.rarities[rarity]==false then return false end
     return record.State=="Slot" or record.State=="Dropped"
@@ -70,7 +71,7 @@ dismiss.Activated:Connect(function()startup.gui:Destroy()end)
 local alive=true
 local connections={}
 local options={master=false,hidePens=false,hideOtherPets=false,hideSelfPets=false,lowDetail=false,disableEffects=false,disableVideos=false,antiAfk=false,autoExecute=false,autoReconnect=false,steal=false,hatch=false,equip=false,treadmill=false,events=false,
-    upgrades=false,rewards=false,fusion=false,LightVsDarkness=true,SammyEvent=true,excluded={},excludedPets={},rarities={},trainingSeconds=20}
+    upgrades=false,rewards=false,fusion=false,LightVsDarkness=true,SammyEvent=true,excluded={},excludedPets={},eggTypes={},rarities={},trainingSeconds=20}
 local api={}
 local pending={}
 local cooldown={}
@@ -613,7 +614,7 @@ if type(readfile)=="function"then pcall(function()
  local loaded=HTTP:JSONDecode(readfile(savePath))
  for k,v in pairs(loaded)do
   if type(v)=="boolean"and type(options[k])=="boolean"then options[k]=v
-  elseif (k=="excluded"or k=="excludedPets"or k=="rarities")and type(v)=="table"then
+  elseif (k=="excluded"or k=="excludedPets"or k=="eggTypes"or k=="rarities")and type(v)=="table"then
    for id,on in pairs(v)do if type(id)=="string"and type(on)=="boolean"then options[k][id]=on end end
   end
  end
@@ -622,14 +623,30 @@ end)end
 local renders={}
 local function toggle(container,key,text,map)
  local target=map or options
- local button=make("TextButton",{Size=UDim2.new(1,-5,0,24),Text="",TextSize=10,Font=Enum.Font.BuilderSans,
-  TextColor3=white,BackgroundColor3=Color3.fromRGB(20,29,41),BorderSizePixel=0,TextXAlignment=Enum.TextXAlignment.Left},container)
- corner(button,5)
- local function render()button.Text="  "..(target[key]and"●  "or"○  ")..text:upper();button.TextColor3=target[key]and blue or white end
- render();renders[button]=render
- button.Destroying:Connect(function()renders[button]=nil end)
- button.Activated:Connect(function()target[key]=not target[key];render();save()end)
- return button
+ local row=make("TextButton",{Size=UDim2.new(1,-5,0,25),Text="",BorderSizePixel=0,
+  BackgroundColor3=Color3.fromRGB(21,30,43)},container)
+ corner(row,5)
+ make("TextLabel",{Position=UDim2.fromOffset(7,0),Size=UDim2.new(1,-53,1,0),
+  BackgroundTransparency=1,Text=text:upper(),TextColor3=white,TextSize=10,TextWrapped=true,
+  Font=Enum.Font.BuilderSans,TextXAlignment=Enum.TextXAlignment.Left},row)
+ local track=make("Frame",{Name="SwitchTrack",Position=UDim2.new(1,-32,.5,-6),Size=UDim2.fromOffset(25,12),
+  BackgroundColor3=Color3.fromRGB(47,59,75),BorderSizePixel=0},row)
+ corner(track,8)
+ local knob=make("Frame",{Name="SwitchKnob",Position=UDim2.fromOffset(2,2),Size=UDim2.fromOffset(8,8),
+  BackgroundColor3=white,BorderSizePixel=0},track)
+ corner(knob,8)
+ local function render()
+  track.BackgroundColor3=target[key]and blue or Color3.fromRGB(47,59,75)
+  knob.Position=UDim2.fromOffset(target[key]and 15 or 2,2)
+ end
+ render();renders[row]=render
+ row.Destroying:Connect(function()renders[row]=nil end)
+ row.Activated:Connect(function()
+  target[key]=not target[key]
+  if map==options.eggTypes then for _,refresh in pairs(renders)do refresh()end else render()end
+  save()
+ end)
+ return row
 end
 local function button(container,text,fn)
  local b=make("TextButton",{Size=UDim2.new(1,-5,0,25),Text=text,TextSize=10,Font=Enum.Font.BuilderSans,
@@ -655,6 +672,75 @@ local eggs=ui.group(pages.Eggs,"Collection and hatching")
 toggle(eggs,"steal","Teleport to egg; run home")
 toggle(eggs,"hatch","Auto plant and native hatch")
 ui.text(eggs,"Highest native rarity rank first, nearest for ties. Exclusions also apply to event eggs in the field snapshot.")
+local eggRecords
+local eggRecordsModule=resolve("Shared.Util.EggRecords")
+if eggRecordsModule then
+ local value=call("load egg names",require,eggRecordsModule)
+ if type(value)=="table"then eggRecords=value end
+end
+local function eggLabel(category,record)
+ local info=api.assets.Directory[category]
+ if eggRecords then
+  local sample=record or {AssetCategory=category,AssetScale=1,AssetEyeColor="Black",AssetColorSeed=0,AssetColorIndex=1,Mutations={}}
+  local ok,name=pcall(eggRecords.DisplayName,sample)
+  if ok and type(name)=="string"then return name end
+ end
+ return info and info.Egg and info.Egg.DisplayName or category.." Egg"
+end
+local eggTypes=ui.group(pages.Eggs,"Egg catalogue • included types")
+local eggSearch=make("TextBox",{Size=UDim2.new(1,-5,0,24),Text="",PlaceholderText="Search egg, pet or rarity",TextSize=11,
+ BackgroundColor3=Color3.fromRGB(20,29,41),TextColor3=white,ClearTextOnFocus=false},eggTypes)
+local eggPage=1
+local eggCount=ui.text(eggTypes,"")
+local eggChoices=make("Frame",{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1},eggTypes)
+make("UIListLayout",{Padding=UDim.new(0,3)},eggChoices)
+local eggEntries={}
+for category,info in pairs(api.assets.Directory)do
+ if info.Egg then eggEntries[#eggEntries+1]={id=category,name=eggLabel(category),rank=tonumber(info.Rarity and info.Rarity.Rank)or 0,
+  rarity=info.Rarity and (info.Rarity.DisplayName or info.Rarity._id)or "Unknown"}end
+end
+table.sort(eggEntries,function(a,b)if a.rank~=b.rank then return a.rank>b.rank end if a.name~=b.name then return a.name<b.name end return a.id<b.id end)
+local eggMatches={}
+local function showEggTypes()
+ for _,child in ipairs(eggChoices:GetChildren())do if child:IsA("TextButton")then child:Destroy()end end
+ eggMatches={}
+ local query=eggSearch.Text:lower()
+ for _,entry in ipairs(eggEntries)do
+  if (entry.name.." "..entry.id.." "..entry.rarity):lower():find(query,1,true)then eggMatches[#eggMatches+1]=entry end
+ end
+ local maxPage=math.max(1,math.ceil(#eggMatches/40));eggPage=math.clamp(eggPage,1,maxPage)
+ eggCount.Text=#eggMatches.." eggs • page "..eggPage.." / "..maxPage
+ for index=(eggPage-1)*40+1,math.min(eggPage*40,#eggMatches)do
+  local entry=eggMatches[index]
+  if options.eggTypes[entry.id]==nil then options.eggTypes[entry.id]=true end
+  toggle(eggChoices,entry.id,entry.name.." | "..entry.rarity.." | "..entry.id,options.eggTypes)
+ end
+end
+button(eggTypes,"Previous egg page",function()eggPage=math.max(1,eggPage-1);showEggTypes()end)
+button(eggTypes,"Next egg page",function()eggPage=eggPage+1;showEggTypes()end)
+button(eggTypes,"Include all eggs",function()for _,entry in ipairs(eggEntries)do options.eggTypes[entry.id]=true end;showEggTypes();save()end)
+button(eggTypes,"Exclude all eggs",function()for _,entry in ipairs(eggEntries)do options.eggTypes[entry.id]=false end;showEggTypes();save()end)
+eggSearch:GetPropertyChangedSignal("Text"):Connect(function()eggPage=1;showEggTypes()end)
+showEggTypes()
+ui.text(eggTypes,"Each switch includes that egg's pet category. Names come from the native egg naming helper when available; pet category distinguishes shared egg names. Biome, rarity and pet exclusions still apply.")
+local liveEggs=ui.group(pages.Eggs,"Live eggs in the map")
+local liveList=ui.text(liveEggs,"")
+local livePage=1
+local function refreshLiveEggs()
+ local rows=api.eggs.ReadFieldEggs().Records
+ table.sort(rows,function(a,b)return a.Uid<b.Uid end)
+ local maxPage=math.max(1,math.ceil(#rows/20));livePage=math.clamp(livePage,1,maxPage)
+ local lines={#rows.." live eggs • page "..livePage.." / "..maxPage}
+ for i=(livePage-1)*20+1,math.min(livePage*20,#rows)do
+  local record=rows[i];local info=api.assets.Directory[record.AssetCategory]
+  lines[#lines+1]=eggLabel(record.AssetCategory,record).." | "..tostring(info and info.Rarity and info.Rarity._id or "Unknown")
+   .." | "..record.AreaId.." | "..record.State.." | "..record.AssetCategory
+ end
+ liveList.Text=table.concat(lines,"\n")
+end
+button(liveEggs,"Refresh live eggs",refreshLiveEggs)
+button(liveEggs,"Previous live page",function()livePage=math.max(1,livePage-1);refreshLiveEggs()end)
+button(liveEggs,"Next live page",function()livePage=livePage+1;refreshLiveEggs()end)
 local biome=ui.group(pages.Biomes,"Excluded biomes")
 local sorted={}for id in pairs(api.areas.Directory)do sorted[#sorted+1]=id end table.sort(sorted)
 for _,id in ipairs(sorted)do toggle(biome,id,"Exclude "..id,options.excluded)end
@@ -830,7 +916,7 @@ button(session,"Reload saved settings (paused)",function()
   local data=HTTP:JSONDecode(readfile(savePath));options.master=false
   for k,v in pairs(data)do
    if k~="master"and type(v)=="boolean"and type(options[k])=="boolean"then options[k]=v
-   elseif (k=="excluded"or k=="excludedPets"or k=="rarities")and type(v)=="table"then
+   elseif (k=="excluded"or k=="excludedPets"or k=="eggTypes"or k=="rarities")and type(v)=="table"then
     for id in pairs(options[k])do options[k][id]=nil end
     for id,on in pairs(v)do if type(id)=="string"and type(on)=="boolean"then options[k][id]=on end end
    end
@@ -890,6 +976,7 @@ task.spawn(function()
     game:GetService("TeleportService"):Teleport(game.PlaceId,player)
    elseif not options.autoReconnect then reconnectAt=nil end
    diagnostics.Text=diagnosticsText()
+   if ui.selected=="Eggs"then refreshLiveEggs()end
   end)
   if not ok then note("Tools: "..tostring(err))end
   task.wait(2)
