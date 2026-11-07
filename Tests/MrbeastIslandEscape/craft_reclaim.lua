@@ -15,6 +15,7 @@ local function setup()
  cfg.item.byId.axe2.recipeId='r';cfg.item.byId.axe2.recipe={wood=4}
  config=function()return cfg end
  count=function(name)return stock[name]or 0 end
+ tools=function()return{}end
  player={Name='Tester',Character={}};root=function()return{},{}end
  workspace={GetServerTimeNow=function()return now end}
  world=function()return{FindFirstChild=function(_,key)if key=='DroppedItems'then return{GetChildren=function()return ground end}end end}end
@@ -23,7 +24,7 @@ local function setup()
  note=function()end
  built=function()end
  pos=function(m)return m.point end
- work={boatId=function()return'boat'end,needs={},amounts={},resourceNeeds={},sent=0,campStash={},
+ work={models=function()return ground end,boatId=function()return'boat'end,needs={},amounts={},resourceNeeds={},sent=0,campStash={},
   pickupEligible=function()return true end,safeResource=function()return true end,noFood=function()return false end,
   bagState=function()return 0,10 end,canCollect=function()return true end,
   station=function()return zone,zone end,fireState=function()return{level=1}end,
@@ -155,6 +156,12 @@ test('quest collection and delivery precede routine hunting cooking and unloadin
   assert(work.rank{key='progression'}<work.rank{key=key})
  end
  assert(work.rank{key='fuel'}<work.rank{key='quest'})
+end)
+test('a failed MrBeast goal returns after its retry backoff and displaces an optional upgrade',function()
+ local request={key='quest:wood',kind='quest',itemId='wood',amounts={wood=4},info={}}
+ local other=craftGoal();goals={request,other};work.goalRunnable=function()return true end
+ work.upgradeBlocked={[request.key]=now+1};assert(work.chooseUpgrade()==other)
+ now=now+1.1;assert(work.chooseUpgrade()==request)
 end)
 assert(loadfile(path))
 print(passed..' reclaim and crafting-priority checks passed; complete module compiles')

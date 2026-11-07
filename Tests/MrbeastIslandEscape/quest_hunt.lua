@@ -144,4 +144,11 @@ test('native quest delivery stages a partial stack before the bag is full',funct
  work.await=function(_,predicate)return predicate()end;motion={serial=1};opts.jobTimeout=15
  assert(tick('quest',true)and held.wood==0 and #staged==2)
 end)
+test('failed quest refresh retains the active request and the next poll retries it',function()
+ work.readQuest();handler(2,2,3)
+ work.boundedRead=function()error('temporary fetch failure')end;queue[1]()
+ assert(work.readQuest().itemId=='crab'and work.questRequirement.count==2)
+ now=now+3;fetchResult={5,2,4};work.boundedRead=function(fn)return fn()end
+ work.readQuest(true);queue[#queue]();assert(work.readQuest().itemId=='crab'and work.questRequirement.count==5)
+end)
 assert(loadfile(path));print(passed..' quest, wildlife, prompt, storage and essential-base checks passed; full module compiles')

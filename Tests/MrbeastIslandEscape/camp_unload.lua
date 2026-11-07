@@ -76,10 +76,10 @@ test('unsafe campfire defers unloading without spending inventory',function()
  tool('wood','Wood',3);work.safeResource=function()return false end
  assert(not work.unloadBag()and count('Wood')==3 and #events==0)
 end)
-test('tools, spare bags, armour and escape artifacts are protected',function()
+test('one working tool is retained while spare equipment and loose parts are stockpiled',function()
  cfg.tool.byId.axe={};cfg.bag.byId.bag2={};cfg.armour.byId.vest={}
  tool('axe','Axe',1);tool('bag2','Bag2',1);tool('vest','Vest',1);tool('compass','Compass',1)
- assert(work.unloadCandidate()==nil and not work.unloadBag()and eventCount('drop:')==0)
+ assert(work.unloadBag()and count('Axe')==1 and count('Bag2')==0 and count('Vest')==0 and count('Compass')==0)
 end)
 test('current direct-craft ingredients stay in the bag until the recipe can be crafted',function()
  tool('wood','Wood',3);tool('stone','Stone',2)

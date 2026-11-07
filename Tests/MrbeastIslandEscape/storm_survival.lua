@@ -36,7 +36,7 @@ local function setup()
   tool={byId={},byDisplayName={}},mob={byId={Chicken={dropId='chicken'},Crab={dropId='crab'},Spider={}}},itemDrop={byId={chicken={{itemCN='Raw'}},crab={{itemCN='Raw'}}}},
   misc={},build={byId={}},freeBuildList={list={}},freeBuild={byCnId={}}}
  item('raw','Raw');item('cooked','Cooked');item('fruit','Fruit');item('wood','Wood');item('crystal','Crystal')
- flags={autoFarm=true,stormStock=true,killFoodOnSight=true,useStorage=true,structureCraft=true,autoAttack=true};opts={jobTimeout=15,foodReserve=8,stormReserve=20,carryFood=3,huntRadius=40,dangerRadius=20,combatMargin=.75,enemyReach=4,retreatHealth=35,guardRadius=14,chestHoldPadding=1.5}
+ flags={cook=true,autoFarm=true,stormStock=true,killFoodOnSight=true,useStorage=true,structureCraft=true,autoAttack=true};opts={jobTimeout=15,foodReserve=8,stormReserve=20,carryFood=3,huntRadius=40,dangerRadius=20,combatMargin=.75,enemyReach=4,retreatHealth=35,guardRadius=14,chestHoldPadding=1.5}
  player={Character={},Name='Tester',GetAttribute=function()return nil end};motion={serial=0};campData={};furnaceData={};connections={};alive=true;failed={};due={}
  scene={Day={Value=1},IsRaining={Value=false},FindFirstChild=function(self,n)return self[n]end}
  world=function()return scene end;config=function()return cfg end;pos=function(m)return m.point end
@@ -45,11 +45,11 @@ local function setup()
  r={Position=vec(5.25,3,0),Size=vec(2,2,2)};h={Health=100,MaxHealth=100,HipHeight=2}
  root=function()return r,h end;note=function(k,v)events[#events+1]=k..':'..v end
  nearest=function(list,pred)for _,m in ipairs(list)do if pred(m)then return m end end end
- work={models=function(k)return models[k]or{}end,markCampDrop=function(m)return m.stashed end,
+ work={bagState=function()return 0,15 end,models=function(k)return models[k]or{}end,markCampDrop=function(m)return m.stashed end,
   isHostile=function(m)return m.Name=='Spider'end,canCollect=function()return true end,
   safeResource=function()return true end,insideBorder=function()return true end,lineOfSight=function()return true end,
   hostiles=function()return{}end,danger=function()return 0,nil,0 end,meleeClearance=function()return .5 end,
-  rawFoodOwned=function()return count('Raw')>0 end,noFood=function()return count('Cooked')==0 end,
+  foodAllowed=function(kind,id)return kind=='food'and id=='cooked'end,rawFoodOwned=function()return count('Raw')>0 end,noFood=function()return count('Cooked')==0 end,
   cookReady=function()return false end,pause=function(_,n)now=now+n;for _,e in ipairs(schedule)do if not e.done and now>=e.at then e.done=true;e.fn()end end return not work.preempted end,
   unloadCount=function(t)return t.attrs.count end,running=function()return not work.preempted end,
   await=function(key,predicate,seconds)local stop=now+(seconds or 3)repeat if predicate()then return true end;if work.preempted then return false end;now=now+.02;for _,e in ipairs(schedule)do if not e.done and now>=e.at then e.done=true;e.fn()end end until now>=stop;return false end}
@@ -60,7 +60,7 @@ local function setup()
  body('    function work.stormActive()', '    local jobsList = {')
  body('    function work.mobDropsFood(', '    function work.bagSubmissionReady()')
  body('    function work.mobYields(', '    function work.mobDropsFood(')
- body('    function work.meleeWeapon()', '    function work.clearSceneIndex()')
+ body('    function work.meleeWeapon(key)', '    function work.clearSceneIndex()')
  body('    function work.stanceScore(', '    function work.combatPosition(')
  body('    function work.interactPrompt(', '    function work.collectModel(')
 end
@@ -78,7 +78,7 @@ end)
 test('food stock counts carried stored stashed ready and queued supplies',function()
  held('Cooked',2);held('Raw',1);work.storageSnapshot={['1']={displayName='Cooked',count=4}}
  local d=model('Cooked');d.attrs.ownerName='Tester';d.attrs.count=3;d.stashed=true;models.drops={d};campData.readyCount=2;campData.pendingCookCount=5
- local cooked,raw,carry=work.foodCounts();assert(cooked==11 and raw==6 and carry==2)
+ local cooked,raw,carry=work.foodCounts();assert(cooked==9 and raw==6 and carry==2)
 end)
 test('raw food in the bag no longer stops on-sight chicken or crab hunting',function()
  held('Raw',10);local chicken=model('Chicken');chicken.Humanoid={Health=10};models.entities={chicken}
@@ -86,18 +86,63 @@ test('raw food in the bag no longer stops on-sight chicken or crab hunting',func
  assert(work.isPassiveFood(chicken)and work.foodHuntCandidate()==chicken)
  assert(work.isPassiveFood(model('Crab'))and not work.isPassiveFood(model('Spider')))
 end)
+test('animal display names and native ID attributes resolve the configured food drop instead of disappearing from creature scans',function()
+ body('    function work.mobInfo(', '    function work.isHostile(')
+ cfg.mob.byId.small_crab={displayName='Beach Crab',dropId='crab',passive=true}
+ local displayed=model('Beach Crab');assert(work.mobInfo(displayed)==cfg.mob.byId.small_crab and work.mobDropsFood(displayed))
+ local renamed=model('Creature');renamed.attrs.mobId='small_crab';assert(work.mobInfo(renamed)==cfg.mob.byId.small_crab)
+ local unknown=model('Unknown Monster');assert(work.mobInfo(unknown)==nil)
+ local chicken=model('Chicken');cfg.mob.byId.Chicken=nil;work.mobLookupSource=nil
+ assert(work.mobInfo(chicken).passive and work.isPassiveFood(chicken))
+end)
 test('disabling on-sight hunting permits the reserve target to stop additional hunts',function()
  flags.killFoodOnSight=false;held('Cooked',8);assert(not work.foodShortage());scene.Day.Value=6;assert(work.foodShortage())
 end)
-test('cooked carry ration survives repeated overflow calculations',function()
- local t=held('Cooked',20);assert(work.foodKeepCount('cooked')==3);t.attrs.count=3;assert(work.foodKeepCount('cooked')==3 and work.foodKeepCount('raw')==0)
+test('healthy food stock is unloaded completely and a hungry meal keeps only one',function()
+ local t=held('Cooked',20);assert(work.foodKeepCount('cooked',t)==0)
+ h.GetAttribute=function(_,key)return key=='hunger'and 10 or 100 end
+ assert(work.foodKeepCount('cooked',t)==1 and work.foodKeepCount('raw')==0)
 end)
-test('food supply requests enough stored cooked food even when some is already carried',function()
- held('Cooked',2);assert(work.foodSupplyGoal().amounts.cooked==3)
+test('food supply does not refill a healthy carried ration',function()
+ held('Cooked',2);assert(work.foodSupplyGoal().amounts.cooked==nil)
 end)
 test('short animal melee position is accepted by horizontal native reach',function()
  local chicken=model('Chicken');assert(work.stanceScore(r.Position,chicken,{range=6,toolType='axe'}))
  assert(not work.stanceScore(r.Position,chicken,{range=6,toolType='gun'}))
+end)
+test('a short passive animal is approached inside the native three-dimensional overlap sphere',function()
+ body('    function work.hitVerticalGap(', '    function work.stanceScore(')
+ body('    function work.combatPosition(', '    function work.attackPlan(')
+ local chicken=model('Chicken',vec(0,0,0))
+ chicken.GetBoundingBox=function()return{Position=vec(0,1,0)},vec(2,2,2)end
+ motion.floor=function(point)return vec(point.X,0,point.Z)end;motion.clearSegment=function()return true end
+ local point=work.combatPosition(chicken,{range=3,toolType='axe'})
+ assert(point and work.stanceScore(point,chicken,{range=3,toolType='axe'}))
+ local gap=work.hitVerticalGap(point,chicken)
+ assert(math.sqrt(point.X^2+point.Z^2+gap^2)<2.75)
+ assert(not work.stanceScore(vec(2.8,3,0),chicken,{range=3,toolType='axe'}))
+end)
+test('passive hunting prefers a working melee tool even when low health would favor a gun in combat',function()
+ cfg.tool.byDisplayName.Axe={atkDmg=20,useCd=.5,range=3,toolType='axe'}
+ cfg.tool.byDisplayName.Gun={atkDmg=10,useCd=1,range=40,toolType='gun'}
+ local axe=held('Axe',1);local gun=held('Gun',1);gun.attrs.ammo=5;h.Health=50
+ work.danger=function()return 100,nil,3 end
+ assert(work.meleeWeapon('foodHunt')==axe and work.meleeWeapon('combat')==gun)
+end)
+test('on-sight food hunting is high priority at action boundaries while survival and MrBeast requests go first',function()
+ body('    function work.rank(job)', '    function work.pick(')
+ assert(work.rank{key='eat'}<work.rank{key='foodHunt'})
+ assert(work.rank{key='quest'}<work.rank{key='foodHunt'})
+ assert(work.rank{key='foodHunt'}<work.rank{key='cook'})
+ assert(not work.interruptsInteraction{key='foodHunt'})
+end)
+test('a food hunt finishes one animal then clears its temporary targeting mode even on failure',function()
+ local text=extract('        {key="foodHunt"', '        {key="foodCache"')
+ local jobs=assert(load('return{'..text..'}'))();local job=jobs[1]
+ defend=function(key)assert(key=='foodHunt'and work.huntingPassive);return true end
+ assert(job.run()and not work.huntingPassive and work.foodHuntAt>now)
+ defend=function()error('native input failed')end
+ assert(not pcall(job.run)and not work.huntingPassive)
 end)
 test('crowded combat prefers an available ranged weapon and rejects empty guns',function()
  cfg.tool.byDisplayName.Axe={atkDmg=20,useCd=.5,range=6,toolType='axe'};cfg.tool.byDisplayName.Gun={atkDmg=10,useCd=1,range=40,toolType='gun'}
@@ -275,22 +320,24 @@ test('raw storage reclaim continues until cooked reserves meet the target',funct
 end)
 test('only nighttime enables low hover even if the old emergency flag was saved',function()
  body('    function work.shelterNeeded()', '    function work.releaseHover(')
- flags.nightHover=true;flags.emergencyHover=true
+ flags.holdNight=true;flags.nightHover=true;flags.emergencyHover=true
  local night=false;work.isNight=function()return night end
  assert(not work.shelterNeeded());night=true;assert(work.shelterNeeded())
  night=false;h.Health=20;assert(not work.shelterNeeded());h.Health=100
  work.danger=function()return 1,nil,4 end;assert(not work.shelterNeeded())
 end)
-test('low hover stays at eight studs after damage and refuses an unsafe landing',function()
+test('hover uses checked positions and lowers its height rather than climbing after unexplained damage',function()
  body('    function work.releaseHover(', '    function work.evaluateLost()')
  local mt={__add=function(a,b)return setmetatable({Position=a.Position+b},getmetatable(a))end}
  CFrame={new=function(p)return setmetatable({Position=p},mt)end}
  local fire=model('Campfire');built=function()return fire end
  r.Parent=true;r.Anchored=false;r.CFrame=CFrame.new(r.Position)
  motion.floor=function(p)return vec(p.X,0,p.Z)end
+ work.hoverBodyClear=function()return true end;work.hoverClearance=function()return 20 end
+ work.hoverDestination=function(_,height)return{land=vec(12,3,0),point=vec(12,3+height,0)}end
  flags.nightHover=true;opts.hoverHeight=8;work.shelterNeeded=function()return true end
  assert(work.nightHold()and r.Anchored and work.hover.height==8)
- h.Health=90;assert(work.nightHold()and work.hover.height==8 and r.CFrame.Position.Y==11)
+ h.Health=90;now=1;assert(work.nightHold()and work.hover.height==6 and r.CFrame.Position.Y==9)
  assert(not work.releaseHover()and r.Anchored)
  work.shelterNeeded=function()return false end;work.safeWorkPoint=function()return false end
  assert(not work.releaseHover()and r.Anchored)
