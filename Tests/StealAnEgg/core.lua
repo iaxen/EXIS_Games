@@ -17,6 +17,26 @@ check('dropped eggs remain eligible',function()for _,s in ipairs({'Dropped'})do 
 check('unknown categories are skipped',function()assert(not Core.allowed(egg('a','Unknown','Forest'),options,assets))end)
 check('rejected eggs back off without hiding other targets',function()local a=egg('a','Dragon','Forest');local b=egg('b','Chicken','Forest');assert(Core.choose({a,b},options,assets,vec(0,0,0),{a=5},1)==b);assert(Core.choose({a,b},options,assets,vec(0,0,0),{a=5},6)==a)end)
 check('first-area carry includes native slot key',function()assert(Core.firstSlot(egg('FirstAreaEgg_4','Chicken','Forest'))=='Forest:Slot_001');assert(Core.firstSlot(egg('ordinary','Chicken','Forest'))==nil)end)
+check('larger highest-rarity egg outranks a nearer smaller egg',function()
+ local a=egg('small','Dragon','Forest',nil,1);a.BoundsSize=vec(2,4,2);a.AssetScale=1
+ local b=egg('big','Dragon','Volcano',nil,1000);b.BoundsSize=vec(4,8,4);b.AssetScale=2
+ assert(Core.choose({a,b},options,assets,vec(0,0,0),{},0)==b)
+end)
+check('rarity always outranks size across tiers',function()
+ local a=egg('common','Chicken','Forest',nil,1);a.BoundsSize=vec(100,100,100)
+ local b=egg('rare','Dragon','Volcano',nil,1000);b.BoundsSize=vec(1,1,1)
+ assert(Core.choose({a,b},options,assets,vec(0,0,0),{},0)==b)
+end)
+check('scale resolves size when bounds are absent',function()
+ local a=egg('a','Dragon','Forest',nil,1);a.AssetScale=1
+ local b=egg('b','Dragon','Forest',nil,100);b.AssetScale=3
+ assert(Core.choose({a,b},options,assets,vec(0,0,0),{},0)==b)
+end)
+check('identical rarity size and distance select a stable UID',function()
+ local a=egg('a','Dragon','Forest');local b=egg('b','Dragon','Forest')
+ assert(Core.choose({b,a},options,assets,vec(0,0,0),{},0)==a)
+ assert(Core.choose({a,b},options,assets,vec(0,0,0),{},0)==a)
+end)
 local kernel={MayEnterFuse=function(_,item)return not item.IsFavorite and not item.InFuse end}
 check('fusion takes exactly native input count of matching duplicates',function()local inv={}for i=1,4 do inv[tostring(i)]={Category='Chicken'}end;local g=Core.fuseGroup(inv,{},assets,kernel,3);assert(#g==3 and g[1]=='1'and g[3]=='3')end)
 check('fusion excludes equipped favorite and temporary pets',function()local inv={a={Category='Chicken'},b={Category='Chicken',IsFavorite=true},c={Category='Chicken',CreatorTemporary=true},d={Category='Chicken'}};assert(not Core.fuseGroup(inv,{a=true},assets,kernel,2))end)
