@@ -239,4 +239,25 @@ test('a crafted MrBeast request produces a native recipe goal before delivery',f
  inventory.Requested=1
  for _,goal in ipairs(work.upgradeCandidates())do assert(not goal.questFor)end
 end)
+local function questReserve(id,n)
+ flags.quest=true;work.questRequirement={itemId=id,count=n};work.questDrops=function()return{}end
+ assert(load(extract('    function work.questReserved(', '    function work.toolKeepCount(')))()
+end
+test('routine native submission spends surplus while preserving the requested quest quantity',function()
+ inventory.Meat=12;questReserve('meat',5);receipt('MakeFire','addFood','Meat',.1)
+ assert(work.submitUnits('cook','MakeFire','addFood',{meat=12},'meat')and #events==7 and inventory.Meat==5)
+end)
+test('all-requested raw food cannot be cooked away by a false ready job',function()
+ inventory.Meat=5;questReserve('meat',5);buildings.Campfire={};assert(not work.cookReady())
+ assert(not work.submitUnits('cook','MakeFire','addFood',{meat=5},'meat')and #events==0)
+end)
+test('critical fire maintenance may override the fuel reserve needed for a quest',function()
+ inventory.Wood=3;questReserve('wood',3);campData.isOnFire=false
+ assert(work.spendable('wood','fuel')==3 and work.spendable('wood','cook')==0)
+end)
+test('optional construction cannot consume quest stock through its whole-recipe native call',function()
+ inventory.Wood=10;questReserve('wood',7)
+ configData.build.byId={a={assetId='A',recipeId='r'}};configData.recipe.byId.r={require_wood=5};buildings.A_Construct={Parent=true}
+ assert(not work.contribute('build',false)and #events==0 and inventory.Wood==10)
+end)
 print(passed..' production-helper regression checks passed')
