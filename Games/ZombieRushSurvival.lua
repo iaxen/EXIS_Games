@@ -2244,28 +2244,38 @@ local function run()
         if not point or not camera then app.releaseFire() return end
         local origin = camera.CFrame.Position
         if app.raycast(origin, point - origin, app.mapFilters()) then app.releaseFire() return end
+        if cfg.headAim then app.aimTick() end
         app.holdFire(tool, info)
     end
     function app.aimTick()
-        if not cfg.fight or not cfg.headAim or not app.active() or not app.target then return end
-        if not app.editing and app.buildGoal and not (app.target.boss and cfg.bossFirst) then return end
+        if not cfg.fight or not cfg.headAim or not app.active() then
+            app.aimStatus="OFF / INACTIVE: enable FIGHT MODE and HEAD AIM with a live character" return
+        end
+        if not app.target then app.aimStatus="WAITING: no live zombie target" return end
         local camera, target = workspace.CurrentCamera, app.target.model
-        if not camera or not target.Parent then return end
+        if not camera or not target or not target.Parent then app.aimStatus="WAITING: camera / target unavailable" return end
         local point = app.head(target)
-        if not point then return end
+        if not point then app.aimStatus="WAITING: target head / hitbox not loaded" return end
+        -- Building uses world-space destinations, so camera aiming can continue
+        -- while moving to a defense slot, teleport dodging, or editing the map.
         local crosshair = app.module(shared:FindFirstChild("ClientGunDependencies"), "CrosshairService")
         local origin = camera.CFrame.Position
         if (point - origin).Magnitude < 0.1 then return end
         camera.CFrame = CFrame.lookAt(origin, point)
-        local ray = crosshair and crosshair.GetAimCameraRay(camera)
-        if ray then
-            local desired, actual = (point - ray.Origin).Unit, ray.Direction.Unit
-            local axis = actual:Cross(desired)
-            if axis.Magnitude > 0.0001 then
-                local rotation = CFrame.fromAxisAngle(axis.Unit, math.acos(math.clamp(actual:Dot(desired), -1, 1)))
-                camera.CFrame = CFrame.new(origin) * rotation * camera.CFrame.Rotation
-            end
+        local ray
+        -- Re-sample after the first rotation: offset desktop/mobile crosshairs
+        -- can also move the ray origin on the near plane.
+        for pass=1,2 do
+            ray=crosshair and type(crosshair.GetAimCameraRay)=="function" and crosshair.GetAimCameraRay(camera)
+            if not ray or (point-ray.Origin).Magnitude<.001 then break end
+            local desired,actual=(point-ray.Origin).Unit,ray.Direction.Unit
+            local axis=actual:Cross(desired)
+            if axis.Magnitude<=.0001 then break end
+            local rotation=CFrame.fromAxisAngle(axis.Unit,math.acos(math.clamp(actual:Dot(desired),-1,1)))
+            camera.CFrame=CFrame.new(origin)*rotation*camera.CFrame.Rotation
         end
+        camera.Focus=CFrame.new(point)
+        app.aimStatus=ray and "TRACKING HEAD: native crosshair ray" or "TRACKING HEAD: camera center (native ray unavailable)"
     end
     -- Compact EXIS interface: sidebar categories and expanding child sections.
     local ui = {}
@@ -2872,7 +2882,7 @@ end
         local ok, err = pcall(app.combatTick, dt)
         if not ok then app.releaseFire() app.stopFlight() app.stopWalk() app.note("combat", "ERROR: " .. tostring(err)) end
     end)
-    RunService:BindToRenderStep("EXIS_ZOMBIE_AIM", Enum.RenderPriority.Camera.Value + 5, function()
+    RunService:BindToRenderStep("EXIS_ZOMBIE_AIM", Enum.RenderPriority.Last.Value - 1, function()
         local ok, err = pcall(app.aimTick)
         if not ok then app.note("aim", "ERROR: " .. tostring(err)) end
     end)
@@ -2945,6 +2955,7 @@ end
                 liveLabel.Text, "MASTER "..tostring(cfg.enabled).." | AUTO PLACE "..tostring(cfg.autoPlace).." | FIGHT "..tostring(cfg.fight),
                 "EDITING "..tostring(app.editing==true).." | BUILD TASK "..tostring(app.placementTask and app.placementTask.slot.name or "NONE"),
                 "PLACEMENT: "..tostring(app.placementReadiness or "No placement scan yet; check AUTO PLACE and master switches"),
+                "AIM: "..tostring(app.aimStatus or "WAITING FOR CAMERA UPDATE"),
                 "FIRE SIGNAL " .. tostring(type(firesignal) == "function"), "CONFIG WRITE " .. tostring(type(writefile) == "function")}
             local keys = {}
             for key in pairs(app.notes) do keys[#keys + 1] = key end
