@@ -19,7 +19,7 @@ local function setup()
  task={wait=function()now=now+.03;if afterWait then afterWait()end end}
  Pathfinding={CreatePath=function()return{Status='Success',ComputeAsync=function()computed=computed+1 end,
   GetWaypoints=function()return{{Position=vec(0,0,0)},{Position=vec(15,0,0)},{Position=vec(30,0,0)}}end}end}
- guardianRows=function()return{}end
+ guardianRows=function()return{}end;newEggOpportunity=function()return false end
 end
 local n=0
 local function test(name,fn)setup();fn();n=n+1;print('PASS '..name)end
@@ -39,6 +39,14 @@ test('a carry UID change stops the old route and restores movement state',functi
 end)
 test('a non-carry routine walk yields immediately if an egg is acquired',function()
  assert(not walker()(vec(30,0,0))and computed==0 and #moves==1)
+end)
+test('an uncommitted routine walk yields when a better spawned egg becomes available',function()
+ held={IsCarrying=false};newEggOpportunity=function()return true end
+ assert(not walker()(vec(30,0,0))and computed==0 and #moves==1)
+end)
+test('a confirmed carry keeps its route even when another egg spawns',function()
+ newEggOpportunity=function()return true end
+ assert(walker()(vec(30,0,0),'u')and restored==1)
 end)
 test('native path rejection cancels the old movement target',function()
  Pathfinding.CreatePath=function()return{Status='NoPath',ComputeAsync=function()end}end

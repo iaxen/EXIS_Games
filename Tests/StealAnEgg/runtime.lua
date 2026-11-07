@@ -82,7 +82,7 @@ test('confirmed carry starts its return during guardian waking instead of waitin
 end)
 test('late carry acknowledgement during streaming cancels the next teleport approach',function()
  local egg={Uid='next',AreaId='Forest'}
- local old=Core.choose;Core.choose=function()return egg end
+ local old=Core.choose;Core.choose=function()return egg end;bestEgg=function()return egg end
  local root=setmetatable({Position=0},{__newindex=function(_,key)error('must not teleport a carried egg: '..key)end})
  character=function()return root,{}end;active=function()return true end;escapePreflight=function()return true end;blocked={}
  api.eggs.ReadFieldEggs=function()return{Records={egg}}end;api.assets={Directory={}}

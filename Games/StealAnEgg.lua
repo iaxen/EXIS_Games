@@ -9,17 +9,43 @@ function Core.allowed(record,options,assets)
     if options.rarities[rarity]==false then return false end
     return record.State=="Slot" or record.State=="Dropped"
 end
+-- Compare native rarity first, then actual spawned size, scale, distance and UID.
+function Core.size(record)
+    local size=record.BoundsSize
+    if size and size.X>0 and size.Y>0 and size.Z>0 then return size.X*size.Y*size.Z end
+    return math.max(0,tonumber(record.AssetScale)or 1)^3
+end
+function Core.better(a,b,assets,position)
+    if not b then return true end
+    local function rank(r)local info=assets[r.AssetCategory];return tonumber(info and info.Rarity and info.Rarity.Rank)or 0 end
+    local ar,br=rank(a),rank(b)
+    if ar~=br then return ar>br end
+    local az,bz=Core.size(a),Core.size(b)
+    if az~=bz then return az>bz end
+    local as,bs=tonumber(a.AssetScale)or 1,tonumber(b.AssetScale)or 1
+    if as~=bs then return as>bs end
+    if position and a.BottomCFrame and b.BottomCFrame then
+        local ad,bd=(a.BottomCFrame.Position-position).Magnitude,(b.BottomCFrame.Position-position).Magnitude
+        if ad~=bd then return ad<bd end
+    end
+    return a.Uid<b.Uid
+end
 function Core.choose(records,options,assets,position,blocked,now)
-    local best,rank,distance
-    for _,r in pairs(records) do
-        if Core.allowed(r,options,assets) and r.BottomCFrame and not (blocked[r.Uid] and blocked[r.Uid]>now) then
-            local tier=assets[r.AssetCategory].Rarity
-            local score=tonumber(tier and tier.Rank) or 0
-            local d=(r.BottomCFrame.Position-position).Magnitude
-            if not best or score>rank or score==rank and d<distance then best,rank,distance=r,score,d end
-        end
+    local best
+    for _,r in pairs(records)do
+        if Core.allowed(r,options,assets)and r.BottomCFrame and not(blocked[r.Uid]and blocked[r.Uid]>now)
+            and Core.better(r,best,assets,position)then best=r end
     end
     return best
+end
+function Core.surfaceDistance(record,position)
+    if not record.BoundsCFrame or not record.BoundsSize then return(position-record.BottomCFrame.Position).Magnitude end
+    local localPoint=record.BoundsCFrame:PointToObjectSpace(position)
+    local size=record.BoundsSize
+    local x=math.max(0,math.abs(localPoint.X)-size.X/2)
+    local y=math.max(0,math.abs(localPoint.Y)-size.Y/2)
+    local z=math.max(0,math.abs(localPoint.Z)-size.Z/2)
+    return math.sqrt(x*x+y*y+z*z)
 end
 function Core.firstSlot(record)
     if record.Uid:sub(1,13)=="FirstAreaEgg_" then return record.AreaId..":"..record.NestId end
@@ -95,7 +121,7 @@ dismiss.Activated:Connect(function()startup.gui:Destroy()end)
 local alive=true
 local connections={}
 local options={master=false,hidePens=false,hideOtherPets=false,hideSelfPets=false,lowDetail=false,disableEffects=false,disableVideos=false,antiAfk=false,autoExecute=false,autoReconnect=false,steal=false,hatch=false,equip=false,treadmill=false,events=false,
-    upgrades=false,rewards=false,fusion=false,LightVsDarkness=true,SammyEvent=true,excluded={},excludedPets={},eggTypes={},rarities={},trainingSeconds=20,fixedRunSpeed=false,autoRunSpeed=false,runSpeed=64,runMargin=12,runSpeedCap=300,skipUnsafeEggs=true}
+    upgrades=false,rewards=false,fusion=false,LightVsDarkness=true,SammyEvent=true,excluded={},excludedPets={},eggTypes={},rarities={},trainingSeconds=20,fixedRunSpeed=false,autoRunSpeed=false,runSpeed=64,runMargin=12,runSpeedCap=300,skipUnsafeEggs=false,priorityVersion=2}
 local api={}
 local pending={}
 local cooldown={}
@@ -186,6 +212,21 @@ local function optionalAPI(key,path)
  if module then local value=call("load:"..key,require,module)if type(value)=="table"then api[key]=value end end
  return api[key]
 end
+optionalAPI("cycle","Shared.Util.AreaEggCycle")
+optionalAPI("clock","Shared.Util.ServerClock")
+optionalAPI("eggWall","Client.AreaEggResetWall")
+optionalAPI("geometry","Shared.Util.GuardAreaGeometry")
+optionalAPI("barriers","Shared.Util.SafeZoneBarriers")
+local function bestEgg()
+ local r=character()
+ if not r then return end
+ return Core.choose(api.eggs.ReadFieldEggs().Records,options,api.assets.Directory,r.Position,blocked,os.clock())
+end
+local function newEggOpportunity()
+ if not options.steal or pending.carry or state.pickupPending then return false end
+ if Core.count(api.eggs.ReadOwnerEggs(player.UserId))>=115 then return false end
+ return bestEgg()~=nil
+end
 local function guardianRows()
  local r=character();if not r then return{}end
  local world=workspace:FindFirstChild("World")
@@ -247,6 +288,9 @@ local function prepareReturnPath()
  local r,_,c=character();local base=plot()
  if not r or not base then return false end
  local goal=base.PetArea.Position+Vector3.new(0,3,0)
+ local cached=state.returnPath
+ if cached and cached.character==c and os.clock()-cached.at<10
+  and Core.flatDistance(r.Position,cached.from)<2 and Core.flatDistance(goal,cached.goal)<5 then return true end
  local path=Pathfinding:CreatePath({AgentRadius=2,AgentHeight=5,AgentCanJump=true,WaypointSpacing=8})
  local ok=pcall(function()path:ComputeAsync(r.Position,goal)end)
  if not ok or path.Status~=Enum.PathStatus.Success then return false end
@@ -259,7 +303,8 @@ local function walk(goal,carryUid)
     local function interrupted()
         if not active()or player.Character~=c then return true end
         local held=carrying()
-        return carryUid and (not held.IsCarrying or held.Uid~=carryUid)or not carryUid and held.IsCarrying
+        return carryUid and (not held.IsCarrying or held.Uid~=carryUid)
+            or not carryUid and (held.IsCarrying or state.job~="steal"and newEggOpportunity())
     end
     local function finish(result)
         if h.Parent then h:MoveTo(r.Position)end
@@ -330,61 +375,64 @@ local function stopTraining()
     if ok==true then state.training=false return true end
     note("Treadmill exit unconfirmed; movement waits")return false
 end
-local function findPickupPrompt(uid)
-    for _,obj in ipairs(workspace:GetDescendants())do
-        if obj:IsA("ProximityPrompt") and obj.Name=="CarryAreaEgg" and obj.Enabled then
-            local ancestor=obj.Parent
-            while ancestor and ancestor~=workspace do
-                if ancestor.Name==uid then return obj end
-                ancestor=ancestor.Parent
-            end
-        end
-    end
-end
-local function promptPosition(prompt)
-    local parent=prompt.Parent
-    if parent and parent:IsA("Attachment")then return parent.WorldPosition end
-    if parent and parent:IsA("BasePart")then return parent.Position end
+-- Native SmartProximityPrompt parents CarryAreaEgg to Workspace.SmartPromptPart,
+-- not to the egg model. Use the controller's exact carry adapter, once per hold.
+local function pickupReady(egg,r,c)
+ if not active()or character()~=r or carrying().IsCarrying then return false,"character/carry changed"end
+ local live=api.eggs.ReadFieldEgg(egg.Uid)
+ if not live or live.Version~=egg.Version or not Core.allowed(live,options,api.assets.Directory)then return false,"egg reset or taken"end
+ if c and c:GetAttribute("IsTrapped")==true then return false,"character trapped"end
+ if api.eggWall and api.eggWall.IsSealed()then return false,"reset wall sealed"end
+ if Core.surfaceDistance(live,r.Position)>7.5 then return false,"out of egg surface reach"end
+ local world=workspace:FindFirstChild("World")
+ local areas=world and world:FindFirstChild("Areas")
+ local line=areas and areas:FindFirstChild("SeparationLine")
+ if line and api.geometry and not api.geometry.IsPastLine(line,r.Position)then return false,"outside field"end
+ if api.barriers and api.barriers.Separates(r.Position,live.BoundsCFrame.Position,api.barriers.IsFencedUid(live.Uid))then
+  return false,"native barrier separates egg"end
+ local best=bestEgg()
+ if best and best.Uid~=live.Uid and Core.better(best,live,api.assets.Directory,r.Position)then
+  state.eggUrgent=true;return false,"better spawned egg available"end
+ return true
 end
 local function pickupEgg(egg)
-    local prompt,nextSearch=nil,0
-    if not await(function()
-        if os.clock()<nextSearch then return false end
-        nextSearch=os.clock()+.4;prompt=findPickupPrompt(egg.Uid);return prompt~=nil
-    end,4)then
-        note("No enabled CarryAreaEgg prompt for "..egg.Uid.."; not running home")return false
-    end
-    local r,h=character();local at=promptPosition(prompt)
-    if not r or not at or not active()or carrying().IsCarrying then return false end
-    local reach=math.min(8,prompt.MaxActivationDistance)
-    if (r.Position-at).Magnitude>reach-1 then r.CFrame=CFrame.new(at+Vector3.new(2,1,0))end
-    h:MoveTo(r.Position)
-    h:UnequipTools()
-    if options.fixedRunSpeed or options.autoRunSpeed then optionalAPI("guards","Data.Guards")end
-    if not active()or carrying().IsCarrying then return false end
-    if not prepareReturnPath()then note("No verified running route home; pickup deferred")return false end
-    local dispatched=false
-    local connection=prompt.Triggered:Connect(function(who)if who==player then dispatched=true end end)
-    state.pickupPending={uid=egg.Uid,at=os.clock()}
-    state.collectionHoldUntil=os.clock()+20
-    local ok,result=pcall(function()
-        if not active()or character()~=r or carrying().IsCarrying or not prompt.Enabled or (r.Position-at).Magnitude>reach then return false end
-        prompt:InputHoldBegin()
-        if not pause(math.max(0,tonumber(prompt.HoldDuration)or 1.2))then return false end
-        prompt:InputHoldEnd()
-        if not dispatched and not carrying().IsCarrying then
-            if type(fireproximityprompt)=="function"then fireproximityprompt(prompt,prompt.HoldDuration)
-            elseif type(firesignal)=="function"then firesignal(prompt.Triggered,player)
-            else note("Pickup input unavailable: fireproximityprompt / firesignal missing")return false end
-        end
-        return await(function()local carry=carrying();return carry.IsCarrying and carry.Uid==egg.Uid end,5)
-    end)
-    pcall(function()prompt:InputHoldEnd()end)
-    connection:Disconnect()
-    if not ok then note("Pickup input failed: "..tostring(result))end
-    if ok and result then state.pickupPending=nil;state.collectionHoldUntil=nil;note("Pickup confirmed: "..egg.Uid)return true end
-    note("Pickup unconfirmed; staying at egg while reconciling")
-    return false
+ if pending.carry or state.pickupPending then return false end
+ local r,h,c=character()
+ if not r then return false end
+ local ready,why=pickupReady(egg,r,c)
+ if not ready then note("Pickup deferred: "..why)return false end
+ h:MoveTo(r.Position);h:UnequipTools()
+ if options.fixedRunSpeed or options.autoRunSpeed then optionalAPI("guards","Data.Guards")end
+ if not prepareReturnPath()then note("No verified running route home; pickup deferred")return false end
+ ready,why=pickupReady(egg,r,c)
+ if not ready then note("Pickup deferred: "..why)return false end
+ local duration=workspace:GetAttribute("FastEggPickupTime")and .25 or 1.2
+ state.job="holding egg pickup"
+ local untilTime=os.clock()+duration
+ repeat
+  ready,why=pickupReady(egg,r,c)
+  if not ready then note("Pickup hold cancelled: "..why)return false end
+  task.wait(.03)
+ until os.clock()>=untilTime
+ -- One native dispatch; no Triggered/fireproximityprompt path can duplicate it.
+ ready,why=pickupReady(egg,r,c)
+ if not ready then note("Pickup hold cancelled: "..why)return false end
+ state.pickupPending={uid=egg.Uid,at=os.clock()}
+ state.collectionHoldUntil=os.clock()+20
+ state.pickupDispatches=(state.pickupDispatches or 0)+1
+ local accepted,message=call("carry",api.eggs.CarryFieldEgg,egg.Uid,Core.firstSlot(egg))
+ state.lastPickupVerdict=accepted==true and "accepted; waiting for carry"or tostring(message or "denied")
+ if accepted~=true and not pending.carry then
+  state.pickupPending=nil;state.collectionHoldUntil=nil
+  note("Native carry denied for "..egg.Uid..": "..tostring(message or "no reason returned"))
+  return false
+ end
+ if await(function()local held=carrying();return held.IsCarrying and held.Uid==egg.Uid end,5)then
+  state.pickupPending=nil;state.collectionHoldUntil=nil
+  state.lastPickupVerdict="confirmed "..egg.Uid;note("Pickup confirmed: "..egg.Uid)return true
+ end
+ note("Native carry unconfirmed; staying at egg while reconciling")
+ return false
 end
 local function returnEgg()
     local carry=carrying();if not carry.IsCarrying then return false end
@@ -426,32 +474,55 @@ local function escapePreflight(egg,h)
  end
  return true
 end
+local function approachEgg(egg)
+ local r,h,c=character();if not r then return false end
+ local frame=egg.BoundsCFrame or egg.BottomCFrame
+ local size=egg.BoundsSize or Vector3.new(0,0,0)
+ local points={}
+ for _,offset in ipairs({Vector3.new(size.X/2+3,0,0),Vector3.new(-size.X/2-3,0,0),
+  Vector3.new(0,0,size.Z/2+3),Vector3.new(0,0,-size.Z/2-3)})do
+  local point=frame:PointToWorldSpace(offset)
+  points[#points+1]=Vector3.new(point.X,egg.BottomCFrame.Position.Y+3,point.Z)
+ end
+ local base=plot();local toward=base and base.PetArea.Position or r.Position
+ table.sort(points,function(a,b)return Core.flatDistance(a,toward)<Core.flatDistance(b,toward)end)
+ for _,point in ipairs(points)do
+  if not active()or character()~=r or carrying().IsCarrying or pending.carry then return false end
+  r.CFrame=CFrame.new(point);h:MoveTo(r.Position)
+  if not pause(.12)then return false end
+  local ready=pickupReady(egg,r,c)
+  if not ready and state.eggUrgent then return false end
+  if ready and prepareReturnPath()then return true end
+ end
+ note("No reachable pickup surface with a running route home for "..egg.Uid)
+ return false
+end
 local function stealEgg()
     if pending.carry then note("Previous carry request awaiting reconciliation")return false end
-    local r,h=character();if not r then return false end
+    local r,h=character();if not r or carrying().IsCarrying then return false end
     local owned=api.eggs.ReadOwnerEggs(player.UserId)
     if Core.count(owned)>=115 then note("Egg inventory full; hatch before stealing")return false end
-    local records=api.eggs.ReadFieldEggs().Records
     state.pickupAttempted=false
-    local egg=Core.choose(records,options,api.assets.Directory,r.Position,blocked,os.clock())
-    if not egg then return false end
-    state.pickupAttempted=true
+    local egg=bestEgg()
+    if not egg then state.eggUrgent=nil;return false end
+    state.pickupAttempted=true;state.eggUrgent=nil;state.targetEgg=egg.Uid
+    if api.eggWall and api.eggWall.IsSealed()then state.job="waiting for reset wall";return false end
     if not stopTraining()then return false end
     if not active()or character()~=r or carrying().IsCarrying then return false end
     if not escapePreflight(egg,h)then blocked[egg.Uid]=os.clock()+10;return false end
-    -- Only approach is teleported. Carried return movement never changes CFrame.
     if workspace.StreamingEnabled then pcall(function()player:RequestStreamAroundAsync(egg.BottomCFrame.Position,2)end)end
     if not active()or character()~=r or carrying().IsCarrying then return false end
-    h:MoveTo(r.Position)
-    r.CFrame=egg.BottomCFrame+Vector3.new(3,3,0)
-    h:MoveTo(r.Position)
-    if not pause(.2)then return false end
+    -- Re-read every yield boundary. Never carry a vanished egg or an obsolete lower target.
     local live=api.eggs.ReadFieldEgg(egg.Uid)
-    if not live or not Core.allowed(live,options,api.assets.Directory)then return false end
-    if character()~=r or (r.Position-live.BottomCFrame.Position).Magnitude>8 then return false end
+    local best=bestEgg()
+    if not live or live.Version~=egg.Version or not Core.allowed(live,options,api.assets.Directory)then return false end
+    if best and best.Uid~=live.Uid and Core.better(best,live,api.assets.Directory,r.Position)then state.eggUrgent=true;cooldown.steal=0;return false end
     if not escapePreflight(live,h)then blocked[egg.Uid]=os.clock()+10;return false end
-    state.pickupAttempted=true
-    if not pickupEgg(live)then blocked[egg.Uid]=os.clock()+8;return false end
+    if not approachEgg(live)then blocked[egg.Uid]=os.clock()+1;return false end
+    if not pickupEgg(live)then
+     if not state.eggUrgent then blocked[egg.Uid]=os.clock()+2 end
+     return false
+    end
     return returnEgg()
 end
 local function plantOrHatch()
@@ -775,6 +846,7 @@ if type(readfile)=="function"then pcall(function()
    for id,on in pairs(v)do if type(id)=="string"and type(on)=="boolean"then options[k][id]=on end end
   end
  end
+ if loaded.priorityVersion~=2 then options.skipUnsafeEggs=false end
  if options.autoRunSpeed then options.fixedRunSpeed=false end
  options.master=false -- Starting a new session always exposes settings before moving.
 end)end
@@ -833,7 +905,7 @@ ui.text(main,"Finish carrying before hatch, equipment, events or training. Retur
 local eggs=ui.group(pages.Eggs,"Collection and hatching")
 toggle(eggs,"steal","Teleport to egg; run home")
 toggle(eggs,"hatch","Auto plant and native hatch")
-ui.text(eggs,"Highest native rarity rank first, nearest for ties. Exclusions also apply to event eggs in the field snapshot.")
+ui.text(eggs,"Highest rarity, then biggest spawned egg, then nearest. Native reset/spawn signals re-rank immediately; exclusions still apply.")
 local eggRecords
 local eggRecordsModule=resolve("Shared.Util.EggRecords")
 if eggRecordsModule then
@@ -890,13 +962,14 @@ local liveList=ui.text(liveEggs,"")
 local livePage=1
 local function refreshLiveEggs()
  local rows=api.eggs.ReadFieldEggs().Records
- table.sort(rows,function(a,b)return a.Uid<b.Uid end)
+ local r=character()
+ table.sort(rows,function(a,b)return Core.better(a,b,api.assets.Directory,r and r.Position)end)
  local maxPage=math.max(1,math.ceil(#rows/20));livePage=math.clamp(livePage,1,maxPage)
  local lines={#rows.." live eggs • page "..livePage.." / "..maxPage}
  for i=(livePage-1)*20+1,math.min(livePage*20,#rows)do
   local record=rows[i];local info=api.assets.Directory[record.AssetCategory]
   lines[#lines+1]=eggLabel(record.AssetCategory,record).." | "..tostring(info and info.Rarity and info.Rarity._id or "Unknown")
-   .." | "..record.AreaId.." | "..record.State.." | "..record.AssetCategory
+   .." | "..record.AreaId.." | "..record.State.." | "..record.AssetCategory..string.format(" | size %.2fx",tonumber(record.AssetScale)or 1)
  end
  liveList.Text=table.concat(lines,"\n")
 end
@@ -928,7 +1001,7 @@ toggle(base,"rewards","Claim discovered index rewards")
 ui.text(base,"Cash upgrades spend in-game money. Paid products, selling and rebirth are never invoked automatically.")
 local training=ui.group(pages.Training,"Speed")
 toggle(training,"treadmill","Train on own treadmill when idle")
-ui.text(training,"Uses own TreadmillBottom and AskWearStill. Leaves the belt before egg, hatch or event movement. Training sessions last 20 seconds.")
+ui.text(training,"Uses own TreadmillBottom and AskWearStill. Leaves the belt before egg, hatch or event movement. Egg spawns interrupt idle training; confirmed carries finish first.")
 local running=ui.group(pages.Training,"Running and guardian speed")
 toggle(running,"fixedRunSpeed","Use fixed running speed")
 toggle(running,"autoRunSpeed","Auto speed from my chasing guardians")
@@ -1070,13 +1143,15 @@ local function diagnosticsText()
  local r,h=character();local carry=carrying();local data=profile()
  local p={}for key in pairs(pending)do p[#p+1]=key end table.sort(p)
  local modules={}for key in pairs(api)do modules[#modules+1]=key end table.sort(modules)
- return table.concat({"EXIS Steal an Egg | build 3","Place "..game.PlaceId.." | Job "..game.JobId,
+ return table.concat({"EXIS Steal an Egg | build 4","Place "..game.PlaceId.." | Job "..game.JobId,
   "FPS "..fps.." | Master "..tostring(options.master).." | Task "..state.job,
   "Health "..tostring(h and math.floor(h.Health)).." | Save "..tostring(data~=nil).." | Base "..tostring(plot()~=nil),
   "Carrying "..tostring(carry.IsCarrying).." | Owned eggs "..Core.count(api.eggs.ReadOwnerEggs(player.UserId)),
   "Delivered "..state.claimed.." | Hatched "..state.hatches.." | Training "..tostring(state.training),
   "Run requested "..tostring(state.runRequested or "native").." | measured "..tostring(state.runMeasured and math.floor(state.runMeasured)or "—").." | guardian "..tostring(state.guardSpeed or 0).." | capped "..tostring(state.runCapped==true),
-  "Pickup "..tostring(state.pickupPending and state.pickupPending.uid or "none"),
+  "Pickup "..tostring(state.pickupPending and state.pickupPending.uid or "none").." | target "..tostring(state.targetEgg or "none"),
+  "Carry dispatches "..tostring(state.pickupDispatches or 0).." | verdict "..tostring(state.lastPickupVerdict or "none"),
+  "Field revision "..tostring(state.fieldRevision or 0).." | reset period "..tostring(state.resetPeriod or "unknown").." | next reset "..tostring(state.nextResetAt or "unknown"),
   "Pending "..(#p>0 and table.concat(p,", ")or"none"),"Modules "..table.concat(modules,", "),
   "Hatch input "..tostring(type(fireproximityprompt)=="function").." | Files "..tostring(type(writefile)=="function"),
   "Native preferences "..tostring(preferences~=nil),"Recent log:",table.concat(state.trace,"\n")},"\n")
@@ -1106,6 +1181,7 @@ button(session,"Reload saved settings (paused)",function()
     for id,on in pairs(v)do if type(id)=="string"and type(on)=="boolean"then options[k][id]=on end end
    end
   end
+  if data.priorityVersion~=2 then options.skipUnsafeEggs=false end
   if options.autoRunSpeed then options.fixedRunSpeed=false end
   for _,render in pairs(renders)do render()end
  end)
@@ -1218,8 +1294,72 @@ local function periodic(key,seconds,fn)
  if not ok then note(key..": "..tostring(result))return false end
  return result==true
 end
+local function wakeEggs(reset)
+ state.fieldRevision=(state.fieldRevision or 0)+1
+ state.eggUrgent=true;cooldown.steal=0
+ if reset then
+  for uid in pairs(blocked)do if not uid:find(":",1,true)then blocked[uid]=nil end end
+ end
+end
+local function observeField(snapshot)
+ local versions=state.fieldVersions or {};local nextVersions={}
+ for _,egg in pairs(snapshot.Records or {})do
+  nextVersions[egg.Uid]=egg.Version
+  if versions[egg.Uid]~=egg.Version then blocked[egg.Uid]=nil end
+ end
+ state.fieldVersions=nextVersions;state.resetSync=nil
+ wakeEggs(false)
+end
+local function watchEggSignals()
+ local function listen(name,fn)
+  local signal=api.eggs[name]
+  if signal and signal.Connect then connections[#connections+1]=signal:Connect(fn)end
+ end
+ observeField(api.eggs.ReadFieldEggs())
+ listen("FieldRefreshed",observeField)
+ listen("FieldShifted",function(egg)
+  local versions=state.fieldVersions or {};state.fieldVersions=versions
+  if versions[egg.Uid]~=egg.Version then blocked[egg.Uid]=nil end
+  versions[egg.Uid]=egg.Version;wakeEggs(false)
+ end)
+ listen("FieldGone",function(uid)
+  if state.fieldVersions then state.fieldVersions[uid]=nil end
+  blocked[uid]=nil;wakeEggs(false)
+ end)
+ listen("ResetCountdown",function(payload)
+  if type(payload.DayStartsAt)=="number"and payload.DayStartsAt>(state.lastCountdownAt or -math.huge)then
+   state.lastCountdownAt=payload.DayStartsAt;state.countdownAt=payload.DayStartsAt
+  end
+ end)
+ listen("RarityRevealed",function(payload)
+  if not state.revealPeriod or payload.PeriodIndex>state.revealPeriod then
+   state.revealPeriod=payload.PeriodIndex;state.resetSync=true;wakeEggs(true)
+  end
+ end)
+end
+local function pollEggReset()
+ local cycle=api.cycle
+ if not cycle or not cycle.IsRunning()then state.nextResetAt=nil;return end
+ local now=api.clock and api.clock.Now()or workspace:GetServerTimeNow()
+ local period=cycle.PeriodIndexAt(now)
+ local crossed=state.resetPeriod~=nil and period~=state.resetPeriod
+ local countdown=state.countdownAt
+ if countdown and now>=countdown then state.countdownAt=nil;crossed=true end
+ state.resetPeriod=period;state.nextResetAt=cycle.NextResetTime(now)
+ if crossed then state.resetSync=true;wakeEggs(true)end
+end
+watchEggSignals()
+-- These listeners only invalidate state. The existing single worker owns all movement.
+task.spawn(function()
+ while alive do
+  local ok,message=pcall(pollEggReset)
+  if not ok then state.resetClockError=tostring(message)end
+  task.wait(.05)
+ end
+end)
 local function farmStep()
     if carrying().IsCarrying then state.pickupPending=nil;state.collectionHoldUntil=nil;returnEgg();return end
+    if pending.carry then state.job="waiting for native carry reply";return end
     if state.hatchInFlight then
      local hatch=state.hatchInFlight
      if api.eggs.ReadOwnedEgg(player.UserId,hatch.uid)==nil then
@@ -1236,8 +1376,13 @@ local function farmStep()
     end
     if state.collectionHoldUntil and os.clock()<state.collectionHoldUntil then
      state.job="retrying egg pickup"
-     if options.steal then periodic("steal",1,stealEgg)end
+     if options.steal then periodic("steal",.25,stealEgg)end
      return
+    end
+    if state.resetSync and options.steal then
+     state.resetSync=nil
+     call("field sync",api.eggs.SyncFieldEggs)
+     if carrying().IsCarrying or pending.carry then return end
     end
     if state.refreshSnapshots then
      state.refreshSnapshots=nil
@@ -1247,6 +1392,11 @@ local function farmStep()
      return
     end
     if state.wantHome then state.wantHome=nil;local b=plot()if b and stopTraining()then walk(b.PetArea.Position+Vector3.new(0,3,0))end;return end
+    if options.steal and newEggOpportunity()then
+     if state.eggUrgent then cooldown.steal=0 end
+     state.pickupAttempted=false
+     if periodic("steal",.25,stealEgg)or state.pickupAttempted then return end
+    end
     if state.training and os.clock()<state.trainUntil and options.treadmill then return end
     if state.training and not stopTraining()then return end
     if not api.eggs.HasFieldSnapshot()then periodic("sync",10,function()call("field sync",api.eggs.SyncFieldEggs)return true end)end
@@ -1264,7 +1414,7 @@ local function farmStep()
     if carrying().IsCarrying then return end
     if options.steal then
      state.pickupAttempted=false
-     if periodic("steal",1,stealEgg)or state.pickupAttempted then return end
+     if periodic("steal",.25,stealEgg)or state.pickupAttempted then return end
     end
     if carrying().IsCarrying then return end
     if options.treadmill then periodic("training",3,train)end
@@ -1278,7 +1428,7 @@ task.spawn(function()
    local ok,err=pcall(farmStep)
    if not ok then note("Worker error: "..tostring(err))end
   end
-  task.wait(.15)
+  task.wait(.05)
  end
 end)
 if startup.gui then startup.gui:Destroy()end
