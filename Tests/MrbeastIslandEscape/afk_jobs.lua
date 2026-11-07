@@ -413,6 +413,14 @@ test('routine crafting cannot interrupt a live hold but defence can',function()
  now=.05;nextRank=1.5
  assert(not work.checkpoint('chests')and work.preempted.to=='combat')
 end)
+test('the optional night pause waits for a valid interaction hold to finish',function()
+ loadBody('    function work.checkpoint(', '    function work.pause(')
+ work.active='chests';work.currentJob={key='chests'};work.jobs={};work.rank=function()return 8 end
+ work.nightPaused=function()return true end;work.interaction={key='chests',untilTime=5}
+ work.pick=function()return nil end;motion.cancel=function()end
+ assert(work.checkpoint('chests')and not work.preempted)
+ now=5.1;assert(not work.checkpoint('chests')and work.preempted.to=='nightHold')
+end)
 test('routine work queues until seven seconds without progress',function()
  loadBody('    function work.checkpoint(', '    function work.pause(')
  work.active='chests';work.currentJob={key='chests'};work.jobs={};work.rank=function()return 8 end
