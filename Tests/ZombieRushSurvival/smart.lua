@@ -98,12 +98,24 @@ test('first affordable turret is placed before ordinary upgrades',function()
  local placed=0;h.app.placeTick=function()placed=placed+1;return true end
  h.app.matchTick();assert(placed==1 and #h.requests==0)
 end)
-test('cash is reserved for the first eligible turret instead of spent on upgrades',function()
+test('an unaffordable first turret gives way to an affordable planned wall',function()
  local h=setup();h.cfg.autoPlace=true;h.cfg.gun=true
  h.app.turretEstablished=function()return false end
- h.app.getPlacement=function()return{affordable=false,slot={role='turret'}}end
- h.app.placeTick=function()error('cannot place without cash')end
- h.app.matchTick();assert(#h.requests==0 and h.app.notes.economy:find('SAVING'))
+ h.app.getPlacement=function(role)if role then return{affordable=false,slot={role='turret'}}end return{affordable=true,slot={role='wall'}}end
+ local placed=0;h.app.placeTick=function()assert(h.app.placementTask.slot.role=='wall');placed=placed+1;return true end
+ h.app.matchTick();assert(placed==1 and #h.requests==0)
+end)
+test('ordinary upgrades run when no affordable planned defense is available',function()
+ local h=setup();h.cfg.autoPlace=true;h.cfg.gun=true
+ h.app.turretEstablished=function()return true end;h.app.getPlacement=function()return nil end
+ h.app.matchTick();assert(h.requests[1].args[1]=='PurchaseWeaponTierUpgrade')
+end)
+test('affordable defenses use available cash before ordinary upgrades',function()
+ local h=setup();h.cfg.autoPlace=true;h.cfg.gun=true
+ h.app.turretEstablished=function()return true end
+ h.app.getPlacement=function()return{affordable=true,slot={role='wall'}}end
+ local placed=0;h.app.placeTick=function()placed=placed+1;return true end
+ h.app.matchTick();assert(placed==1 and #h.requests==0)
 end)
 test('low health remains an urgent exception to the initial turret order',function()
  local h=setup();h.cfg.autoPlace=true;h.cfg.health=true;h.app.root=function()return{},{Health=10,MaxHealth=100}end
