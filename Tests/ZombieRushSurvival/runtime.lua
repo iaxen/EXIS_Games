@@ -15,11 +15,16 @@ local function setup()
  local events={};local enum={UserInputType={MouseButton1=1},UserInputState={Begin=1},KeyCode={Unknown=0}}
  local environment=setmetatable({app=app,cfg=cfg,Core={strictFits=function()return true end,placementBox=function(slot)return slot end},Vector3={new=v},Enum=enum,
   os={clock=function()return now end},RS={},UIS={InputEnded='ended'},player={},classes={},maps={AvailableData={Map1={DisplayName='Skyline'},Map2={DisplayName='Crystal Cave'}}},
-  placement={GetPlacementDistances=function()return 18 end},game={PlaceId=87413622775071},workspace={GetAttribute=function()return'Map2'end},
+  Diagnostics={traceback=debug.traceback},placement={GetPlacementDistances=function()return 18 end},game={PlaceId=87413622775071},workspace={GetAttribute=function()return'Map2'end},
   firesignal=function(signal,token)events[#events+1]={signal=signal,token=token}end},{__index=_G})
  app.root=function()return{Position=v(7,3,0),Size=v(2,2,2)},{HipHeight=2}end
  app.module=function()return{GetCurrentPrice=function()return'Cash',10 end}end;app.afford=function()return true end;app.airRisk=function()return 0 end;app.placementSafe=function()return true end;app.inPlayableMap=function()return true end;app.find=function()return{}end
- app.stopWalk=function()end;app.note=function()end;app.region=function()return{points={}}end
+ app.stopWalk=function()end;app.note=function()end;
+ app.stabilizePlacement=function()app.stopWalk();app.placing=true;return{}end
+ app.validPlacementHold=function()return true end
+ app.confirmPlacement=function()return true end
+ app.finishPlacementHold=function()app.placing=false end
+ app.region=function()return{points={}}end
  app.occupied=function()return false end;app.active=function()return true end;app.placementRegion=app.region
  app.ground=function(x,z,y)return{Position=v(x,y,z)}end
  app.invoke=function(key,remote,...)events[#events+1]={key=key,args={...}};return{ok=true}end
@@ -94,10 +99,10 @@ test('native mouse mode works without a mobile fire button',function()
  local h=setup();h.cfg.fireInput='Native';h.env.UIS.InputBegan='nativeBegin';h.app.fireButton=function()return nil end
  h.app.holdFire(h.tool,{Automatic=true});assert(h.app.held and h.events[1].signal=='nativeBegin')
 end)
-test('native range allows placement without first reaching the arbitrary side spot',function()
+test('placement approaches its reserved position even when already inside maximum native range',function()
  local h=setup();h.app.root=function()return{Position=v(16,3,0),Size=v(2,2,2)},{HipHeight=2}end
- assert(h.app.placeTick()==true and #h.events==1 and not h.app.buildGoal)
- assert(h.app.next.place==0)
+ assert(h.app.placeTick()==nil and #h.events==0 and h.app.buildGoal)
+ assert(h.app.buildGoal.X<10)
 end)
 test('unsafe placement waits without spending and resumes as soon as safe',function()
  local h=setup();h.app.placementSafe=function()return false end
@@ -198,5 +203,17 @@ end)
 test('occupied-slot rejection leaves other valid slots immediately eligible',function()
  local h=setup();h.app.invoke=function()h.app.next.place=5;return{ok=false,reason='occupied'}end
  assert(h.app.placeTick()==false and h.app.next.place==0 and h.app.rejected.slot1==8)
+end)
+test('accepted requests keep the player held until construction is confirmed',function()
+ local h=setup();h.app.confirmPlacement=function()
+  assert(h.app.placing and h.app.pendingPlacements.slot1 and not h.app.placedSerial);return true
+ end
+ assert(h.app.placeTick()==true and h.app.placedSerial==1 and not h.app.placing)
+end)
+test('failed confirmation or a thrown request releases movement without claiming a completed build',function()
+ local h=setup();h.app.confirmPlacement=function()return false end
+ assert(h.app.placeTick()==false and not h.app.placing and not h.app.placedSerial and h.app.pendingPlacements.slot1)
+ h=setup();h.app.invoke=function()error('native placement failed')end
+ assert(h.app.placeTick()==false and not h.app.placing and not h.app.placedSerial)
 end)
 print(tests..' movement / placement / input checks passed')
