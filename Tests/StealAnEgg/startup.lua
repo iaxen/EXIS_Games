@@ -1,6 +1,11 @@
 -- Whole-script startup with a small Roblox client surface. No live engine claim.
 local source=assert(io.open('Games/StealAnEgg.lua')):read('*a')
-local function signal()return{Connect=function()return{Disconnect=function()end}end}end
+math.clamp=math.clamp or function(x,a,b)return math.max(a,math.min(b,x))end
+local function signal()
+ local handlers={}
+ return {Connect=function(_,fn)local h={fn=fn};handlers[#handlers+1]=h;return{Disconnect=function()h.off=true end}end,
+ Fire=function(_,...)for _,h in ipairs(handlers)do if not h.off then h.fn(...)end end end}
+end
 local methods={}
 local instances={}
 local function node(class)
@@ -43,11 +48,11 @@ services.UserInputService=node('UserInputService');services.PathfindingService={
 services.Lighting=node('Lighting');services.RunService=node('RunService');services.GuiService=node('GuiService')
 workspace=node('Workspace');workspace.CurrentCamera=node('Camera');function workspace:GetServerTimeNow()return now end
 services.Workspace=workspace
-local eggs={ReadCarryState=function()return{IsCarrying=false}end,ReadOwnerEggs=function()return{}end,HasFieldSnapshot=function()return true end}
+local eggs={ReadCarryState=function()return{IsCarrying=false}end,ReadOwnerEggs=function()return{}end,HasFieldSnapshot=function()return true end,ReadFieldEggs=function()return{Records={{Uid='test-egg',AssetCategory='Chicken',AreaId='Forest',State='Slot'}}}end}
 local plots={ResolvePlot=function()end,ReadOwners=function()return{}end}
 local remotes={Treadmill={AssignedBeltShifted={OnClientEvent=signal()}},LightVsDarkness={RingCollected={OnClientEvent=signal()}},SammyEvent={PickupCollected={OnClientEvent=signal()}}}
 for path,value in pairs({['Client.EggState']=eggs,['Client.PlotState']=plots,['Shared.Remotes']=remotes,
- ['Data.Assets']={Directory={}},['Data.Areas']={Directory={}},['Data.Rarity']={Rarities={}},['Shared.Save']={Peek=function()end},
+ ['Data.Assets']={Directory={Chicken={Egg={DisplayName='Forest Egg'},Rarity={_id='Common',Rank=1}}}},['Data.Areas']={Directory={}},['Data.Rarity']={Rarities={}},['Shared.Save']={Peek=function()end},
  ['Client.BaseUpgrade']={},['Data.Treadmills']={},['Shared.Util.FuseKernel']={},['Shared.Flags.GameplayBalance']={},
  ['Shared.Preferences']={IsOn=function()return false end}})do mount(rs,path,value)end
 require=function(module)return assert(modules[module],'unexpected module')end
@@ -73,6 +78,21 @@ for _,o in ipairs(instances)do
 end
 assert(panel and not startupAlive)
 print('PASS complete game script reaches its main panel with all native modules present')
+local track
+for _,o in ipairs(instances)do if o.Name=='SwitchTrack'and o.Parent then track=o;break end end
+assert(track and track:FindFirstChild('SwitchKnob'))
+print('PASS whole UI constructs Fuzzotopia switch tracks and knobs')
+local knob=track:FindFirstChild('SwitchKnob');local row=track.Parent
+assert(knob.Position.X.Offset==2);row.Activated:Fire();assert(knob.Position.X.Offset==15)
+row.Activated:Fire();assert(knob.Position.X.Offset==2)
+print('PASS clicking the actual switch moves its knob on and off')
+local refresh
+for _,o in ipairs(instances)do if o.ClassName=='TextButton'and o.Text=='REFRESH LIVE EGGS'then refresh=o;break end end
+assert(refresh);refresh.Activated:Fire()
+local listed=false
+for _,o in ipairs(instances)do if type(o.Text)=='string'and o.Text:find('Forest Egg | Common | Forest | Slot | Chicken',1,true)then listed=true end end
+assert(listed)
+print('PASS live egg list displays native egg name rarity biome and state')
 -- A missing required adapter must propagate a failure return, not false success.
 services.ReplicatedStorage=node('ReplicatedStorage');now=0
 os.clock=function()now=now+1;return now end
@@ -81,4 +101,4 @@ local result,message=assert(load(source))()
 os.clock=originalClock
 assert(result==false and tostring(message):find('Client.EggState',1,true))
 print('PASS complete script returns the missing adapter error to the universal loader')
-print('2 complete startup and error propagation checks passed')
+print('5 complete startup, switch UI, egg listing and error propagation checks passed')
