@@ -8,7 +8,7 @@ V.__sub=function(a,b)return vec(a.X-b.X,a.Y-b.Y,a.Z-b.Z)end
 local now,cfg,held,scene,rows,ground,hunger,queue,handler,fetchResult,promptCalls
 local function setup()
  note=function()end
- now=0;os.clock=function()return now end;held={};rows={};ground={};queue={};promptCalls={};hunger=true
+ due={};now=0;os.clock=function()return now end;held={};rows={};ground={};queue={};promptCalls={};hunger=true
  flags={quest=true,huntFood=false,autoFarm=true};opts={huntRadius=50};alive=true;connections={}
  cfg={item={byId={},byName={},byDisplayName={}},food={byId={}},mob={byId={}},itemDrop={byId={}}}
  for _,id in ipairs({'wood','crab','meat','stone'})do local item={id=id,displayName=id};cfg.item.byId[id]=item;cfg.item.byName[id]=item;cfg.item.byDisplayName[id]=item end
@@ -27,7 +27,7 @@ local function setup()
   pause=function(_,duration)now=now+duration;return not work.preempted end,buildRank=function(info)return info.rank or 2 end,boatId=function()return'boat'end}
  campData={};failed={};Vector3={new=vec}
  local event={OnClientEvent={Connect=function(_,fn)handler=fn;return{}end}}
- RS={Engine={Service={FindFirstChild=function()return{FindFirstChild=function()return event end}end}}}
+ RS={Engine={Service={FindFirstChild=function()return{FindFirstChild=function(_,name)if name=='questUpdateRemote'then return event end end}end}}}
  local q={client={fetchQuest=function()return table.unpack(fetchResult or{1,1,1})end},getQuestRequirement=function(index,alt)return{itemId=alt==2 and'crab'or'wood',count=index}end}
  module=function()return q end
  body('    function work.readQuest(', '    function work.questDrops(')

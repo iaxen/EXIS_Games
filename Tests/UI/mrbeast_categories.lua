@@ -20,12 +20,13 @@ local head=extract('    local main=page("Main")', '    local function stopAll()'
 local aliases=assert(load(head..'\nreturn{main=main,gather=resources,camp=camp,craft=craft,quests=questPage,explore=explore,settings=settings,combat=combatPage,food=foodPage,inventory=inventoryPage,survival=survivalPage,rewards=rewardsPage,rounds=roundsPage,esp=espPage,status=statusPage}'))()
 work.makeSuiteUI(aliases)
 local expected={eat='Food',combat='Combat',autoAttack='Combat',killFoodOnSight='Combat',huntFood='Combat',
- unloadBag='Inventory',tidyBag='Inventory',bagUpgrade='Inventory',quest='Quests',choiceRewards='Quests',
+ unloadBag='Inventory',tidyTools='Inventory',tidyBag='Inventory',bagUpgrade='Inventory',quest='Quests',choiceRewards='Quests',
  redeemCodes='Rewards',daily='Rewards',weekly='Rewards',playtime='Rewards',dailyQuest='Rewards',
  fuel='Camp',cook='Food',cooked='Food',smelt='Craft',smeltCollect='Craft',build='Camp',buildCurrent='Camp',
  buildCamp='Camp',buildBoat='Explore',nightHover='Survival',holdNight='Survival',runShadow='Survival',
  fish='Fishing',autoRound='Rounds',leaveLost='Rounds',liveStatus='Status'}
 for key,wanted in pairs(expected)do assert(controls[key]==wanted,key..' is in '..tostring(controls[key])..' instead of '..wanted)end
+assert(values.threatScanRadius[1]=='Combat')
 assert(#values.hunger==1 and values.hunger[1]=='Food'and #values.hoverHeight==1 and values.hoverHeight[1]=='Survival')
 print('PASS production controls have one category each and meal thresholds are not duplicated')
 for _,name in ipairs({'Main','Survival','Combat','Food','Inventory','Gather','Camp','Craft','Quests','Rewards','Explore','Fishing','Rounds','ESP','Status','Settings'})do assert(pages[name],name)end
