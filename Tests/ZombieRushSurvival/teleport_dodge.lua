@@ -94,6 +94,7 @@ local function landingHarness()
  h.env.workspace=world;h.env.OverlapParams={new=function()return{}end}
  h.app.flightPoint=function(p)return p end;h.app.mapFilters=function()return{{floor=true}}end
  h.app.raycast=function(origin)return{Position=vec(origin.X,0,origin.Z),Normal=vec(0,1,0),Material='Concrete'}end
+ assert(load(extract('    function app.floorSupport(', '    function app.groundRoute('),'support','t',h.env))()
  assert(load(extract('    function app.teleportLanding(', '    function app.teleportDodgeTick()'),'landing','t',h.env))()
  h.world=world;return h
 end
@@ -145,5 +146,21 @@ test('ordinary dodging holds during a placement request but urgent danger still 
  assert(not h.app.teleportDodgeTick()and h.teleports()==1)
  h.mobs[1].x,h.mobs[1].z=h.root.Position.X,h.root.Position.Z;h.advance(.13)
  assert(h.app.teleportDodgeTick()and h.teleports()==2)
+end)
+test('a diagonal platform corner is rejected even when the center and four side probes have floor',function()
+ local h=landingHarness()
+ h.app.raycast=function(origin)
+  if origin.X>21 and origin.Z>21 then return nil end
+  return{Position=vec(origin.X,0,origin.Z),Normal=vec(0,1,0),Material='Concrete'}
+ end
+ assert(not h.app.teleportLanding(vec(20,3,20)))
+end)
+test('a landing needs a body-width edge margin rather than only the old 1.2-stud probes',function()
+ local h=landingHarness()
+ h.app.raycast=function(origin)
+  if origin.X>21.5 then return nil end
+  return{Position=vec(origin.X,0,origin.Z),Normal=vec(0,1,0),Material='Concrete'}
+ end
+ assert(not h.app.teleportLanding(vec(20,3,20)))
 end)
 print(tests..' simulated ground teleport, landing, prediction and firing checks passed')
