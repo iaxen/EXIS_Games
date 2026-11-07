@@ -273,24 +273,24 @@ test('raw storage reclaim continues until cooked reserves meet the target',funct
  bag={};work.storageSnapshot={{displayName='Raw',count=20}}
  assert(work.foodSupplyGoal().amounts.raw==1)
 end)
-test('night and emergency shelter trigger separately from an inert morning Shadow',function()
+test('only nighttime enables low hover even if the old emergency flag was saved',function()
  body('    function work.shelterNeeded()', '    function work.releaseHover(')
  flags.nightHover=true;flags.emergencyHover=true
  local night=false;work.isNight=function()return night end
  assert(not work.shelterNeeded());night=true;assert(work.shelterNeeded())
- night=false;h.Health=20;assert(work.shelterNeeded());h.Health=100
- work.danger=function()return 1,nil,4 end;assert(work.shelterNeeded())
+ night=false;h.Health=20;assert(not work.shelterNeeded());h.Health=100
+ work.danger=function()return 1,nil,4 end;assert(not work.shelterNeeded())
 end)
-test('shelter raises altitude after damage and refuses an unsafe landing',function()
+test('low hover stays at eight studs after damage and refuses an unsafe landing',function()
  body('    function work.releaseHover(', '    function work.evaluateLost()')
  local mt={__add=function(a,b)return setmetatable({Position=a.Position+b},getmetatable(a))end}
  CFrame={new=function(p)return setmetatable({Position=p},mt)end}
  local fire=model('Campfire');built=function()return fire end
  r.Parent=true;r.Anchored=false;r.CFrame=CFrame.new(r.Position)
  motion.floor=function(p)return vec(p.X,0,p.Z)end
- flags.nightHover=true;opts.hoverHeight=20;work.shelterNeeded=function()return true end
- assert(work.nightHold()and r.Anchored and work.hover.height==20)
- h.Health=90;assert(work.nightHold()and work.hover.height==28)
+ flags.nightHover=true;opts.hoverHeight=8;work.shelterNeeded=function()return true end
+ assert(work.nightHold()and r.Anchored and work.hover.height==8)
+ h.Health=90;assert(work.nightHold()and work.hover.height==8 and r.CFrame.Position.Y==11)
  assert(not work.releaseHover()and r.Anchored)
  work.shelterNeeded=function()return false end;work.safeWorkPoint=function()return false end
  assert(not work.releaseHover()and r.Anchored)

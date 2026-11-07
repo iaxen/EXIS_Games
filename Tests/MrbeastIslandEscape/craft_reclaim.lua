@@ -140,13 +140,21 @@ test('bag upgrades alone do not activate a disabled manual selected craft',funct
  local goal=craftGoal();goal.key='selected:axe2';goals={goal};stock.Wood=4
  assert(work.nextReadyCraft()==nil)
 end)
-test('a progressing objective finishes before a newly queued routine upgrade',function()
+test('a new MrBeast request takes over from a pinned optional upgrade at the next action boundary',function()
  local current=craftGoal();current.key='current'
  local queued={key='quest:new',kind='quest',rank=-100,amounts={},info={}}
  goals={current,queued};work.objective=current;work.objectiveSignature=work.signature();work.objectiveProgressAt=now
  work.goalRunnable=function()return true end
- assert(work.chooseUpgrade().key=='current')
- now=now+8;assert(work.chooseUpgrade().key=='quest:new')
+ assert(work.chooseUpgrade().key=='quest:new')
+end)
+test('quest collection and delivery precede routine hunting cooking and unloading',function()
+ body('    function work.rank(job)', '    function work.pick(')
+ work.objective={kind='quest'};work.foodHuntReady=function()return true end
+ for _,key in ipairs({'hunt','cook','cooked','unloadBag','structures','craft'})do
+  assert(work.rank{key='quest'}<work.rank{key=key})
+  assert(work.rank{key='progression'}<work.rank{key=key})
+ end
+ assert(work.rank{key='fuel'}<work.rank{key='quest'})
 end)
 assert(loadfile(path))
 print(passed..' reclaim and crafting-priority checks passed; complete module compiles')
