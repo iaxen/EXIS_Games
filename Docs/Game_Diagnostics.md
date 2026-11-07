@@ -22,3 +22,7 @@ If file saving is unavailable, the view explicitly reports the error, retries ar
 The drawn polygon is an outer limit. Runtime planning first creates an inset area with a one-stud border gap; rectangular bounds are aligned inward to the native grid. Barricade, turret and support footprints remain within that interior while retaining the existing row and middle-spacing plan.
 
 Immediately before a Place request, the requested point is snapped using the defense's native grid and facing footprint. The complete rectangle must remain strictly inside the original polygon, with no touching or crossing of its lines. Rejected boundary checks appear in Diagnostics. Existing defenses are not moved or deleted.
+
+# Cash available but zero defenses
+
+ZombieRush's placement snapshot now reports the selected defense price/currency, whether it is already in native range, unsupported-floor coordinates, and cash-reserve waits. A supported destination near zombies remains eligible: the player needs a safe position within native range, not an enemy-free defense destination. If movement is necessary, the builder searches supported stand-off positions, keeping the native elevation limit and strict selected-area boundary checks. Immediately reachable slots are attempted before distant rows; a distant first turret cannot block another affordable defense already in range.

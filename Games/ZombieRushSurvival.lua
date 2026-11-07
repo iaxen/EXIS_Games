@@ -1098,7 +1098,7 @@ local function run()
             local first = app.placementTask and app.placementTask.slot.role == "turret" and app.placementTask
                 or app.getPlacement("turret", true)
             if first then
-                if not first.affordable then
+                if not first.affordable or first.inRange == false then
                     first = app.getPlacement()
                     if not first then app.note("economy", "WAITING FOR DEFENSE FUNDS / SPACE") app.buildGoal = nil end
                 end
@@ -1520,7 +1520,8 @@ local function run()
                         grid = defs.GetNumber(info, "Placement", "GridSize", 1), facing = facing,
                         canRotate = placement.FacesCharacter(info),
                         blocking = defs.GetBoolean(info,"Physics","ZombieBlocking",false) or defs.GetBoolean(info,"FakeWall","Enabled",false),
-                        info = info, primary = primary, range = placement.GetFunctionalRange(effective)}
+                        info = info, primary = primary, range = placement.GetFunctionalRange(effective),
+                        maxElevation = defs.GetNumber(info,"Placement","MaxElevationDifference",5)}
                 else app.note("layout", "MISSING DEFENSE TEMPLATE: " .. name) end
             end
         end
@@ -1573,8 +1574,11 @@ local function run()
         end
         if app.mapId ~= map or app.className ~= class or app.revision ~= revision then return {} end
         app.plan, app.planKey = plan, key
-        app.note("layout", #plan == 0 and "AREA FULL / NO FITTING SLOTS; WAITING FOR FREE SPACE"
-            or app.blueprintReason .. " · " .. #plan .. " FREE SLOTS")
+        if #plan==0 then
+            if #specs==0 then app.note("layout","NO DEFENSE TYPES READY: check selected class, enabled defense types and loaded templates")
+            elseif #(app.blueprint or {})==0 then app.note("layout","NO INTERIOR SLOTS: "..tostring(app.blueprintReason))
+            else app.note("layout","AREA FULL; WAITING FOR FREE PLANNED SPACE") end
+        else app.note("layout",app.blueprintReason .. " · " .. #plan .. " FREE SLOTS") end
         return plan
     end
     function app.coverageStatus()
@@ -1631,8 +1635,16 @@ local function run()
         return margin >= 2
     end
     function app.getPlacement(preferred, allowUnfunded)
-        if os.clock() < (app.next.place or 0) then return nil end
-        if app.mode ~= "MATCH" or not cfg.autoPlace or app.editing or app.mapId == "Unknown" or not app.className then return nil end
+        if os.clock() < (app.next.place or 0) then
+            app.placementReadiness="WAITING: native placement request retry cooldown" return nil
+        end
+        if app.mode ~= "MATCH" or not cfg.autoPlace or app.editing or app.mapId == "Unknown" or not app.className then
+            app.placementReadiness = app.mode~="MATCH" and "WAITING: enter a match"
+                or not cfg.autoPlace and "OFF: AUTO PLACE CURRENT CLASS is disabled"
+                or app.editing and "PAUSED: close / connect the area editor"
+                or app.mapId=="Unknown" and "WAITING: map not detected" or "WAITING: class not detected"
+            return nil
+        end
         local client = app.module(app.find(player, "PlayerScripts", "Client"), "DeployableSystem")
         if not client then app.note("defense", "WAITING FOR NATIVE DEPLOYABLE MODULE") return nil end
         local choices,root = {},app.root()
@@ -1642,10 +1654,15 @@ local function run()
                 local priority=slot.layer=="BARRICADE"and 1 or slot.layer=="TURRET 1"and 2
                     or slot.layer=="TURRET 2"and 3 or slot.layer=="TURRET 3"and 4 or slot.role=="support"and 5 or 6
                 local distance=root and(slot.x-root.Position.X)^2+(slot.z-root.Position.Z)^2 or 0
-                choices[#choices+1]={slot=slot,key=key,priority=priority,distance=distance}
+                local spec = slot.spec or {}
+                local reach = placement.GetPlacementDistances(spec.info or {},spec.grid or 1)
+                local height = root and math.abs(root.Position.Y-slot.y) or math.huge
+                local inRange = root ~= nil and distance+height*height <= reach*reach and height <= (spec.maxElevation or 5)
+                choices[#choices+1]={slot=slot,key=key,priority=priority,distance=distance,inRange=inRange}
             end
         end
         table.sort(choices,function(a,b)
+            if a.inRange ~= b.inRange then return a.inRange end
             if a.priority~=b.priority then return a.priority<b.priority end
             if a.distance~=b.distance then return a.distance<b.distance end
             return a.key<b.key
@@ -1669,17 +1686,28 @@ local function run()
                         if not app.active() or app.editing or app.mapId ~= map or app.className ~= class or app.revision ~= revision then return nil end
                     end
                     local hit=app.ground(slot.x,slot.z,slot.y)
-                    if hit and app.placementSafe(hit.Position) then
+                    if hit then
+                        -- A defense can be deployed ahead of the player, including
+                        -- near enemies. Only the player's firing/approach position
+                        -- needs attack clearance, not the defense's destination.
+                        app.placementReadiness = (affordable and "READY " or "WAITING FOR CASH ")..slot.name.." | PRICE "..tostring(price[2]).." "..tostring(price[1])
+                            .." | "..(row.inRange and "IN RANGE" or "NEEDS SAFE APPROACH")
                         return{key=row.key,slot=slot,point=hit.Position,class=app.className,map=app.mapId,
-                            revision=app.revision,affordable=affordable}
+                            revision=app.revision,affordable=affordable,inRange=row.inRange}
                     end
-                    app.rejected[row.key]=os.clock()+(hit and .5 or 8)
+                    app.rejected[row.key]=os.clock()+8
+                    app.placementReadiness = "WAITING: selected floor has no valid support at "..slot.x..","..slot.z
                     if diagnostic then diagnostic:record("placement probe",slot.name.." @ "..slot.x..","..slot.z..": "..
-                        (hit and "WAITING: enemies can reach this slot" or "WAITING: selected floor has no valid support here"),"WAIT") end
+                        "WAITING: selected floor has no valid support here","WAIT") end
                 end
             else app.rejected[row.key]=os.clock()+.2 end
         end
-        if #choices>0 and funded==0 and not allowUnfunded then app.note("defense","WAITING FOR CASH: no selected defense is affordable") end
+        if #choices>0 and funded==0 and not allowUnfunded then
+            app.placementReadiness = "WAITING FOR CASH: no selected defense is affordable (reserve "..tostring(cfg.reserveCash or 0)..")"
+            app.note("defense",app.placementReadiness)
+        elseif #choices==0 then
+            app.placementReadiness = "WAITING: no free eligible slot; "..tostring(app.notes and app.notes.layout or "check saved area / selected defense types / retry timers")
+        end
         return nil
     end
     function app.placeTick()
@@ -1692,12 +1720,13 @@ local function run()
         end
         local root, human = app.root()
         if not root then return false end
-        if not app.placementSafe(root.Position) or not app.placementSafe(candidate.point) then
+        if not app.placementSafe(root.Position) then
             app.buildGoal = nil app.note("defense", "WAITING FOR SAFE PLACEMENT OPENING") return false
         end
         local spec = candidate.slot.spec
         local maxDistance = placement.GetPlacementDistances(spec.info, spec.grid or 1)
         local inRange = (root.Position - candidate.point).Magnitude <= maxDistance
+            and math.abs(root.Position.Y-candidate.point.Y) <= (spec.maxElevation or 5)
         -- The native range is to the requested surface point. Do not force a
         -- move to an arbitrary side/height when we can already place safely.
         local lift = human.HipHeight + root.Size.Y / 2
@@ -1706,15 +1735,27 @@ local function run()
         local side = candidate.point + outward.Unit * math.min(8, math.max(candidate.slot.w, candidate.slot.d) / 2 + 3)
         local sideHit = app.ground(side.X, side.Z, candidate.point.Y)
         local stand = (sideHit and sideHit.Position or candidate.point) + Vector3.new(0, lift, 0)
-        if not inRange and not app.placementSafe(stand) then
-            local safe
-            for i = 0, 7 do
-                local angle = i * math.pi / 4
-                local probe = candidate.point + Vector3.new(math.cos(angle) * 7, 0, math.sin(angle) * 7)
-                local floor = app.ground(probe.X, probe.Z, candidate.point.Y)
-                if floor and app.placementSafe(floor.Position) then safe = floor.Position + Vector3.new(0, lift, 0) break end
+        if not inRange and (not sideHit or not app.placementSafe(stand)) then
+            local safe, best
+            -- Stay out of reach while placing up to the native distance ahead.
+            -- Tight floors can use a closer ring when the outer ring has no support.
+            for _,radius in ipairs({math.max(3,maxDistance-3),6}) do
+                for i = 0, 15 do
+                    local angle = i * math.pi / 8
+                    local probe = candidate.point + Vector3.new(math.cos(angle)*radius,0,math.sin(angle)*radius)
+                    local floor = app.ground(probe.X,probe.Z,candidate.point.Y)
+                    if floor then
+                        local position = floor.Position+Vector3.new(0,lift,0)
+                        local distance = (position-root.Position).Magnitude
+                        if (position-candidate.point).Magnitude<=maxDistance and app.placementSafe(position)
+                            and (not best or distance<best) then safe,best=position,distance end
+                    end
+                end
             end
-            if not safe then return false end
+            if not safe then
+                app.buildGoal=nil app.placementReadiness="WAITING: no safe supported approach within native placement range"
+                app.note("defense",app.placementReadiness) return false
+            end
             stand = safe
         end
         if not inRange then
@@ -2873,6 +2914,7 @@ end
             local lines = {coverage, "PLACE " .. game.PlaceId, "MAP " .. app.mapId, "CLASS " .. tostring(app.className),
                 liveLabel.Text, "MASTER "..tostring(cfg.enabled).." | AUTO PLACE "..tostring(cfg.autoPlace).." | FIGHT "..tostring(cfg.fight),
                 "EDITING "..tostring(app.editing==true).." | BUILD TASK "..tostring(app.placementTask and app.placementTask.slot.name or "NONE"),
+                "PLACEMENT: "..tostring(app.placementReadiness or "No placement scan yet; check AUTO PLACE and master switches"),
                 "FIRE SIGNAL " .. tostring(type(firesignal) == "function"), "CONFIG WRITE " .. tostring(type(writefile) == "function")}
             local keys = {}
             for key in pairs(app.notes) do keys[#keys + 1] = key end
