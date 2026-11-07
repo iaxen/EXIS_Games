@@ -128,14 +128,20 @@ function Core.rectangle(p, width, depth)
         {x = p.x + a, z = p.z + b}, {x = p.x - a, z = p.z + b}}
 end
 
-function Core.fits(p, width, depth, poly)
+function Core.fits(p, width, depth, poly, touching)
     local corners = Core.rectangle(p, width, depth)
     for _, corner in ipairs(corners) do if not Core.inside(corner, poly) then return false end end
     -- Checking corners alone is insufficient for a concave boundary.
     for i, a in ipairs(poly) do
         local b = poly[i % #poly + 1]
+        if touching and a.x > p.x - width/2 + 0.00001 and a.x < p.x + width/2 - 0.00001
+            and a.z > p.z - depth/2 + 0.00001 and a.z < p.z + depth/2 - 0.00001 then return false end
         for j, c in ipairs(corners) do
-            if Core.intersects(a, b, c, corners[j % 4 + 1]) then return false end
+            local d = corners[j % 4 + 1]
+            if Core.intersects(a, b, c, d) then
+                if not touching or Core.cross(a, b, c) * Core.cross(a, b, d) < -0.000001
+                    and Core.cross(c, d, a) * Core.cross(c, d, b) < -0.000001 then return false end
+            end
         end
     end
     return true
@@ -148,119 +154,408 @@ end
 
 function Core.role(name, info)
     if name == "HealingStation" or info.Heal then return "support" end
-    if info.Classification and info.Classification.Barricade then return "wall" end
+    if name:find("Barricade") or info.Style == "Barrier" or info.Classification and info.Classification.Barricade then return "wall" end
     if info.PlayerBuff or name == "ReconTower" then return "support" end
     if info.Placement and info.Placement.Ability then return "ability" end
     if name:find("Barrel") or name:find("Mine") or name:find("Bomb") or name:find("Trap") then return "trap" end
     return "turret"
 end
 
-function Core.plan(poly, specs, limit, existing)
-    existing = existing or {}
-    if not Core.validPolygon(poly) then return {}, "SELECT A VALID AREA" end
-    local minX, maxX, minZ, maxZ, y, center = math.huge, -math.huge, math.huge, -math.huge, 0, {x = 0, z = 0}
-    for _, p in ipairs(poly) do
-        minX, maxX, minZ, maxZ = math.min(minX, p.x), math.max(maxX, p.x), math.min(minZ, p.z), math.max(maxZ, p.z)
-        center.x, center.z, y = center.x + p.x / #poly, center.z + p.z / #poly, y + p.y / #poly
+-- Offset every edge inward. Reject collapsed/self-crossing offsets instead of
+-- bridging a narrow concavity with an imaginary wall.
+function Core.insetPolygon(poly, inset)
+    local area, edges = 0, {}
+    for i, a in ipairs(poly) do local b = poly[i % #poly + 1]; area = area + a.x * b.z - b.x * a.z end
+    local sign = area > 0 and 1 or -1
+    for i, a in ipairs(poly) do
+        local b = poly[i % #poly + 1]
+        local dx, dz = b.x - a.x, b.z - a.z
+        local length = math.sqrt(dx * dx + dz * dz)
+        edges[i] = {x = a.x - sign * dz / length * inset, z = a.z + sign * dx / length * inset,
+            dx = dx, dz = dz}
     end
-    if maxX - minX > 600 or maxZ - minZ > 600 then return {}, "SELECT A SMALLER AREA" end
-    local candidates, step = {}, math.max(2, math.max(maxX - minX, maxZ - minZ) / 24)
-    for x = minX, maxX, step do
-        for z = minZ, maxZ, step do
-            local p = {x = x, y = y, z = z}
-            if Core.inside(p, poly) then candidates[#candidates + 1] = p end
+    local result = {}
+    for i, edge in ipairs(edges) do
+        local prev = edges[(i - 2) % #edges + 1]
+        local cross = prev.dx * edge.dz - prev.dz * edge.dx
+        local x, z = edge.x, edge.z
+        if math.abs(cross) > 0.00001 then
+            local t = ((edge.x - prev.x) * edge.dz - (edge.z - prev.z) * edge.dx) / cross
+            x, z = prev.x + t * prev.dx, prev.z + t * prev.dz
+        end
+        local point = {x = x, y = poly[i].y, z = z}
+        if not Core.inside(point, poly) then return nil end
+        -- An offset larger than a narrow corridor can fold back inside it.
+        for j, a in ipairs(poly) do
+            if Core.edgeDistance(point, a, poly[j % #poly + 1]) < inset - 0.001 then return nil end
+        end
+        result[#result + 1] = point
+    end
+    for i, a in ipairs(result) do
+        local b = result[i % #result + 1]
+        if (a.x-b.x)^2+(a.z-b.z)^2 < 0.000001 then return nil end
+        for j = i+2, #result do
+            if not (i==1 and j==#result) and Core.intersects(a,b,result[j],result[j % #result+1]) then return nil end
         end
     end
-    local result, used, reserve = {}, {}, nil
-    local supportSize = 4
-    for _, spec in ipairs(specs) do
-        if spec.role == "support" then supportSize = math.max(supportSize, spec.w + 0.5, spec.d + 0.5) end
-    end
-    local coverageRange = 24
-    for _, spec in ipairs(specs) do if spec.name == "HealingStation" then coverageRange = spec.range or 24 end end
-    local score
-    for _, p in ipairs(candidates) do
-        local blocked = false
-        for _, box in ipairs(existing) do
-            if Core.overlap({x = p.x, z = p.z, w = supportSize + 0.6, d = supportSize + 0.6}, box) then blocked = true break end
-        end
-        if not blocked and Core.fits(p, supportSize + 0.6, supportSize + 0.6, poly) then
-            local coverage = 0
-            for _, box in ipairs(existing) do
-                if (p.x - box.x) ^ 2 + (p.z - box.z) ^ 2 <= coverageRange ^ 2 then coverage = coverage + 1000 end
+    return result
+end
+
+function Core.containsBox(point, box)
+    return math.abs(point.x - box.x) <= box.w / 2 + 0.00001
+        and math.abs(point.z - box.z) <= box.d / 2 + 0.00001
+end
+
+-- Exact segment/rectangle intervals reveal even gaps narrower than the planner's
+-- sampling step. Only real blocking walls count, never turret firing circles.
+function Core.wallCoverage(ring, boxes, role)
+    local gaps, total, uncovered = {}, 0, 0
+    for i, a in ipairs(ring or {}) do
+        local b, intervals = ring[i % #ring + 1], {}
+        local dx, dz = b.x - a.x, b.z - a.z
+        local length = math.sqrt(dx * dx + dz * dz)
+        total = total + length
+        for _, box in ipairs(boxes) do
+            if box.role == (role or "wall") and ((role and role~="wall") or box.blocking ~= false) then
+                local low, high = 0, 1
+                for _, axis in ipairs({{"x", dx, box.w}, {"z", dz, box.d}}) do
+                    local key, delta, size = axis[1], axis[2], axis[3]
+                    if math.abs(delta) < 0.000001 then
+                        if math.abs(a[key] - box[key]) > size / 2 + 0.00001 then high = -1 end
+                    else
+                        local t1, t2 = (box[key] - size / 2 - a[key]) / delta, (box[key] + size / 2 - a[key]) / delta
+                        low, high = math.max(low, math.min(t1, t2)), math.min(high, math.max(t1, t2))
+                    end
+                end
+                if high >= low then intervals[#intervals + 1] = {low, high} end
             end
-            for _, q in ipairs(candidates) do
-                if (p.x - q.x) ^ 2 + (p.z - q.z) ^ 2 <= coverageRange ^ 2 then coverage = coverage + 1 end
+        end
+        table.sort(intervals, function(x, y) return x[1] < y[1] end)
+        local cursor = 0
+        local function gap(to)
+            if to > cursor + 0.00001 then
+                local mid = (cursor + to) / 2
+                gaps[#gaps + 1] = {edge = i, x = a.x + dx * mid, z = a.z + dz * mid,
+                    start = {x = a.x + dx * cursor, z = a.z + dz * cursor},
+                    finish = {x = a.x + dx * to, z = a.z + dz * to},
+                    length = (to - cursor) * length}
+                uncovered = uncovered + (to - cursor) * length
             end
-            local rank = coverage * 100 - ((p.x - center.x) ^ 2 + (p.z - center.z) ^ 2)
-            if not score or rank > score then reserve, score = {x = p.x, z = p.z, w = supportSize, d = supportSize}, rank end
         end
+        for _, span in ipairs(intervals) do gap(span[1]); cursor = math.max(cursor, span[2]) end
+        gap(1)
     end
-    if not reserve then return {}, "AREA NEEDS ROOM FOR A SUPPORT GAP" end
-    -- Keep the support gap even when another class must supply the healer.
-    used[1] = reserve
-    for _, box in ipairs(existing) do used[#used + 1] = box end
-    local function place(spec, p, ignoreReserve)
-        local grid = spec.grid or 1
-        local w, d = spec.w, spec.d
-        local x = (math.floor(p.x / grid - w * 0.5 + 0.5) + w * 0.5) * grid
-        local z = (math.floor(p.z / grid - d * 0.5 + 0.5) + d * 0.5) * grid
-        local box = {x = x, z = z, w = w * grid, d = d * grid}
-        if not Core.fits(box, box.w + 0.1, box.d + 0.1, poly) then return false end
-        for i, other in ipairs(used) do
-            if not (ignoreReserve and i == 1) and Core.overlap(box, other) then return false end
-        end
-        box.name, box.role, box.y, box.facing = spec.name, spec.role, y, spec.facing
-        result[#result + 1], used[#used + 1] = box, box
-        return true
+    return {gaps = gaps, uncovered = uncovered, total = total}
+end
+
+-- Exact union of axis-aligned deployment footprints clipped to the selected
+-- polygon. Sweep events include sloping-polygon / box-height intersections.
+-- Targeting range is deliberately not treated as spawn suppression coverage.
+function Core.areaCoverage(poly, boxes)
+    local xs, area = {}, 0
+    for i, a in ipairs(poly) do
+        local b = poly[i % #poly + 1]
+        xs[#xs + 1] = a.x; area = area + a.x * b.z - b.x * a.z
     end
-    -- Front-facing barriers first; the first two dots define the front edge.
-    table.sort(candidates, function(a, b)
-        return Core.edgeDistance(a, poly[1], poly[2]) < Core.edgeDistance(b, poly[1], poly[2])
-    end)
-    for _, spec in ipairs(specs) do
-        if spec.role == "wall" then
-            local n = 0
-            for _, p in ipairs(candidates) do
-                if #result >= limit then break end
-                local distance = Core.edgeDistance(p, poly[1], poly[2])
-                if distance <= math.max(spec.w, spec.d) + 3 and place(spec, p) then
-                    n = n + 1
-                    if n >= math.max(1, math.floor(limit * 0.35)) then break end
+    local minX, maxX = math.huge, -math.huge
+    for _, x in ipairs(xs) do minX, maxX = math.min(minX, x), math.max(maxX, x) end
+    for _, box in ipairs(boxes) do
+        xs[#xs + 1], xs[#xs + 2] = math.max(minX, box.x - box.w/2), math.min(maxX, box.x + box.w/2)
+        for i, a in ipairs(poly) do
+            local b = poly[i % #poly + 1]
+            if math.abs(b.z - a.z) > 0.000001 then
+                for _, z in ipairs({box.z - box.d/2, box.z + box.d/2}) do
+                    local t = (z - a.z) / (b.z - a.z)
+                    if t > 0 and t < 1 then xs[#xs + 1] = a.x + (b.x - a.x) * t end
                 end
             end
         end
     end
-    for _, spec in ipairs(specs) do
-        if spec.role == "support" and #result < limit then
-            if not place(spec, reserve, true) then
-                for _, p in ipairs(candidates) do if place(spec, p) then break end end
+    table.sort(xs)
+    local covered = 0
+    for i = 1, #xs - 1 do
+        local left, right = math.max(minX, xs[i]), math.min(maxX, xs[i+1])
+        if right > left + 0.000001 then
+            local x, cuts, spans = (left + right)/2, {}, {}
+            for j, a in ipairs(poly) do
+                local b = poly[j % #poly + 1]
+                if (a.x > x) ~= (b.x > x) then cuts[#cuts + 1] = a.z + (b.z-a.z) * (x-a.x)/(b.x-a.x) end
+            end
+            table.sort(cuts)
+            for _, box in ipairs(boxes) do
+                if x > box.x-box.w/2 and x < box.x+box.w/2 then spans[#spans+1] = {box.z-box.d/2,box.z+box.d/2} end
+            end
+            table.sort(spans,function(a,b)return a[1]<b[1]end)
+            local merged = {}
+            for _, span in ipairs(spans) do
+                local last = merged[#merged]
+                if last and span[1] <= last[2] then last[2] = math.max(last[2],span[2]) else merged[#merged+1] = {span[1],span[2]} end
+            end
+            local length = 0
+            for j = 1, #cuts-1, 2 do
+                for _, span in ipairs(merged) do length = length + math.max(0,math.min(cuts[j+1],span[2])-math.max(cuts[j],span[1])) end
+            end
+            covered = covered + length * (right-left)
+        end
+    end
+    area = math.abs(area)/2
+    return {area = area, covered = math.min(area,covered), uncovered = math.max(0,area-covered)}
+end
+
+function Core.plan(poly, specs, limit, existing, yieldWork, middleSpacing)
+    existing = existing or {}
+    limit = math.max(0,math.min(512,math.floor(limit)))
+    middleSpacing = Core.finite(middleSpacing) and math.max(6,math.min(40,middleSpacing)) or 12
+    if not Core.validPolygon(poly) then return {}, "SELECT A VALID AREA" end
+    local minX,maxX,minZ,maxZ,y=math.huge,-math.huge,math.huge,-math.huge,0
+    for _,p in ipairs(poly)do
+        minX,maxX,minZ,maxZ=math.min(minX,p.x),math.max(maxX,p.x),math.min(minZ,p.z),math.max(maxZ,p.z)
+        y=y+p.y/#poly
+    end
+    if maxX-minX>600 or maxZ-minZ>600 then return {},"SELECT A SMALLER AREA" end
+    local roles={wall={},turret={},support={},trap={}}
+    local wallSize,turretSize,grid=0,0,1
+    for _,spec in ipairs(specs)do
+        if roles[spec.role]then roles[spec.role][#roles[spec.role]+1]=spec end
+        local size=math.max(spec.w,spec.d)*(spec.grid or 1)
+        if spec.role=="wall"and spec.blocking~=false then wallSize=math.max(wallSize,size)end
+        if spec.role=="turret"then turretSize=math.max(turretSize,size)end
+        grid=math.max(grid,spec.grid or 1)
+    end
+    local result,used,reserve={}, {},nil
+    for _,box in ipairs(existing)do used[#used+1]=box end
+    local work=0
+    local function snapped(spec,point,facing)
+        local g,w,d=spec.grid or 1,spec.w,spec.d
+        if facing%2==1 then w,d=d,w end
+        return{x=(math.floor(point.x/g-w/2+.5)+w/2)*g,y=y,
+            z=(math.floor(point.z/g-d/2+.5)+d/2)*g,w=w*g,d=d*g,
+            name=spec.name,role=spec.role,facing=facing,blocking=spec.role=="wall"and spec.blocking~=false,spec=spec}
+    end
+    local function available(box,ignoreReserve)
+        work=work+1;if yieldWork and work%256==0 then yieldWork()end
+        if not Core.fits(box,box.w,box.d,poly,true)then return false end
+        for _,other in ipairs(used)do
+            if not(ignoreReserve and other==reserve)and Core.overlap(box,other,0)then return false end
+        end
+        return true
+    end
+    local function add(box)
+        if #result>=limit or not available(box)then return false end
+        result[#result+1],used[#used+1]=box,box;return true
+    end
+    local center={x=(minX+maxX)/2,z=(minZ+maxZ)/2}
+    -- Reserve an actual selected support unit, never a phantom hole for a class
+    -- that cannot build one. The middle is intentionally spaced, not tiled.
+    if roles.support[1]then
+        local best
+        for x=minX,maxX,math.max(2,(maxX-minX)/16)do
+            for z=minZ,maxZ,math.max(2,(maxZ-minZ)/16)do
+                local box=snapped(roles.support[1],{x=x,z=z},roles.support[1].facing or 0)
+                local d=(x-center.x)^2+(z-center.z)^2
+                if available(box)and(not best or d<best)then reserve,best=box,d end
+            end
+        end
+        if reserve then used[#used+1]=reserve end
+    end
+    local rectangle=#poly==4
+    for _,p in ipairs(poly)do
+        if math.min(math.abs(p.x-minX),math.abs(p.x-maxX))>.0001
+            or math.min(math.abs(p.z-minZ),math.abs(p.z-maxZ))>.0001 then rectangle=false end
+    end
+    local layers,counts={},{}
+    local function layer(name,role,inset,quota,types,bounds)
+        local ring=Core.insetPolygon(poly,inset)
+        local reference=types[1]
+        if role=="wall"then for _,spec in ipairs(types)do if spec.blocking~=false then reference=spec;break end end end
+        if bounds and reference then
+            local w,d=reference.w*(reference.grid or 1),reference.d*(reference.grid or 1)
+            if bounds.maxX-bounds.minX>w and bounds.maxZ-bounds.minZ>d then
+                ring={{x=bounds.minX+w/2,y=y,z=bounds.minZ+d/2},{x=bounds.maxX-w/2,y=y,z=bounds.minZ+d/2},
+                    {x=bounds.maxX-w/2,y=y,z=bounds.maxZ-d/2},{x=bounds.minX+w/2,y=y,z=bounds.maxZ-d/2}}
+            else ring=nil end
+        end
+        local row={name=name,role=role,ring=ring,inset=inset,planned=0}
+        layers[#layers+1]=row
+        if not ring then row.unfit=true;return end
+        local pool,seen={},{}
+        if bounds then
+            -- A picked rectangular floor can be tiled exactly on its native
+            -- grid. Fixed rows avoid greedy corner gaps and work for barriers
+            -- whose native contract does not support rotation.
+            for _,spec in ipairs(types)do
+                if role~="wall"or spec.blocking~=false then
+                    local g=spec.grid or 1;local w,d=spec.w*g,spec.d*g
+                    local function candidate(x,z,edge)
+                        local box=snapped(spec,{x=x,z=z},0)
+                        local key=spec.name..":"..box.x..":"..box.z
+                        if not seen[key]and available(box)then
+                            seen[key]=true;box.edge,box.layer=edge,name;pool[#pool+1]=box
+                        end
+                    end
+                    for x=bounds.minX+w/2,bounds.maxX-w/2+.0001,w do
+                        candidate(x,bounds.minZ+d/2,1);candidate(x,bounds.maxZ-d/2,3)
+                    end
+                    for z=bounds.minZ+d*1.5,bounds.maxZ-d*1.5+.0001,d do
+                        candidate(bounds.minX+w/2,z,4);candidate(bounds.maxX-w/2,z,2)
+                    end
+                end
+            end
+        else
+        for i,a in ipairs(ring)do
+            local b=ring[i%#ring+1];local dx,dz=b.x-a.x,b.z-a.z
+            local length=math.sqrt(dx*dx+dz*dz)
+            local n=math.max(1,math.min(math.ceil(length/grid),math.floor(2048/#ring)))
+            for j=0,n do
+                for _,spec in ipairs(types)do
+                    if role~="wall"or spec.blocking~=false then
+                        local facing=spec.facing or 0
+                        if spec.canRotate then
+                            facing=math.floor(-math.atan2(dz,dx)/(math.pi/2)+.5)%4
+                            if spec.w<spec.d then facing=(facing+1)%4 end
+                        end
+                        local box=snapped(spec,{x=a.x+dx*j/n,z=a.z+dz*j/n},facing)
+                        local key=spec.name..":"..box.x..":"..box.z..":"..facing
+                        if not seen[key]and available(box)then
+                            seen[key]=true;box.edge,box.layer=i,name;pool[#pool+1]=box
+                        end
+                    end
+                end
+            end
+        end
+        end
+        local nextEdge=1
+        while row.planned<quota and #result<limit do
+            local coverage=Core.wallCoverage(ring,used,role)
+            if coverage.uncovered<.001 then break end
+            local choice,best,chosenEdge
+            table.sort(coverage.gaps,function(a,b)return(a.edge-nextEdge+#ring)%#ring<(b.edge-nextEdge+#ring)%#ring end)
+            for pass=1,3 do
+                for _,gap in ipairs(coverage.gaps)do
+                    local target=pass==1 and gap.start or pass==2 and gap.finish or gap
+                    for _,box in ipairs(pool)do
+                        if Core.containsBox(target,box)and available(box)then
+                            local a,b=ring[gap.edge],ring[gap.edge%#ring+1]
+                            local dx,dz=b.x-a.x,b.z-a.z
+                            local length=math.sqrt(dx*dx+dz*dz)
+                            local direction=pass==2 and -1 or 1
+                            local probe={x=target.x+dx/length*.01*direction,z=target.z+dz/length*.01*direction}
+                            if Core.containsBox(probe,box)then
+                                local gain=0
+                                for k=1,8 do
+                                    local t=k/8
+                                    local point={x=gap.start.x+(gap.x-gap.start.x)*2*t,z=gap.start.z+(gap.z-gap.start.z)*2*t}
+                                    if Core.containsBox(point,box)then gain=gain+1 end
+                                end
+                                local score=gain*100-(counts[box.name]or 0)
+                                if not best or score>best then choice,best,chosenEdge=box,score,gap.edge end
+                            end
+                        end
+                    end
+                    if choice then break end
+                end
+                if choice then break end
+            end
+            if not choice or not add(choice)then break end
+            counts[choice.name]=(counts[choice.name]or 0)+1;row.planned=row.planned+1;nextEdge=chosenEdge%#ring+1
+        end
+        row.coverage=Core.wallCoverage(ring,used,role)
+    end
+    local supportBudget=reserve and 1 or 0
+    local middleBudget=math.min(3,limit)
+    local outerInset=wallSize>0 and wallSize/2+grid*.6 or grid*.6
+    local wallBudget=#roles.turret>0 and math.floor(math.max(0,limit-middleBudget-supportBudget)*.3)or math.max(0,limit-middleBudget-supportBudget)
+    local wallReference
+    for _,spec in ipairs(roles.wall)do if spec.blocking~=false then wallReference=spec break end end
+    local bounds=rectangle and {minX=minX,maxX=maxX,minZ=minZ,maxZ=maxZ}or nil
+    if wallSize>0 then layer("BARRICADE","wall",outerInset,wallBudget,roles.wall,bounds)end
+    local firstInset=outerInset+(wallSize>0 and wallSize/2 or 0)+turretSize/2+grid*.1
+    local fitted=0
+    if #roles.turret>0 then
+        for n=1,3 do
+            local quota=math.max(0,math.floor((limit-#result-middleBudget-supportBudget)/(4-n)))
+            local frame
+            if rectangle then
+                local wx=wallReference and wallReference.w*(wallReference.grid or 1)or 0
+                local wz=wallReference and wallReference.d*(wallReference.grid or 1)or 0
+                frame={minX=minX+wx+(n-1)*turretSize,maxX=maxX-wx-(n-1)*turretSize,
+                    minZ=minZ+wz+(n-1)*turretSize,maxZ=maxZ-wz-(n-1)*turretSize}
+            end
+            layer("TURRET "..n,"turret",firstInset+(n-1)*turretSize,quota,roles.turret,frame)
+            if not layers[#layers].unfit then fitted=fitted+1 end
+        end
+    end
+    if reserve and #result<limit and available(reserve,true)then
+        result[#result+1]=reserve;reserve.layer="SUPPORT"
+    end
+    local innerInset=firstInset+2*turretSize+turretSize/2
+    local inner=Core.insetPolygon(poly,innerInset)
+    if rectangle then
+        local wx=wallReference and wallReference.w*(wallReference.grid or 1)or 0
+        local wz=wallReference and wallReference.d*(wallReference.grid or 1)or 0
+        if maxX-minX>2*(wx+3*turretSize)and maxZ-minZ>2*(wz+3*turretSize)then
+            inner={{x=minX+wx+3*turretSize,y=y,z=minZ+wz+3*turretSize},{x=maxX-wx-3*turretSize,y=y,z=minZ+wz+3*turretSize},
+                {x=maxX-wx-3*turretSize,y=y,z=maxZ-wz-3*turretSize},{x=minX+wx+3*turretSize,y=y,z=maxZ-wz-3*turretSize}}
+        else inner=nil end
+    end
+    local middleAdded=0
+    middleBudget=math.max(0,limit-#result)
+    local function middleUnit(spec,point,anchor)
+        if not spec or middleAdded>=middleBudget or #result>=limit then return nil end
+        local box=snapped(spec,point,spec.facing or 0)
+        if not inner or not Core.fits(box,box.w,box.d,inner,true)then return nil end
+        if add(box)then box.layer,box.fill,box.anchor="MIDDLE",true,anchor;middleAdded=middleAdded+1;return box end
+    end
+    if inner then
+        local spacing=math.max(middleSpacing,wallSize+grid,turretSize+grid)
+        local startX=center.x-math.floor((center.x-minX)/spacing)*spacing
+        local startZ=center.z-math.floor((center.z-minZ)/spacing)*spacing
+        local anchors={}
+        for x=startX,maxX,spacing do for z=startZ,maxZ,spacing do
+            if Core.inside({x=x,z=z},inner)then anchors[#anchors+1]={x=x,z=z}end
+        end end
+        table.sort(anchors,function(a,b)return(a.x-center.x)^2+(a.z-center.z)^2<(b.x-center.x)^2+(b.z-center.z)^2 end)
+        for index,anchor in ipairs(anchors)do
+            if middleAdded>=middleBudget or #result>=limit then break end
+            local primary=roles.wall[1]or roles.turret[(index-1)%math.max(1,#roles.turret)+1]
+            local box=middleUnit(primary,anchor,index)
+            if box and #roles.turret>0 then
+                local gun=roles.turret[(index-1)%#roles.turret+1]
+                -- A nearby shooter covers each middle barricade. Keep the
+                -- native footprints separate and retain routes between groups.
+                local gx,gz=gun.w*(gun.grid or 1),gun.d*(gun.grid or 1)
+                for _,offset in ipairs({{(box.w+gx)/2+grid,0},{-(box.w+gx)/2-grid,0},{0,(box.d+gz)/2+grid},{0,-(box.d+gz)/2-grid}})do
+                    if middleUnit(gun,{x=box.x+offset[1],z=box.z+offset[2]},index)then break end
+                end
+            end
+            if roles.trap[1]and box then
+                middleUnit(roles.trap[1],{x=box.x,z=box.z+box.d/2+roles.trap[1].d*(roles.trap[1].grid or 1)/2+grid},index)
             end
         end
     end
-    table.sort(candidates, function(a, b)
-        local da = (a.x - reserve.x) ^ 2 + (a.z - reserve.z) ^ 2
-        local db = (b.x - reserve.x) ^ 2 + (b.z - reserve.z) ^ 2
-        return da < db
-    end)
-    local turretTypes, trapTypes = 0, 0
-    for _, spec in ipairs(specs) do
-        if spec.role == "turret" then turretTypes = turretTypes + 1 end
-        if spec.role == "trap" then trapTypes = trapTypes + 1 end
+    local placed={};for _,box in ipairs(used)do if box~=reserve then placed[#placed+1]=box end end
+    if reserve and reserve.layer then placed[#placed+1]=reserve end
+    local coverage={layers=layers,fitted=fitted,middle=middleAdded,spacing=middleSpacing,floor=Core.areaCoverage(poly,placed)}
+    local incomplete=0
+    for _,row in ipairs(layers)do if row.unfit or not row.coverage or row.coverage.uncovered>.001 then incomplete=incomplete+1 end end
+    coverage.incomplete=incomplete
+    local reason="1 BARRICADE + 3 TURRET ROWS · MIDDLE SPACING "..middleSpacing
+    if wallSize==0 then reason="NO BLOCKING BARRICADE IN SELECTION · "..reason end
+    if fitted<3 then reason=reason.." · AREA FITS "..fitted.."/3 TURRET ROWS" end
+    if incomplete>0 then reason=reason.." · "..incomplete.." ROWS HAVE GAPS / LIMITS" end
+    return result,reason,reserve,coverage
+end
+
+function Core.teleportClearance(point, mobs, horizon)
+    local clearance, margin = math.huge, math.huge
+    for _, mob in ipairs(mobs) do
+        local from={x=mob.x,z=mob.z}
+        local to={x=mob.x+(mob.vx or 0)*horizon,z=mob.z+(mob.vz or 0)*horizon}
+        local distance=Core.edgeDistance(point,from,to)
+        clearance=math.min(clearance,distance)
+        margin=math.min(margin,distance-math.max(0,mob.range or 3)-3)
     end
-    local trapQuota = math.max(1, math.floor(limit * 0.15))
-    local turretQuota = math.max(1, math.floor((limit - #result - trapTypes * trapQuota) / math.max(1, turretTypes)))
-    for _, spec in ipairs(specs) do
-        if spec.role == "turret" or spec.role == "trap" then
-            local quota = spec.role == "trap" and trapQuota or turretQuota
-            local n = 0
-            for _, p in ipairs(candidates) do
-                if #result >= limit or n >= quota then break end
-                if Core.edgeDistance(p, poly[1], poly[2]) > math.max(spec.w, spec.d) + 3 and place(spec, p) then n = n + 1 end
-            end
-        end
-    end
-    return result, "LAYOUT READY", reserve
+    return clearance,margin
 end
 
 function Core.targetScore(distance, boss, bossFirst, previous)
@@ -403,21 +698,25 @@ local function run()
     local app = {alive = true, connections = {}, cache = {}, rejected = {}, notes = {}, mapId = "", mode = "",
         next = {}, selectedPage = "MAIN", manual = {}, revision = 0}
     env.EXISZombieRush = app
-    local cfg = {version = 1, enabled = true, autoSkip = false, buyClasses = {}, upgradeClasses = {},
+    local cfg = {version = 1, layoutVersion = 2, enabled = true, autoSkip = false, buyClasses = {}, upgradeClasses = {},
         buyWeapons = {}, upgradeWeapons = {}, loadout = {}, autoLoadout = false,
         health = false, gun = false, melee = false, autoPlace = false, defenseTypes = {},
-        regions = {}, maxDefenses = 18, reserveCash = 0, fight = false, fly = false, turretLeash = 20,
-        headAim = true, bossFirst = true, clearance = 14, moveMode = "Smooth", placeSpawnArea = false, fireInput = "Mobile", flyHeight = 14, orbitRadius = 16, flySpeed = 32}
+        regions = {}, showBoundary = false, maxDefenses = 256, middleSpacing = 12, reserveCash = 0, fight = false, fly = false, turretLeash = 20,
+        headAim = true, bossFirst = true, dodgeTeleport = true, dodgeClearance = 35, dodgeInterval = 0.3, clearance = 14, moveMode = "Smooth", placeSpawnArea = false, fireInput = "Mobile", flyHeight = 14, orbitRadius = 16, flySpeed = 32}
     local file = storage.path("EXIS_ZombieRushSurvival_" .. player.UserId .. ".json")
     if type(readfile) == "function" then
         local ok, data = pcall(function() if storage.exists(file) then return Http:JSONDecode(storage.read(file)) end end)
         if ok and type(data) == "table" and data.version == 1 then
             for key, value in pairs(data) do if type(value) == type(cfg[key]) then cfg[key] = value end end
+            -- The original 18-slot default cannot support the requested four-row
+            -- perimeter. Preserve other explicit limits when migrating old saves.
+            if data.layoutVersion~=2 and data.maxDefenses==18 then cfg.maxDefenses=256 end
+            cfg.layoutVersion=2
         end
     end
     -- Migrate old hover saves: combat now uses grounded dodging.
-    cfg.fly, cfg.moveMode = false, "Ground"
-    for key, limits in pairs({turretLeash = {8, 60}, maxDefenses = {1, 48}, reserveCash = {0, 1e12}, flyHeight = {5, 50},
+    cfg.fly, cfg.moveMode, cfg.placeSpawnArea = false, "Ground", false
+    for key, limits in pairs({dodgeClearance = {3,40}, dodgeInterval = {.12,1}, turretLeash = {8, 60}, maxDefenses = {1, 512}, middleSpacing = {6,40}, reserveCash = {0, 1e12}, flyHeight = {5, 50},
         orbitRadius = {6, 90}, flySpeed = {8, 100}, clearance = {8, 60}}) do
         local value = cfg[key]
         cfg[key] = Core.finite(value) and math.clamp(value, limits[1], limits[2]) or limits[1]
@@ -622,15 +921,17 @@ local function run()
         return true
     end
     function app.turretEstablished()
+        local poly = app.region().points or {}
         local folder = workspace:FindFirstChild("Deployables")
         for _, model in ipairs(folder and folder:GetChildren() or {}) do
             local name = model:GetAttribute("TypeName")
             local info = name and defs.Types[name]
             if model:GetAttribute("OwnerUserId") == player.UserId and model:GetAttribute("Destroyed") ~= true
-                and (model:GetAttribute("Health") or 1) > 0 and info and Core.role(name, info) == "turret" then return true end
+                and (model:GetAttribute("Health") or 1) > 0 and info and Core.role(name, info) == "turret"
+                and model.PrimaryPart and Core.inside({x=model.PrimaryPart.Position.X,z=model.PrimaryPart.Position.Z},poly) then return true end
         end
         for _, pending in pairs(app.pendingPlacements or {}) do
-            if os.clock() < pending.expires and pending.slot.role == "turret" then return true end
+            if os.clock() < pending.expires and pending.slot.role == "turret" and Core.inside(pending.slot,poly) then return true end
         end
         return false
     end
@@ -950,34 +1251,9 @@ local function run()
         return ok
     end
     function app.placementRegion()
-        if not cfg.placeSpawnArea then return app.region() end
-        local nav, root = app.navigation(), app.root()
-        if #nav.hull < 3 or not root or #nav.spawns == 0 then return {points = {}} end
-        if not app.spawnAnchor or app.spawnAnchorMap ~= app.mapId then
-            local best, distance
-            for _, row in ipairs(nav.spawns) do
-                local d = (row.point - root.Position).Magnitude
-                if app.airRisk(row.point) > 0 then d = d + 10000 end
-                if not distance or d < distance then best, distance = row.point, d end
-            end
-            local alternatives = {}
-            for _, row in ipairs(nav.spawns) do alternatives[#alternatives + 1] = row.point end
-            table.sort(alternatives, function(a, b) return (a - root.Position).Magnitude < (b - root.Position).Magnitude end)
-            best = alternatives[((app.spawnAnchorTurn or 0) % #alternatives) + 1] or best
-            local hit = app.raycast(best + Vector3.new(0, 5, 0), Vector3.new(0, -100, 0), app.mapFilters())
-            if hit and hit.Normal.Y >= 0.65 then best = hit.Position end
-            app.spawnAnchor, app.spawnAnchorMap = best, app.mapId
-        end
-        local p, radius = app.spawnAnchor, 25
-        local square = {{x = p.X - radius, y = p.Y, z = p.Z - radius}, {x = p.X + radius, y = p.Y, z = p.Z - radius},
-            {x = p.X + radius, y = p.Y, z = p.Z + radius}, {x = p.X - radius, y = p.Y, z = p.Z + radius}}
-        local clipped = Core.clipPolygon(square, nav.hull)
-        if #clipped > 24 then
-            local simpler = {}
-            for i = 1, 24 do simpler[i] = clipped[math.floor((i - 1) * #clipped / 24) + 1] end
-            clipped = simpler
-        end
-        return {points = clipped, anywhere = true}
+        -- The saved map-part selection is the only placement region. Legacy
+        -- spawn-area options must never silently override the user's boundary.
+        return app.region()
     end
     function app.routeHop(goal)
         local root = app.root()
@@ -1069,15 +1345,18 @@ local function run()
             end
         end
     end
+    function app.syncBoundary(force)
+        local key = app.mapId .. ":" .. app.revision .. ":" .. tostring(cfg.showBoundary) .. ":" .. tostring(app.editing)
+        if not force and key == app.boundaryKey then return end
+        app.boundaryKey = key
+        if cfg.showBoundary and not app.editing and app.mode == "MATCH" then app.drawRegion(app.region().points or {},true)
+        else app.clearMarkers() end
+    end
     function app.specs()
         local result = {}
         if not app.className then return result end
         local region = app.placementRegion()
         local poly = region.points or {}
-        local outward = #poly >= 2 and Vector3.new(poly[2].z - poly[1].z, 0, poly[1].x - poly[2].x) or Vector3.new(0, 0, -1)
-        local center = Vector3.new(0, 0, 0)
-        for _, p in ipairs(poly) do center = center + Vector3.new(p.x, p.y, p.z) / #poly end
-        if #poly >= 2 and outward:Dot(Vector3.new(poly[1].x, poly[1].y, poly[1].z) - center) < 0 then outward = -outward end
         for _, name in ipairs(classes.GetDeployableSlots(app.className)) do
             local info = defs.Types[name]
             if info and cfg.defenseTypes[name] ~= false and not (info.Placement and info.Placement.Ability) then
@@ -1086,12 +1365,13 @@ local function run()
                 local primary = template and utils.GetRootPrimaryPart(template)
                 if primary then
                     local w, d = utils.GetFootprint(primary)
-                    local facing = placement.FacesCharacter(info) and placement.GetFacingFromLookVector(outward) or 0
-                    w, d = placement.GetFacingFootprint(w, d, facing)
+                    local facing = 0
                     local level = tonumber(app.value(app.data("Classes", "DeployableLevels", name), 1)) or 1
                     local effective = deployUpgrades.ApplyLevelToTypeInfo(name, info, level)
                     result[#result + 1] = {name = name, role = Core.role(name, info), w = w, d = d,
                         grid = defs.GetNumber(info, "Placement", "GridSize", 1), facing = facing,
+                        canRotate = placement.FacesCharacter(info),
+                        blocking = defs.GetBoolean(info,"Physics","ZombieBlocking",false) or defs.GetBoolean(info,"FakeWall","Enabled",false),
                         info = info, primary = primary, range = placement.GetFunctionalRange(effective)}
                 else app.note("layout", "MISSING DEFENSE TEMPLATE: " .. name) end
             end
@@ -1099,16 +1379,47 @@ local function run()
         return result
     end
     function app.layout()
-        local key = app.mapId .. ":" .. tostring(app.className) .. ":" .. app.revision
+        local boxes = app.defenseBoxes()
+        local signatures, owned = {}, 0
+        for _, box in ipairs(boxes) do
+            signatures[#signatures+1] = table.concat({box.name or "?",box.x,box.z,box.w,box.d},":")
+            if box.owned then owned = owned + 1 end
+        end
+        for _, row in pairs(app.pendingPlacements or {}) do
+            if os.clock() < row.expires then
+                local found = false
+                for _, box in ipairs(boxes) do if Core.overlap(row.slot,box,0) then found = true break end end
+                if not found then boxes = {table.unpack(boxes)};boxes[#boxes+1] = row.slot;owned = owned+1 end
+                signatures[#signatures+1] = "pending:"..row.slot.name..":"..row.slot.x..":"..row.slot.z
+            end
+        end
+        table.sort(signatures)
+        local key = app.mapId .. ":" .. tostring(app.className) .. ":" .. app.revision .. ":" .. table.concat(signatures,";")
         if key == app.planKey then return app.plan or {} end
         local specs = app.specs()
-        local plan, reason, reserve = Core.plan(app.placementRegion().points or {}, specs, cfg.maxDefenses, app.defenseBoxes())
-        local byName = {}
-        for _, spec in ipairs(specs) do byName[spec.name] = spec end
-        for _, slot in ipairs(plan) do slot.spec = byName[slot.name] end
-        app.plan, app.planKey, app.reserve = plan, key, reserve
-        app.note("layout", reason .. " · " .. #plan .. " SLOTS")
+        local map, class, revision = app.mapId, app.className, app.revision
+        local poly = app.placementRegion().points or {}
+        local plan, reason, reserve, coverage = Core.plan(poly, specs, math.max(0,cfg.maxDefenses-owned), boxes,function()
+            task.wait()
+            if not app.alive or app.mapId ~= map or app.className ~= class or app.revision ~= revision then error("LAYOUT CHANGED; REPLANNING") end
+        end,cfg.middleSpacing)
+        if app.mapId ~= map or app.className ~= class or app.revision ~= revision then return {} end
+        app.plan, app.planKey, app.reserve, app.planCoverage = plan, key, reserve, coverage
+        app.note("layout", reason .. " · " .. #plan .. " NEW SLOTS")
         return plan
+    end
+    function app.coverageStatus()
+        local poly = app.region().points or {}
+        if not Core.validPolygon(poly) then return "SELECT A MAP PART FIRST" end
+        local boxes, confirmed = app.defenseBoxes(), {}
+        for _, box in ipairs(boxes) do confirmed[#confirmed+1] = box end
+        local count=0
+        for _,box in ipairs(confirmed)do if Core.inside(box,poly)then count=count+1 end end
+        local text="BUILT "..count.." DEFENSES · OUTER BARRICADE + 3 TURRET ROWS · MIDDLE "..cfg.middleSpacing.." STUDS"
+        local plan=app.planCoverage
+        if plan and plan.fitted<3 then text=text.." · ONLY "..plan.fitted.."/3 ROWS FIT" end
+        if plan and plan.incomplete>0 then text=text.." · PLAN: "..plan.incomplete.." ROWS HAVE GAPS / LIMITS" end
+        return text
     end
     function app.defenseBoxes()
         if app.defenseCache and os.clock() < app.defenseCache.untilTime then return app.defenseCache.boxes end
@@ -1116,7 +1427,7 @@ local function run()
         local poly, floorY = app.placementRegion().points or {}, 0
         for _, p in ipairs(poly) do floorY = floorY + p.y / #poly end
         for _, model in ipairs(folder and folder:GetChildren() or {}) do
-            if model:IsA("Model") and model:GetAttribute("Destroyed") ~= true then
+            if model:IsA("Model") and model:GetAttribute("Destroyed") ~= true and (model:GetAttribute("Health") or 1)>0 then
                 local primary = model.PrimaryPart
                 local grid = model:GetAttribute("GridSize") or 1
                 local x, z = model:GetAttribute("GridStartX"), model:GetAttribute("GridStartZ")
@@ -1128,6 +1439,10 @@ local function run()
                     else
                         box = {x = primary.Position.X, z = primary.Position.Z, w = primary.Size.X, d = primary.Size.Z}
                     end
+                    local name = model:GetAttribute("TypeName")
+                    local info = name and defs.Types[name]
+                    box.name, box.role, box.owned = name, info and Core.role(name,info) or "unknown", model:GetAttribute("OwnerUserId") == player.UserId
+                    box.blocking = info and (defs.GetBoolean(info,"Physics","ZombieBlocking",false) or defs.GetBoolean(info,"FakeWall","Enabled",false)) or false
                     boxes[#boxes + 1] = box
                 end
             end
@@ -1136,9 +1451,9 @@ local function run()
         return boxes
     end
     function app.occupied(slot)
-        for _, box in ipairs(app.defenseBoxes()) do if Core.overlap(slot, box, 0.1) then return true end end
+        for _, box in ipairs(app.defenseBoxes()) do if Core.overlap(slot, box, 0) then return true end end
         for _, pending in pairs(app.pendingPlacements or {}) do
-            if os.clock() < pending.expires and Core.overlap(slot, pending.slot) then return true end
+            if os.clock() < pending.expires and Core.overlap(slot, pending.slot, 0) then return true end
         end
         return false
     end
@@ -1152,31 +1467,41 @@ local function run()
             if model:GetAttribute("OwnerUserId") == player.UserId and model:GetAttribute("Destroyed") ~= true then ownedCount = ownedCount + 1 end
         end
         if ownedCount >= cfg.maxDefenses then return nil end
-        local choices = {}
-        for index, slot in ipairs(app.layout()) do
-            local key = app.planKey .. ":" .. index
-            if (not preferred or slot.name == preferred or slot.role == preferred)
-                and os.clock() >= (app.rejected[key] or 0) and not app.occupied(slot) then
-                local currency, price = client.GetCurrentPrice(slot.name)
-                local affordable = app.afford(currency, price)
+        local choices,root = {},app.root()
+        for _,slot in ipairs(app.layout())do
+            local key=app.mapId..":"..app.revision..":"..slot.name..":"..slot.x..":"..slot.z..":"..slot.facing
+            if(not preferred or slot.name==preferred or slot.role==preferred)and os.clock()>=(app.rejected[key]or 0)then
+                local priority=slot.layer=="BARRICADE"and 1 or slot.layer=="TURRET 1"and 2
+                    or slot.layer=="TURRET 2"and 3 or slot.layer=="TURRET 3"and 4 or slot.role=="support"and 5 or 6
+                local distance=root and(slot.x-root.Position.X)^2+(slot.z-root.Position.Z)^2 or 0
+                choices[#choices+1]={slot=slot,key=key,priority=priority,distance=distance}
+            end
+        end
+        table.sort(choices,function(a,b)
+            if a.priority~=b.priority then return a.priority<b.priority end
+            if a.distance~=b.distance then return a.distance<b.distance end
+            return a.key<b.key
+        end)
+        local prices={}
+        -- A large layered layout must not perform hundreds of floor/risk
+        -- queries per class type on every worker tick.
+        for index=1,math.min(32,#choices)do
+            local row=choices[index];local slot=row.slot
+            if not app.occupied(slot)then
+                local price=prices[slot.name]
+                if not price then local currency,cost=client.GetCurrentPrice(slot.name);price={currency,cost};prices[slot.name]=price end
+                local affordable=app.afford(price[1],price[2])
                 if affordable or allowUnfunded then
-                    local hit = app.ground(slot.x, slot.z, slot.y)
-                    if hit and app.inPlayableMap(hit.Position) and app.airRisk(hit.Position) == 0 then
-                        choices[#choices + 1] = {key = key, slot = slot, point = hit.Position, class = app.className,
-                            map = app.mapId, revision = app.revision, affordable = affordable}
-                    elseif not hit then app.rejected[key] = os.clock() + 8 end
+                    local hit=app.ground(slot.x,slot.z,slot.y)
+                    if hit and app.inPlayableMap(hit.Position)and app.airRisk(hit.Position)==0 then
+                        return{key=row.key,slot=slot,point=hit.Position,class=app.className,map=app.mapId,
+                            revision=app.revision,affordable=affordable}
+                    end
+                    app.rejected[row.key]=os.clock()+(hit and .5 or 8)
                 end
-            end
+            else app.rejected[row.key]=os.clock()+.2 end
         end
-        if #choices == 0 then
-            if cfg.placeSpawnArea and not app.placementTask and os.clock() >= (app.next.spawnArea or 0) then
-                app.next.spawnArea = os.clock() + 5
-                app.spawnAnchorTurn = (app.spawnAnchorTurn or 0) + 1
-                app.spawnAnchor, app.planKey = nil, nil
-            end
-            return nil
-        end
-        return choices[math.random(1, #choices)]
+        return nil
     end
     function app.placeTick()
         if app.target and app.target.boss and cfg.bossFirst and cfg.fight then app.buildGoal = nil return end
@@ -1218,13 +1543,13 @@ local function run()
             or not cfg.autoPlace or not app.active() or app.occupied(candidate.slot) then return false end
         local spec = candidate.slot.spec
         local region = app.placementRegion()
-        if not Core.fits(candidate.slot, candidate.slot.w + 0.1, candidate.slot.d + 0.1, region.points or {}) then return false end
+        if not Core.fits(candidate.slot, candidate.slot.w, candidate.slot.d, region.points or {}, true) then return false end
         local client = app.module(app.find(player, "PlayerScripts", "Client"), "DeployableSystem")
         if not client then return false end
         local currency, price = client.GetCurrentPrice(candidate.slot.name)
         if not app.afford(currency, price) then return false end
         local result = app.invoke("place", app.find(RS, "DeployableSystem_Remotes", "Place"),
-            candidate.slot.name, candidate.point, {Facing = spec.facing})
+            candidate.slot.name, candidate.point, {Facing = candidate.slot.facing or spec.facing})
         if type(result) == "table" and result.ok == true then
             app.pendingPlacements = app.pendingPlacements or {}
             app.pendingPlacements[candidate.key] = {slot = candidate.slot, expires = os.clock() + 5}
@@ -1385,13 +1710,24 @@ local function run()
         if app.enemyCache and os.clock() < app.enemyCache.untilTime then return app.enemyCache.rows end
         local folder, rows = workspace:FindFirstChild("Zombie_ClientVisuals"), {}
         local types = app.module(shared:FindFirstChild("Zombies"), "ZombieTypes")
+        app.enemyMotion=app.enemyMotion or setmetatable({},{__mode="k"})
+        local now=os.clock()
         for _, model in ipairs(folder and folder:GetChildren() or {}) do
             if model:IsA("Model") and model:GetAttribute("ZombieId") ~= nil then
                 local point = app.head(model)
                 local human = model:FindFirstChildOfClass("Humanoid")
                 if point and (not human or human.Health > 0) then
                     local info = types and types.GetById(model:GetAttribute("ZombieTypeId"))
-                    rows[#rows + 1] = {model = model, point = point, x = point.X, z = point.Z,
+                    local previous=app.enemyMotion[model]
+                    local vx,vz=0,0
+                    if previous and now-previous.at>.01 then
+                        vx,vz=(point.X-previous.x)/(now-previous.at),(point.Z-previous.z)/(now-previous.at)
+                        local speed=math.sqrt(vx*vx+vz*vz)
+                        local maximum=math.max(32,(info and tonumber(info.speed)or 16)*2)
+                        if speed>maximum then vx,vz=vx/speed*maximum,vz/speed*maximum end
+                    end
+                    app.enemyMotion[model]={x=point.X,z=point.Z,at=now}
+                    rows[#rows + 1] = {model = model, point = point, x = point.X, z = point.Z,vx=vx,vz=vz,
                         range = info and tonumber(info.attackRange) or 3, boss = app.isBoss(model)}
                 end
             end
@@ -1499,6 +1835,108 @@ local function run()
         app.airGoal = goal and {point = goal, untilTime = os.clock() + 0.2} or nil
         return goal
     end
+    function app.teleportLanding(point)
+        local root=app.root()
+        if not root then return nil end
+        local goal=app.flightPoint(point)
+        if not goal then return nil end
+        local filters={}
+        for _,folder in ipairs(app.navigation().filters)do filters[#filters+1]=folder end
+        local defenses=workspace:FindFirstChild("Deployables")
+        if defenses then filters[#filters+1]=defenses end
+        local params=OverlapParams.new()
+        params.FilterType,params.FilterDescendantsInstances=Enum.RaycastFilterType.Include,filters
+        params.RespectCanCollide,params.CollisionGroup=true,root.CollisionGroup
+        for _,part in ipairs(workspace:GetPartBoundsInBox(CFrame.new(goal),Vector3.new(3,4,3),params))do
+            if part.CanCollide then return nil end
+        end
+        -- Check the feet around the destination, not just a single floor ray.
+        for _,offset in ipairs({{1.2,0},{-1.2,0},{0,1.2},{0,-1.2}})do
+            local hit=app.raycast(goal+Vector3.new(offset[1],3,offset[2]),Vector3.new(0,-16,0),app.mapFilters())
+            local _,human=app.root()
+            if not human or not hit or hit.Material==Enum.Material.Water or hit.Normal.Y<.65
+                or math.abs(hit.Position.Y-(goal.Y-human.HipHeight-root.Size.Y/2))>2 then return nil end
+        end
+        return goal
+    end
+    function app.teleportDodgeTick()
+        if not app.active()or not cfg.fight or not cfg.dodgeTeleport then return false end
+        local root,human=app.root()
+        if not root or root.Anchored or human.Sit or human.PlatformStand then return false end
+        local phase=human:GetState()
+        if phase==Enum.HumanoidStateType.Physics or phase==Enum.HumanoidStateType.Ragdoll or phase==Enum.HumanoidStateType.Dead then return false end
+        local now=os.clock()
+        if now<(app.next.dodgeScan or 0)then return false end
+        app.next.dodgeScan=now+.1
+        local mobs=app.enemyRows()
+        if #mobs==0 and not app.buildGoal then return false end
+        local horizon=math.max(.15,cfg.dodgeInterval or .3)
+        local _,currentMargin=Core.teleportClearance({x=root.Position.X,z=root.Position.Z},mobs,horizon)
+        local emergency=currentMargin<2 or now<(app.damageEvadeUntil or 0)
+        if now<(app.next.dodgeTeleport or 0)and not(emergency and now-(app.lastDodgeAt or -10)>=.12)then return false end
+        local candidates,seen={},{}
+        app.dodgeRejected=app.dodgeRejected or {}
+        for key,expires in pairs(app.dodgeRejected)do if expires<=now then app.dodgeRejected[key]=nil end end
+        local turret=app.turretAnchor()
+        local function candidate(point,build)
+            local dx,dz=point.X-root.Position.X,point.Z-root.Position.Z
+            local distance=math.sqrt(dx*dx+dz*dz)
+            if distance<(build and 3 or 10)or not app.inPlayableMap(point)then return end
+            local key=math.floor(point.X/2)..":"..math.floor(point.Z/2)
+            if seen[key]or app.dodgeRejected[key]then return end;seen[key]=true
+            local clearance,margin=Core.teleportClearance({x=point.X,z=point.Z},mobs,horizon)
+            if margin<2 then return end -- A smaller opening must still clear native attack reach.
+            local preferred=clearance>=(cfg.dodgeClearance or 35)
+            local score=(preferred and 100000 or 0)+math.min(100,margin)*100-distance*.05
+            if build then score=score+500 end
+            if turret and(point-turret.point).Magnitude<=turret.radius then score=score+25 end
+            for _,old in ipairs(app.dodgeHistory or {})do
+                if now-old.at<3 and(point-old.point).Magnitude<16 then score=score-800 end
+            end
+            candidates[#candidates+1]={point=point,score=score,clearance=clearance,margin=margin,build=build,key=key}
+        end
+        if app.buildGoal then candidate(app.buildGoal,true)end
+        if #mobs>0 then
+            local angle=now*.7
+            for _,radius in ipairs({12,24,40,64})do
+                for n=0,15 do local a=angle+n*math.pi/8;candidate(root.Position+Vector3.new(math.cos(a)*radius,0,math.sin(a)*radius))end
+            end
+            local nav=app.navigation()
+            local count=#nav.spawns
+            for n=1,math.min(32,count)do
+                local index=((n-1+math.floor(now*4))%count)+1;candidate(nav.spawns[index].point)
+            end
+            if #nav.hull>=3 then
+                local minX,maxX,minZ,maxZ=math.huge,-math.huge,math.huge,-math.huge
+                for _,p in ipairs(nav.hull)do minX,maxX,minZ,maxZ=math.min(minX,p.x),math.max(maxX,p.x),math.min(minZ,p.z),math.max(maxZ,p.z)end
+                for x=1,5 do for z=1,5 do candidate(Vector3.new(minX+(maxX-minX)*x/6,root.Position.Y,minZ+(maxZ-minZ)*z/6))end end
+            end
+        end
+        table.sort(candidates,function(a,b)return a.score>b.score end)
+        for n=1,math.min(12,#candidates)do
+            local choice=candidates[n]
+            local landing=app.teleportLanding(choice.point)
+            if not landing then app.dodgeRejected[choice.key]=now+1 end
+            if landing and app.active()and cfg.fight and cfg.dodgeTeleport then
+                -- Re-read both threats and character after all ground queries.
+                local fresh=app.root()
+                local _,margin=Core.teleportClearance({x=landing.X,z=landing.Z},app.enemyRows(),horizon)
+                if fresh==root and margin>=2 and not root.Anchored then
+                    human:MoveTo(root.Position)
+                    root.CFrame=CFrame.new(landing)*root.CFrame.Rotation
+                    root.AssemblyLinearVelocity=Vector3.new(0,0,0)
+                    app.walkGoal,app.airGoal,app.groundRouteCache=nil,nil,nil
+                    app.lastDodgeAt,app.next.dodgeTeleport=now,now+(cfg.dodgeInterval or .3)
+                    app.dodgeHistory=app.dodgeHistory or {};app.dodgeHistory[#app.dodgeHistory+1]={point=landing,at=now}
+                    if #app.dodgeHistory>8 then table.remove(app.dodgeHistory,1)end
+                    app.note("movement",string.format("GROUND TP · %.1f STUD ZOMBIE CLEARANCE",choice.clearance))
+                    return true
+                end
+            end
+        end
+        app.note("movement","NO VALID GROUND OPENING; RESCANNING / FIRING")
+        return false
+    end
     function app.combatTick(dt)
         if app.mode ~= "MATCH" or not app.active() then
             app.releaseFire() app.stopFlight() app.stopWalk() app.buildGoal = nil return
@@ -1513,21 +1951,23 @@ local function run()
             app.orbitDirection = -(app.orbitDirection or 1)
         end
         app.observedHealth = human and human.Health
-        local danger = root and (app.airRisk(root.Position) > 0 or os.clock() < (app.damageEvadeUntil or 0))
+        local teleportMode=cfg.fight and cfg.dodgeTeleport
+        if teleportMode then app.stopWalk();app.teleportDodgeTick() end
+        local danger = not teleportMode and root and (app.airRisk(root.Position) > 0 or os.clock() < (app.damageEvadeUntil or 0))
         if danger and (cfg.fight or cfg.autoPlace) then
             build = nil
             app.move(app.orbitGoal(target), dt)
             app.note("movement", "DODGING ZOMBIES ON SAFE GROUND")
         end
         if target and target.boss and cfg.bossFirst then build = nil end
-        if build then app.releaseFire() app.move(build, dt) return end
+        if build and not teleportMode then app.releaseFire() app.move(build, dt) return end
         if not target then
             app.releaseFire()
-            if not danger then app.move(app.orbitGoal(nil), dt) end
+            if not danger and not teleportMode then app.move(app.orbitGoal(nil), dt) end
             return
         end
         local tool, info = app.weapon()
-        if not danger then app.move(app.orbitGoal(target), dt) end
+        if not danger and not teleportMode then app.move(app.orbitGoal(target), dt) end
         if not tool or app.reload(tool) then return end
         local point = app.head(target.model)
         local camera = workspace.CurrentCamera
@@ -1610,7 +2050,9 @@ local function run()
         app.connect(row.Activated, function()
             object[key] = not object[key]
             if object == cfg and (key == "fight" or key == "enabled" or key == "headAim") then app.releaseFire() end
-            app.changed() refresh()
+            if object == cfg and key == "showBoundary" then app.syncBoundary(true); app.save()
+            else app.changed() end
+            refresh()
         end)
         refresh()
         return row
@@ -1818,7 +2260,10 @@ end
     ui.toggle(fight, "BOSS FIRST", cfg, "bossFirst")
     ui.textLabel(fight, "Uses your equipped gun's normal fire, ammo and reload rules.", 30)
     local movement = ui.group(main, "DODGE NEAR TURRETS")
-    ui.textLabel(movement, "Ground movement · avoid zombies · stay within friendly turret coverage. Safety comes first.", 44)
+    ui.textLabel(movement, "Fight mode checks fresh ground openings and relocates by TP. Turn it off to use grounded turret dodging.", 44)
+    ui.toggle(movement, "TELEPORT DODGE IN FIGHT MODE", cfg, "dodgeTeleport")
+    ui.number(movement, "PREFERRED ZOMBIE CLEARANCE", "dodgeClearance", 3, 40)
+    ui.number(movement, "TP INTERVAL (SECONDS)", "dodgeInterval", .12, 1)
     ui.number(movement, "TURRET DISTANCE", "turretLeash", 8, 60)
     ui.number(movement, "ZOMBIE CLEARANCE", "clearance", 8, 60)
     local wave = ui.group(main, "WAVES")
@@ -1880,9 +2325,10 @@ end
         for _, child in ipairs(defensePage:GetChildren()) do if child:IsA("GuiObject") then child:Destroy() end end
         local group = ui.group(defensePage, "AUTO DEFENSE")
         ui.toggle(group, "AUTO PLACE CURRENT CLASS", cfg, "autoPlace")
-        ui.toggle(group, "USE ZOMBIE-SPAWN MAP AREA", cfg, "placeSpawnArea")
-        ui.number(group, "MAX OWNED DEFENSES", "maxDefenses", 1, 48)
-        ui.textLabel(group, "Barricades at front · turrets inside · support gap reserved.", 30)
+        ui.number(group, "MAX OWNED DEFENSES", "maxDefenses", 1, 512)
+        ui.number(group, "MIDDLE DEFENSE SPACING", "middleSpacing", 6, 40)
+        ui.textLabel(group, "1 barricade row + 3 turret rows. Spaced middle barricades with nearby turrets; no solid center fill.", 44)
+        app.coverageLabel = ui.textLabel(group,"SELECT A MAP PART FIRST",44)
         local selection = ui.group(defensePage, "CLASS DEFENSE SELECTION")
         for _, name in ipairs(classes.GetDeployableSlots(app.className or classes.DefaultClass)) do
             local info = defs.Types[name]
@@ -1894,7 +2340,7 @@ end
         ui.textLabel(selection, "Healing Station repairs defenses. Buff Barricade buffs players.", 32)
     end
     local area = ui.group(areaPage, "TOP VIEW MAP SELECTION")
-    ui.textLabel(area, "Open the map, tap your corners, then CONNECT. First edge = front.", 32)
+    ui.textLabel(area, "Pick a floor part, then CONNECT. Edit the saved corners when needed.", 32)
     local areaLabel = ui.textLabel(area, "NO AREA SELECTED", 28)
     local editor = ui.new("Frame", {AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 8),
         Size = UDim2.fromOffset(370, 137), BackgroundColor3 = Color3.fromRGB(12, 23, 38), Visible = false,
@@ -1951,7 +2397,7 @@ end
         app.stopMapView()
         app.editing, app.pickPart, app.draftSurface, app.clearSurface = false, false, nil, nil
         editor.Visible, dotOverlay.Visible, mapHolder.Visible, frame.Visible = false, false, false, true
-        app.drawRegion(saved and app.draft or app.region().points or {}, true)
+        app.syncBoundary(true)
     end
     function app.commitArea()
         local ok, reason = Core.validPolygon(app.draft or {})
@@ -2025,18 +2471,9 @@ end
             app.mapLayer(app.mapView.layer)
         end
     end)
-    ui.button(area, "OPEN TOP VIEW · NEW AREA", function() app.openMapEditor("new") end)
-    ui.button(area, "OPEN TOP VIEW · EDIT SAVED AREA", function() app.openMapEditor("saved") end)
-    ui.button(area, "OPEN TOP VIEW · PICK MAP PART", function() app.openMapEditor("part") end)
-    ui.button(area, "SHOW SAVED BOUNDARY", function() app.drawRegion(app.region().points or {}, true) end)
-    ui.button(area, "HIDE BOUNDARY", app.clearMarkers)
-    ui.button(area, "REMOVE MAP PART LOCK", function()
-        local region = app.region()
-        region.surface = nil
-        cfg.regions[app.mapId] = region
-        app.surface = nil
-        app.changed()
-    end)
+    ui.button(area, "PICK MAP PART", function() app.openMapEditor("part") end)
+    ui.button(area, "EDIT SAVED BOUNDARY", function() app.openMapEditor("saved") end)
+    ui.toggle(area, "SHOW SAVED BOUNDARY", cfg, "showBoundary")
     local system = ui.group(settings, "AUTOMATION / CONFIG")
     ui.toggle(system, "MASTER ENABLED", cfg, "enabled")
     ui.number(system, "KEEP CASH RESERVE", "reserveCash", 0, 1e12)
@@ -2130,6 +2567,7 @@ end
         if app.editing then app.closeMapEditor(false) end
         app.releaseFire() app.stopFlight() app.stopWalk() app.buildGoal = nil
         app.turretCache, app.airGoal, app.observedHealth = nil, nil, nil
+        app.dodgeHistory,app.enemyMotion,app.enemyCache,app.dodgeRejected=nil,nil,nil,nil
     end)
     RunService:BindToRenderStep("EXIS_ZOMBIE_MAP", Enum.RenderPriority.Camera.Value + 20, function()
         local ok, err = pcall(app.renderMapView)
@@ -2168,8 +2606,10 @@ end
                     app.enemyCache, app.airGoal, app.navCache, app.spawnAnchor = nil, nil, nil, nil
                     app.turretCache, app.groundRouteCache, app.walkGoal, app.observedHealth = nil, nil, nil, nil
                     app.matchMix, app.placementTask = nil, nil
+                    app.dodgeHistory,app.enemyMotion,app.dodgeRejected=nil,nil,nil
                     ui.buildClasses() ui.buildDefenses()
                 end
+                app.syncBoundary()
                 if cfg.enabled and not app.editing then
                     if app.manual.kind == "class" and app.mode == "LOBBY" then
                         local name = app.manual.name
@@ -2216,7 +2656,9 @@ end
                     .. " · GUN " .. upgrades.GetPlayerLevel(player, upgrades.WeaponTierUpgradeTypeName)
                     .. " · MELEE " .. upgrades.GetPlayerLevel(player, upgrades.MeleeUpgradeTypeName)
             else upgradeState.Text = "MATCH UPGRADES ARE AVAILABLE INSIDE A MAP" end
-            local lines = {"PLACE " .. game.PlaceId, "MAP " .. app.mapId, "CLASS " .. tostring(app.className),
+            local coverage = app.coverageStatus()
+            if app.coverageLabel then app.coverageLabel.Text = coverage end
+            local lines = {coverage, "PLACE " .. game.PlaceId, "MAP " .. app.mapId, "CLASS " .. tostring(app.className),
                 "FIRE SIGNAL " .. tostring(type(firesignal) == "function"), "CONFIG WRITE " .. tostring(type(writefile) == "function")}
             local keys = {}
             for key in pairs(app.notes) do keys[#keys + 1] = key end

@@ -32,31 +32,30 @@ test('a concave notch cannot be bridged by a rectangle',function()
 end)
 test('class defense roles match turret barricade healing and ability mechanics',function()
  assert(Core.role('HealingStation',{Heal={}})=='support');assert(Core.role('BuffBarricade',{Classification={Barricade=true}})=='wall')
+ assert(Core.role('Barricade',{Style='Barrier',Physics={ZombieBlocking=true}})=='wall');assert(Core.role('FlameBarricade',{})=='wall')
  assert(Core.role('AutoTurret',{})=='turret');assert(Core.role('ReconGhost',{Placement={Ability=true}})=='ability');assert(Core.role('LureBomb',{})=='trap')
 end)
-test('planner reserves a healer gap even for non-medic classes',function()
- local plan,_,reserve=Core.plan(square(40),specs,18);assert(#plan>0 and reserve)
- for _,slot in ipairs(plan)do assert(not Core.overlap(slot,reserve))end
+test('no phantom support space is left when the selected class has no support defense',function()
+ local plan,_,reserve=Core.plan(square(40),specs,18);assert(#plan>0 and reserve==nil)
 end)
-test('planned slots are in-bounds nonoverlapping and limited',function()
+test('planned slots remain in bounds touching only at legal cell edges and obey the limit',function()
  local p=square(40);local plan=Core.plan(p,specs,18);assert(#plan<=18 and #plan>3)
- for i,a in ipairs(plan)do assert(Core.fits(a,a.w+.1,a.d+.1,p));for j,b in ipairs(plan)do if i~=j then assert(not Core.overlap(a,b))end end end
+ for i,a in ipairs(plan)do assert(Core.fits(a,a.w,a.d,p,true));for j,b in ipairs(plan)do if i~=j then assert(not Core.overlap(a,b,0))end end end
 end)
-test('barricades are along the front and turret rows are inside',function()
- local plan=Core.plan(square(40),specs,18);local wall,turret=false,false
- for _,s in ipairs(plan)do if s.role=='wall'then wall=true;assert(s.z<=8)elseif s.role=='turret'then turret=true;assert(s.z>6)end end
- assert(wall and turret)
+test('blocking barricades are planned on all four border sides',function()
+ local plan=Core.plan(square(40),specs,64);local sides={}
+ for _,s in ipairs(plan)do if s.role=='wall'and not s.fill then sides[s.edge]=true end end
+ assert(sides[1]and sides[2]and sides[3]and sides[4])
 end)
-test('medic reserves and fills a support position between defenses',function()
+test('medic support is placed in its reserved space while turrets cover separate border positions',function()
  local medic={{name='PulseTurret',role='turret',w=3,d=3},{name='BuffBarricade',role='wall',w=5,d=2},{name='HealingStation',role='support',w=4,d=4,range=24}}
- local plan=Core.plan(square(40),medic,18);local healer
- for _,s in ipairs(plan)do if s.name=='HealingStation'then healer=s end end
- assert(healer)
- local coverage=0;for _,s in ipairs(plan)do if s.role=='turret'and (s.x-healer.x)^2+(s.z-healer.z)^2<=24^2 then coverage=coverage+1 end end
- assert(coverage>=5)
+ local plan,_,reserve=Core.plan(square(40),medic,64);local healer,turrets=0,0
+ for _,s in ipairs(plan)do if s.name=='HealingStation'then healer=healer+1;assert(Core.containsBox(s,reserve))elseif s.role=='turret'then turrets=turrets+1 end end
+ assert(healer==1 and turrets>=4)
 end)
-test('an area too small for support does not request invalid placements',function()
- local plan,reason=Core.plan(square(5),specs,18);assert(#plan==0 and reason:find('SUPPORT'))
+test('a tiny selection reports uncovered space instead of inventing a complete layout',function()
+ local plan,reason,_,coverage=Core.plan(square(5),specs,18)
+ assert(#plan<=18 and (not coverage or coverage.floor.uncovered>0)and not reason:find('FULL AREA PLAN READY',1,true))
 end)
 test('planning work is bounded on excessively large areas',function()
  local plan,reason=Core.plan(square(1000),specs,18);assert(#plan==0 and reason:find('SMALLER'))
@@ -69,14 +68,14 @@ test('boss priority beats a closer regular zombie',function()
  assert(Core.targetScore(300,true,true,false)>Core.targetScore(3,false,true,false))
  assert(Core.targetScore(300,true,false,false)<Core.targetScore(3,false,false,false))
 end)
-test('existing defenses cannot occupy the reserved healer gap or new slots',function()
+test('existing defenses cannot be overwritten by new slots',function()
  local existing={{x=20,z=20,w=6,d=6}}
  local plan,_,reserve=Core.plan(square(40),specs,18,existing)
- assert(reserve and not Core.overlap(reserve,existing[1]))
- for _,slot in ipairs(plan)do assert(not Core.overlap(slot,existing[1]))end
+ assert(reserve==nil)
+ for _,slot in ipairs(plan)do assert(not Core.overlap(slot,existing[1],0))end
 end)
 test('all selected structural roles receive slots when enough space is available',function()
- local plan=Core.plan(square(40),specs,18);local found={}
+ local plan=Core.plan(square(60),specs,256);local found={}
  for _,slot in ipairs(plan)do found[slot.name]=true end
  assert(found.AutoTurret and found.Barricade and found.ExplosiveBarrel)
 end)
