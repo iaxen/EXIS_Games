@@ -29,7 +29,7 @@ local function setup()
   RaycastParams={new=function()return{}end},Enum={RaycastFilterType={Include='Include'},Material={Water='Water'}},
   os={clock=function()return now end}},{__index=_G})
  app.root=function()return root,human end;app.navigation=function()return nav end
- app.note=function()end;app.enemyRows=function()return{}end
+ app.note=function()end;app.aimTick=function()end;app.enemyRows=function()return{}end
  app.airRisk=function(p)return Core.airRisk({x=p.X,z=p.Z},app.enemyRows(),cfg.clearance)end
  app.airRoute=function(a,b)return Core.escapeRoute({x=a.X,z=a.Z},{x=b.X,z=b.Z},app.enemyRows(),cfg.clearance)end
  assert(load(extract('    function app.inPlayableMap(', '    function app.placementRegion()'),'borders','t',env))()

@@ -123,7 +123,7 @@ test('teleport combat continues firing and does not resume the obsolete turret w
  h.app.weapon=function()return{},{}end;h.app.reload=function()return false end;h.app.head=function()return vec(1,3,1)end
  h.env.workspace={CurrentCamera={CFrame=frame(vec(0,3,0))}}
  h.app.raycast=function()return nil end;h.app.mapFilters=function()return{}end
- h.app.holdFire=function()calls.fire=calls.fire+1 end
+ h.app.aimTick=function()end;h.app.holdFire=function()calls.fire=calls.fire+1 end
  assert(load(extract('    function app.combatTick(', '    function app.aimTick()'),'combat','t',h.env))()
  h.app.combatTick(.02);assert(calls.tp==1 and calls.walk==0 and calls.fire==1)
 end)
