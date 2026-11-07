@@ -42,6 +42,7 @@ function Core.fuseGroup(inventory,equipped,assets,kernel,inputCount)
 end
 if ...=="EXIS_TEST" then return Core end
 
+local startup={}
 local function run()
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -49,9 +50,18 @@ local UIS=game:GetService("UserInputService")
 local Pathfinding=game:GetService("PathfindingService")
 local HTTP=game:GetService("HttpService")
 local player=Players.LocalPlayer
+local bootParent=player:WaitForChild("PlayerGui")
+local previous=bootParent:FindFirstChild("EXISEggStartup")
+if previous then previous:Destroy()end
+startup.gui=Instance.new("ScreenGui");startup.gui.Name="EXISEggStartup";startup.gui.ResetOnSpawn=false;startup.gui.DisplayOrder=2147483647;startup.gui.Parent=bootParent
+startup.label=Instance.new("TextLabel");startup.label.Size=UDim2.fromOffset(340,110);startup.label.Position=UDim2.new(.5,-170,.5,-55)
+startup.label.BackgroundColor3=Color3.fromRGB(8,12,18);startup.label.TextColor3=Color3.fromRGB(80,160,255)
+startup.label.TextWrapped=true;startup.label.TextSize=14;startup.label.Text="EXIS | STEAL AN EGG\nStarting native adapters…";startup.label.Parent=startup.gui
+local dismiss=Instance.new("TextButton");dismiss.Size=UDim2.fromOffset(24,24);dismiss.Position=UDim2.new(.5,145,.5,-55);dismiss.Text="×";dismiss.Parent=startup.gui
+dismiss.Activated:Connect(function()startup.gui:Destroy()end)
 local alive=true
 local connections={}
-local options={master=false,steal=false,hatch=false,equip=false,treadmill=false,events=false,
+local options={master=false,hidePens=false,hideOtherPets=false,hideSelfPets=false,lowDetail=false,disableEffects=false,disableVideos=false,antiAfk=false,autoExecute=false,autoReconnect=false,steal=false,hatch=false,equip=false,treadmill=false,events=false,
     upgrades=false,rewards=false,fusion=false,LightVsDarkness=true,SammyEvent=true,excluded={},excludedPets={},rarities={},trainingSeconds=20}
 local api={}
 local pending={}
@@ -82,7 +92,10 @@ local function bounded(key,fn)
     return false,"request timed out; awaiting reconciliation"
 end
 local function loadAPI(key,path)
+    if startup.label and startup.label.Parent then startup.label.Text="EXIS | STEAL AN EGG\nLoading "..path end
+    local deadline=os.clock()+15
     local module=resolve(path)
+    while not module and os.clock()<deadline do task.wait(.1);module=resolve(path)end
     assert(module,"Missing native module: "..path)
     local value,message=bounded("load:"..key,function()return require(module)end)
     assert(type(value)=="table",message or "Native module failed: "..path)
@@ -563,7 +576,7 @@ local function button(container,text,fn)
   TextColor3=blue,BackgroundColor3=Color3.fromRGB(20,29,41),BorderSizePixel=0},container)
  corner(b,5);b.Activated:Connect(fn);return b
 end
-local names={"Main","Eggs","Biomes","Rarities","Pets","Base","Training","Events","Fusion","Settings"}
+local names={"Main","Eggs","Biomes","Rarities","Pets","Base","Training","Events","Fusion","Performance","Tools","Settings"}
 for _,name in ipairs(names)do ui.page(name)end
 local main=ui.group(pages.Main,"Automation")
 toggle(main,"master","Master switch")
@@ -619,6 +632,214 @@ local settings=ui.group(pages.Settings,"Session")
 button(settings,"Print diagnostics",function()print(table.concat(state.trace,"\n"));note("Diagnostics printed to console")end)
 button(settings,"Queue walk to own base",function()state.wantHome=true;note("Walk home queued behind current action")end)
 ui.text(settings,"Settings save in EXIGames/StealAnEgg. Master starts off. No promotional-code loop is included.")
+-- Visual ownership: save each property once, restore on toggle-off or close.
+local perf={saved=setmetatable({},{__mode="k"}),prefs={},lastSignature=nil,revision=0}
+local function restoreVisuals()
+ for obj,properties in pairs(perf.saved)do
+  if obj.Parent then for property,value in pairs(properties)do pcall(function()obj[property]=value end)end end
+  perf.saved[obj]=nil
+ end
+end
+local function writeVisual(obj,property,value)
+ local ok,old=pcall(function()return obj[property]end)
+ if not ok or old==value then return end
+ perf.saved[obj]=perf.saved[obj]or{}
+ if perf.saved[obj][property]==nil then perf.saved[obj][property]=old end
+ pcall(function()obj[property]=value end)
+end
+local function hideVisual(obj)
+ if obj:IsA("BasePart")then writeVisual(obj,"LocalTransparencyModifier",1)
+ elseif obj:IsA("Decal")or obj:IsA("Texture")then writeVisual(obj,"Transparency",1)
+ elseif obj:IsA("BillboardGui")or obj:IsA("SurfaceGui")then writeVisual(obj,"Enabled",false)end
+end
+local function otherPlotRoots()
+ local roots={}
+ if not options.hidePens then return roots end
+ for slot,owner in pairs(api.plots.ReadOwners())do
+  if owner~=player.UserId then
+   local folder=api.plots.ResolveFolder()
+   local other=folder and folder:FindFirstChild(tostring(slot))
+   local detail=other and other:FindFirstChild("ToUpdate")
+   if detail then roots[#roots+1]=detail end
+  end
+ end
+ return roots
+end
+local function applyVisual(obj,roots)
+ if options.lowDetail then
+  if obj:IsA("BasePart")then writeVisual(obj,"Material",Enum.Material.SmoothPlastic);writeVisual(obj,"Reflectance",0);writeVisual(obj,"CastShadow",false)
+  elseif obj:IsA("Decal")or obj:IsA("Texture")then writeVisual(obj,"Transparency",1)end
+ end
+ if options.disableEffects and (obj:IsA("ParticleEmitter")or obj:IsA("Trail")or obj:IsA("Beam")or obj:IsA("Smoke")or obj:IsA("Fire")or obj:IsA("Sparkles")or obj:IsA("PostEffect"))then writeVisual(obj,"Enabled",false)end
+ for _,root in ipairs(roots)do if obj:IsDescendantOf(root)then hideVisual(obj)break end end
+end
+local preferences
+local prefModule=resolve("Shared.Preferences")
+if prefModule then local value=call("load preferences",require,prefModule)if type(value)=="table"then preferences=value end end
+local function syncPreference(key,on)
+ if not preferences then return end
+ if on then
+  if perf.prefs[key]==nil then perf.prefs[key]=preferences.IsOn(key)end
+  if not preferences.IsOn(key)then call("preference:"..key,preferences.Set,key,true)end
+ elseif perf.prefs[key]~=nil then
+  local old=perf.prefs[key]
+  if preferences.IsOn(key)==old or call("preference:"..key,preferences.Set,key,old)==true then perf.prefs[key]=nil end
+ end
+end
+local function restorePreferences()
+ if preferences then for key,value in pairs(perf.prefs)do pcall(preferences.Set,key,value)end end
+ perf.prefs={}
+end
+local function performanceSignature()
+ local values={"pens="..tostring(options.hidePens),"detail="..tostring(options.lowDetail),"effects="..tostring(options.disableEffects)}
+ if options.hidePens then for slot,owner in pairs(api.plots.ReadOwners())do values[#values+1]=tostring(slot)..":"..tostring(owner)end end
+ table.sort(values);return table.concat(values,"|")
+end
+local function refreshPerformance()
+ perf.revision=perf.revision+1;local revision=perf.revision
+ restoreVisuals()
+ local roots=otherPlotRoots()
+ if options.lowDetail then writeVisual(game:GetService("Lighting"),"GlobalShadows",false)end
+ if not (options.hidePens or options.lowDetail or options.disableEffects)then return end
+ local objects=workspace:GetDescendants()
+ for _,obj in ipairs(game:GetService("Lighting"):GetDescendants())do objects[#objects+1]=obj end
+ for i,obj in ipairs(objects)do
+  if not alive or revision~=perf.revision then return end
+  if obj.Parent then applyVisual(obj,roots)end
+  if i%150==0 then task.wait()end
+ end
+end
+connections[#connections+1]=workspace.DescendantAdded:Connect(function(obj)
+ if options.hidePens or options.lowDetail or options.disableEffects then task.defer(function()if alive and obj.Parent then applyVisual(obj,otherPlotRoots())end end)end
+end)
+connections[#connections+1]=game:GetService("Lighting").DescendantAdded:Connect(function(obj)
+ if options.disableEffects then task.defer(function()if alive and obj.Parent then applyVisual(obj,{})end end)end
+end)
+local performance=ui.group(pages.Performance,"Reversible performance booster")
+toggle(performance,"hidePens","Hide other players' pen visuals")
+toggle(performance,"hideOtherPets","Hide other pets (native)")
+toggle(performance,"hideSelfPets","Hide own pets (native)")
+toggle(performance,"lowDetail","Plain materials / no textures or shadows")
+toggle(performance,"disableEffects","Disable particles trails and post effects")
+toggle(performance,"disableVideos","Disable treadmill videos (native)")
+button(performance,"Apply performance preset",function()
+ for _,key in ipairs({"hidePens","hideOtherPets","hideSelfPets","lowDetail","disableEffects","disableVideos"})do options[key]=true end
+ for _,render in pairs(renders)do render()end;save()
+end)
+button(performance,"Restore visuals",function()
+ for _,key in ipairs({"hidePens","hideOtherPets","hideSelfPets","lowDetail","disableEffects","disableVideos"})do options[key]=false end
+ for _,render in pairs(renders)do render()end;save()
+end)
+ui.text(performance,"Local visual changes only. No parts are destroyed and collisions/prompts stay intact. Native pet settings suppress pet rendering work; materials/effects savings vary by device. Close restores changes owned by EXIS.")
+local tools=ui.group(pages.Tools,"EXIS diagnostics")
+local diagnostics=ui.text(tools,"Loading session diagnostics…")
+local fps=0;local samples,elapsed=0,0
+connections[#connections+1]=game:GetService("RunService").RenderStepped:Connect(function(dt)
+ samples=samples+1;elapsed=elapsed+dt
+ if elapsed>=1 then fps=math.floor(samples/elapsed+.5);samples,elapsed=0,0 end
+end)
+local function diagnosticsText()
+ local r,h=character();local carry=carrying();local data=profile()
+ local p={}for key in pairs(pending)do p[#p+1]=key end table.sort(p)
+ local modules={}for key in pairs(api)do modules[#modules+1]=key end table.sort(modules)
+ return table.concat({"EXIS Steal an Egg | build 2","Place "..game.PlaceId.." | Job "..game.JobId,
+  "FPS "..fps.." | Master "..tostring(options.master).." | Task "..state.job,
+  "Health "..tostring(h and math.floor(h.Health)).." | Save "..tostring(data~=nil).." | Base "..tostring(plot()~=nil),
+  "Carrying "..tostring(carry.IsCarrying).." | Owned eggs "..Core.count(api.eggs.ReadOwnerEggs(player.UserId)),
+  "Delivered "..state.claimed.." | Hatched "..state.hatches.." | Training "..tostring(state.training),
+  "Pending "..(#p>0 and table.concat(p,", ")or"none"),"Modules "..table.concat(modules,", "),
+  "Hatch input "..tostring(type(fireproximityprompt)=="function").." | Files "..tostring(type(writefile)=="function"),
+  "Native preferences "..tostring(preferences~=nil),"Recent log:",table.concat(state.trace,"\n")},"\n")
+end
+button(tools,"Copy diagnostics",function()
+ local text=diagnosticsText();print(text)
+ if type(setclipboard)=="function"then setclipboard(text);note("Diagnostics copied")else note("Clipboard unavailable; diagnostics printed")end
+end)
+button(tools,"Save diagnostics file",function()
+ local ok,err=pcall(function()assert(type(writefile)=="function","writefile unavailable");save();writefile("EXIGames/StealAnEgg/diagnostics_"..player.UserId..".txt",diagnosticsText())end)
+ note(ok and "Diagnostics file saved"or tostring(err))
+end)
+button(tools,"Clear diagnostic log",function()state.trace={};note("Log cleared")end)
+button(tools,"Refresh native snapshots",function()state.refreshSnapshots=true;note("Snapshot refresh queued; pending mutations retained")end)
+local session=ui.group(pages.Tools,"Session and configuration")
+button(session,"Save settings now",function()save();note("Settings save requested")end)
+button(session,"Reload saved settings (paused)",function()
+ local ok,err=pcall(function()
+  assert(type(readfile)=="function","readfile unavailable")
+  local data=HTTP:JSONDecode(readfile(savePath));options.master=false
+  for k,v in pairs(data)do
+   if k~="master"and type(v)=="boolean"and type(options[k])=="boolean"then options[k]=v
+   elseif (k=="excluded"or k=="excludedPets"or k=="rarities")and type(v)=="table"then
+    for id in pairs(options[k])do options[k][id]=nil end
+    for id,on in pairs(v)do if type(id)=="string"and type(on)=="boolean"then options[k][id]=on end end
+   end
+  end
+  for _,render in pairs(renders)do render()end
+ end)
+ note(ok and "Settings reloaded; Master paused"or tostring(err))
+end)
+toggle(session,"antiAfk","Anti-idle input")
+toggle(session,"autoExecute","Queue EXIS on teleport")
+toggle(session,"autoReconnect","Reconnect on connection loss (277/279)")
+local function queueLoader()
+ local queue=queue_on_teleport or (syn and syn.queue_on_teleport)
+ if type(queue)~="function"then return false,"queue_on_teleport unavailable"end
+ local code=("if game.PlaceId==107778070777162 and type(readfile)=='function' then local ok,c=pcall(function()return game:GetService('HttpService'):JSONDecode(readfile(%q))end);if ok and c.autoExecute then loadstring(game:HttpGet('https://raw.githubusercontent.com/iaxen/EXIScript/main/EXIScript.lua'))()end end"):format(savePath)
+ return pcall(queue,code)
+end
+button(session,"Rejoin current server",function()
+ save();if options.autoExecute then queueLoader()end
+ game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId,game.JobId,player)
+end)
+button(session,"Join another available server",function()
+ save();if options.autoExecute then queueLoader()end
+ game:GetService("TeleportService"):Teleport(game.PlaceId,player)
+end)
+ui.text(session,"Teleport queue requires executor support. Auto reconnect handles connection loss only; it does not retry kicks or moderation messages. New sessions start paused.")
+connections[#connections+1]=player.OnTeleport:Connect(function()if options.autoExecute then queueLoader()end end)
+connections[#connections+1]=player.Idled:Connect(function()
+ if options.antiAfk then pcall(function()local vu=game:GetService("VirtualUser");vu:CaptureController();vu:ClickButton2(Vector2.new())end)end
+end)
+local reconnectAt,reconnectAttempts
+connections[#connections+1]=game:GetService("GuiService").ErrorMessageChanged:Connect(function(message)
+ local text=tostring(message):lower()
+ local code=tonumber(text:match("error%s*code%s*:%s*(%d+)")or text:match("%((%d%d%d)%)"))
+ local lost=code and (code==277 or code==279)or (not code and text:find("lost connection",1,true)~=nil)
+ if options.autoReconnect and lost then reconnectAt=os.clock()+3;reconnectAttempts=0;note("Connection lost; reconnect queued")end
+end)
+local visualThread
+local queuedOption=false
+-- Performance/session work is independent of the farm master, but never owns movement.
+task.spawn(function()
+ while alive do
+  local ok,err=pcall(function()
+   syncPreference("HideOtherPets",options.hideOtherPets)
+   syncPreference("HideSelfPets",options.hideSelfPets)
+   syncPreference("DisableVideos",options.disableVideos)
+   local signature=performanceSignature()
+   if signature~=perf.lastSignature then
+    perf.lastSignature=signature
+    visualThread=task.spawn(refreshPerformance)
+   end
+   if options.autoExecute and not queuedOption then local done,message=queueLoader();queuedOption=done;if not done then note(tostring(message))end
+   elseif not options.autoExecute then queuedOption=false end
+   if reconnectAt and options.autoReconnect and os.clock()>=reconnectAt then
+    reconnectAttempts=(reconnectAttempts or 0)+1;reconnectAt=os.clock()+math.min(30,3*2^reconnectAttempts)
+    if options.autoExecute then queueLoader()end
+    game:GetService("TeleportService"):Teleport(game.PlaceId,player)
+   elseif not options.autoReconnect then reconnectAt=nil end
+   diagnostics.Text=diagnosticsText()
+  end)
+  if not ok then note("Tools: "..tostring(err))end
+  task.wait(2)
+ end
+end)
+gui.Destroying:Connect(function()
+ perf.revision=perf.revision+1
+ restoreVisuals()
+ task.spawn(restorePreferences)
+end)
+
 selectPage=function(name)
  ui.selected=name;pageTitle.Text=name:upper()
  for key,frame in pairs(pages)do frame.Visible=key==name end
@@ -657,6 +878,7 @@ selectPage("Main")
 local function periodic(key,seconds,fn)
  if os.clock()<(cooldown[key]or 0)then return false end
  cooldown[key]=os.clock()+seconds
+ state.job=key
  local ok,result=pcall(fn)
  if not ok then note(key..": "..tostring(result))return false end
  return result==true
@@ -669,6 +891,13 @@ task.spawn(function()
   else
    local ok,err=pcall(function()
     if carrying().IsCarrying then returnEgg();return end
+    if state.refreshSnapshots then
+     state.refreshSnapshots=nil
+     call("field sync",api.eggs.SyncFieldEggs)
+     call("owned sync",api.eggs.SyncOwnedEggs)
+     note("Native snapshots refreshed")
+     return
+    end
     if state.wantHome then state.wantHome=nil;local b=plot()if b and stopTraining()then walk(b.PetArea.Position+Vector3.new(0,3,0))end;return end
     if state.training and os.clock()<state.trainUntil and options.treadmill then return end
     if state.training and not stopTraining()then return end
@@ -687,7 +916,11 @@ task.spawn(function()
   task.wait(.15)
  end
 end)
+if startup.gui then startup.gui:Destroy()end
 note("Ready • configure selections, then enable Master")
 end
 local ok,err=pcall(run)
-if not ok then warn("EXIS Steal an Egg startup: "..tostring(err))end
+if not ok then
+    warn("EXIS Steal an Egg startup: "..tostring(err))
+    if startup.label and startup.label.Parent then startup.label.Text="EXIS STARTUP FAILED\n"..tostring(err).."\nCopy this error for diagnostics." end
+end
