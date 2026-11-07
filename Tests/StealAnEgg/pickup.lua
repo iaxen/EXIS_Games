@@ -8,7 +8,7 @@ V.__sub=function(x,y)return vec(x.X-y.X,x.Y-y.Y,x.Z-y.Z)end
 local now,carry,beginCount,endCount,fireCount,duration,prompt,callback,r,h
 local function setup()
  now=0;carry={IsCarrying=false};beginCount=0;endCount=0;fireCount=0;duration=nil;callback=nil
- os.clock=function()return now end;state={};player={};note=function()end
+ os.clock=function()return now end;state={};player={};options={};active=function()return true end;note=function()end;prepareReturnPath=function()return true end
  Vector3={new=vec};CFrame={new=function(v)return{Position=v}end}
  r={Position=vec(0,0,0)};h={UnequipTools=function()end,MoveTo=function(_,goal)assert(goal==r.Position);state.movementStopped=true end};character=function()return r,h end
  local model={Name='u'};local attachment={Parent=model,WorldPosition=vec(3,0,0),IsA=function(_,name)return name=='Attachment'end}
@@ -48,6 +48,23 @@ test('hold interruption releases input and disconnects its receipt',function(pic
 end)
 test('live prompt timing overrides the guessed pickup default',function(pickup)
  prompt.HoldDuration=3.5;assert(pickup{Uid='u'}and duration==3.5)
+end)
+test('an unavailable return path defers pickup without dispatching a prompt',function(pickup)
+ prepareReturnPath=function()return false end
+ assert(not pickup{Uid='u'}and beginCount==0 and fireCount==0 and not state.pickupPending)
+end)
+test('optional guardian data loads before the pickup hold',function(pickup)
+ options.autoRunSpeed=true
+ optionalAPI=function(key,path)assert(key=='guards'and path=='Data.Guards'and beginCount==0 and not carry.IsCarrying);return{}end
+ assert(pickup{Uid='u'})
+end)
+test('a character change during preplanning cancels the pickup',function(pickup)
+ prepareReturnPath=function()character=function()return{}end;return true end
+ assert(not pickup{Uid='u'}and beginCount==0 and fireCount==0)
+end)
+test('a late carry receipt during prompt discovery prevents pickup repositioning',function(pickup)
+ await=function(predicate)assert(predicate());carry={IsCarrying=true,Uid='late'};return true end
+ assert(not pickup{Uid='u'}and beginCount==0 and fireCount==0 and r.CFrame==nil)
 end)
 test('pending pickup prevents hatch event and treadmill movement',function()
  state.pickupPending={uid='u',at=now};options={hatch=true,treadmill=true,events=true,steal=true}

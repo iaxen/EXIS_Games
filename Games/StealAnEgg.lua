@@ -32,6 +32,30 @@ function Core.claimReceipt(uid,category,before,after)
     end
     return false
 end
+function Core.flatDistance(a,b)
+    local x,z=a.X-b.X,a.Z-b.Z
+    return math.sqrt(x*x+z*z)
+end
+function Core.reached(a,b,radius)
+    return Core.flatDistance(a,b)<=radius and math.abs(a.Y-b.Y)<=8
+end
+function Core.guardSpeed(base,flatRadius,distance,policy)
+    if not base or base<=0 then return 0 end
+    local strength=tonumber(policy.DISTANCE_MULTIPLIER_STRENGTH)or .5
+    local cap=tonumber(policy.MAX_DISTANCE_MULTIPLIER)or 4
+    return math.min(base*(1+math.max(0,distance/math.max(.001,flatRadius or 1)-1)*strength),base*cap)
+end
+function Core.runningSpeed(options,baseline,guards)
+    local cap=options.runSpeedCap or 300
+    if options.autoRunSpeed then
+        local needed=baseline
+        for _,guard in ipairs(guards)do
+            needed=math.max(needed,(guard.speed or 0)+(options.runMargin or 12))
+        end
+        return math.min(cap,needed),needed>cap
+    end
+    if options.fixedRunSpeed then return math.min(cap,options.runSpeed or 64),(options.runSpeed or 64)>cap end
+end
 function Core.count(t)local n=0 for _ in pairs(t or {})do n=n+1 end return n end
 function Core.fuseGroup(inventory,equipped,assets,kernel,inputCount)
     local groups={}
@@ -71,7 +95,7 @@ dismiss.Activated:Connect(function()startup.gui:Destroy()end)
 local alive=true
 local connections={}
 local options={master=false,hidePens=false,hideOtherPets=false,hideSelfPets=false,lowDetail=false,disableEffects=false,disableVideos=false,antiAfk=false,autoExecute=false,autoReconnect=false,steal=false,hatch=false,equip=false,treadmill=false,events=false,
-    upgrades=false,rewards=false,fusion=false,LightVsDarkness=true,SammyEvent=true,excluded={},excludedPets={},eggTypes={},rarities={},trainingSeconds=20}
+    upgrades=false,rewards=false,fusion=false,LightVsDarkness=true,SammyEvent=true,excluded={},excludedPets={},eggTypes={},rarities={},trainingSeconds=20,fixedRunSpeed=false,autoRunSpeed=false,runSpeed=64,runMargin=12,runSpeedCap=300,skipUnsafeEggs=true}
 local api={}
 local pending={}
 local cooldown={}
@@ -155,32 +179,140 @@ local function await(fn,seconds)
     repeat if fn()then return true end if not active()then return false end task.wait(.05)until os.clock()>=deadline
     return false
 end
+local motion={speedOwner=nil}
+local function optionalAPI(key,path)
+ if api[key]then return api[key]end
+ local module=resolve(path)
+ if module then local value=call("load:"..key,require,module)if type(value)=="table"then api[key]=value end end
+ return api[key]
+end
+local function guardianRows()
+ local r=character();if not r then return{}end
+ local world=workspace:FindFirstChild("World")
+ local areas=world and world:FindFirstChild("Areas")
+ local folder=areas and areas:FindFirstChild("GuardAreas")
+ if not folder then return{}end
+ local guards=api.guards
+ -- Never require/yield while escaping; preload optional data before pickup.
+ local policy=api.balance.GuardChase or {}
+ local carry=carrying();local rows={}
+ for _,area in ipairs(folder:GetChildren())do
+  for _,guard in ipairs(area:GetChildren())do
+   if guard:IsA("Model")and guard.Name=="Guard"then
+    local phase=guard:GetAttribute("GuardState")
+    local target=tostring(guard:GetAttribute("TargetPlayer")or "")
+    local wake=tostring(guard:GetAttribute("WakeTargetPlayer")or "")
+    local own=tostring(player.UserId)
+    if (phase=="Chasing"and target==own)or ((phase=="Waking"or phase=="Sleeping")and (wake==own or carry.IsCarrying and carry.AreaId==area.Name))then
+     local root=guard:FindFirstChild("HumanoidRootPart")
+     local human=guard:FindFirstChildOfClass("Humanoid")
+     if root and human then
+      local areaInfo=api.areas.Directory[area.Name]
+      local config=guards and guards.Directory and guards.Directory[areaInfo and areaInfo.GuardId or area.Name]
+      local distance=Core.flatDistance(r.Position,root.Position)
+      local predicted=config and Core.guardSpeed(config.WalkSpeed,config.FlatRadius,distance,policy)or 0
+      rows[#rows+1]={model=guard,distance=distance,speed=math.max(human.WalkSpeed,predicted),
+       hit=config and config.HitDistance or policy.DEFAULT_HIT_DISTANCE or 10,area=area.Name}
+     end
+    end
+   end
+  end
+ end
+ return rows
+end
+local function restoreRunSpeed()
+ local own=motion.speedOwner;motion.speedOwner=nil
+ state.runRequested=nil;state.runCapped=false;state.guardSpeed=0
+ if own and own.human.Parent and own.human.WalkSpeed==own.applied then own.human.WalkSpeed=own.original end
+end
+local function applyRunSpeed(r,h)
+ if not options.master or not (options.fixedRunSpeed or options.autoRunSpeed)then restoreRunSpeed();return end
+ if r.Anchored or h.PlatformStand or h.Sit then restoreRunSpeed();return end
+ local phase=h.GetState and h:GetState()
+ if phase==Enum.HumanoidStateType.Physics or phase==Enum.HumanoidStateType.Ragdoll or phase==Enum.HumanoidStateType.Dead then restoreRunSpeed();return end
+ local own=motion.speedOwner
+ if not own or own.human~=h then
+  restoreRunSpeed();own={human=h,original=h.WalkSpeed};motion.speedOwner=own
+ elseif h.WalkSpeed~=own.applied then
+  -- Preserve a newer native slowdown/buff when this temporary override ends.
+  own.original=h.WalkSpeed
+ end
+ local guards=guardianRows()
+ local wanted,capped=Core.runningSpeed(options,own.original,guards)
+ if wanted then h.WalkSpeed=wanted;own.applied=wanted end
+ state.runRequested=wanted;state.guardSpeed=0;state.runCapped=capped
+ for _,guard in ipairs(guards)do state.guardSpeed=math.max(state.guardSpeed,guard.speed)end
+end
+local function prepareReturnPath()
+ local r,_,c=character();local base=plot()
+ if not r or not base then return false end
+ local goal=base.PetArea.Position+Vector3.new(0,3,0)
+ local path=Pathfinding:CreatePath({AgentRadius=2,AgentHeight=5,AgentCanJump=true,WaypointSpacing=8})
+ local ok=pcall(function()path:ComputeAsync(r.Position,goal)end)
+ if not ok or path.Status~=Enum.PathStatus.Success then return false end
+ state.returnPath={points=path:GetWaypoints(),from=r.Position,goal=goal,character=c,at=os.clock()}
+ return true
+end
 local function walk(goal,carryUid)
     local r,h,c=character();if not r then return false end
     local last=r.Position;local progress=os.clock();local deadline=os.clock()+90
-    while active() and player.Character==c and os.clock()<deadline do
-        if carryUid and (not carrying().IsCarrying or carrying().Uid~=carryUid)then return false end
-        if (r.Position-goal).Magnitude<5 then return true end
-        local path=Pathfinding:CreatePath({AgentRadius=2,AgentHeight=5,AgentCanJump=true,WaypointSpacing=5})
-        local ok=pcall(function()path:ComputeAsync(r.Position,goal)end)
-        if not ok or path.Status~=Enum.PathStatus.Success then note("No walking route; retrying without teleporting carried egg")return false end
-        for _,point in ipairs(path:GetWaypoints())do
-            if not active() or player.Character~=c then h:MoveTo(r.Position)return false end
-            if carryUid and (not carrying().IsCarrying or carrying().Uid~=carryUid)then return false end
-            if point.Action==Enum.PathWaypointAction.Jump then h.Jump=true end
-            h:MoveTo(point.Position)
-            local step=os.clock()+3
-            repeat
-                if not active()then h:MoveTo(r.Position)return false end
-                if carryUid and not carrying().IsCarrying then return false end
-                if (r.Position-last).Magnitude>1.5 then last=r.Position;progress=os.clock()end
-                if os.clock()-progress>7 then h:MoveTo(r.Position)note("Walking stalled; route will be recalculated")return false end
-                task.wait(.05)
-            until (r.Position-point.Position).Magnitude<3 or os.clock()>step
-            if (r.Position-point.Position).Magnitude>=3 then break end
-        end
+    local function interrupted()
+        if not active()or player.Character~=c then return true end
+        local held=carrying()
+        return carryUid and (not held.IsCarrying or held.Uid~=carryUid)or not carryUid and held.IsCarrying
     end
-    return false
+    local function finish(result)
+        if h.Parent then h:MoveTo(r.Position)end
+        restoreRunSpeed();return result
+    end
+    local ok,result=pcall(function()
+      while os.clock()<deadline do
+        if interrupted()then return false end
+        if Core.reached(r.Position,goal,4)then return true end
+        applyRunSpeed(r,h)
+        local points
+        local prepared=state.returnPath
+        if carryUid and prepared and prepared.character==c and os.clock()-prepared.at<15
+            and Core.flatDistance(r.Position,prepared.from)<8 and Core.flatDistance(goal,prepared.goal)<5 then
+            points=prepared.points;state.returnPath=nil
+        else
+            local path=Pathfinding:CreatePath({AgentRadius=2,AgentHeight=5,AgentCanJump=true,WaypointSpacing=8})
+            local computed=pcall(function()path:ComputeAsync(r.Position,goal)end)
+            if interrupted()then return false end
+            if not computed or path.Status~=Enum.PathStatus.Success then note("No walking route; retaining carried egg for retry")return false end
+            points=path:GetWaypoints()
+        end
+        for _,point in ipairs(points)do
+            if interrupted()then return false end
+            -- Path waypoints are ground positions; root height must not add a
+            -- three-second wait at every already-reached waypoint.
+            if not Core.reached(r.Position,point.Position,3)then
+                applyRunSpeed(r,h)
+                if point.Action==Enum.PathWaypointAction.Jump then h.Jump=true end
+                h:MoveTo(point.Position)
+                local step=os.clock()+math.max(.6,math.min(3,Core.flatDistance(r.Position,point.Position)/math.max(1,h.WalkSpeed)+1))
+                local nextSpeed=0
+                repeat
+                    if interrupted()then return false end
+                    if os.clock()>=nextSpeed then applyRunSpeed(r,h);nextSpeed=os.clock()+.1 end
+                    local moved=Core.flatDistance(r.Position,last)
+                    if moved>1.5 then
+                        local dt=os.clock()-progress
+                        if dt>.01 then state.runMeasured=moved/dt end
+                        last=r.Position;progress=os.clock()
+                    end
+                    if os.clock()-progress>7 then note("Walking stalled; retaining egg and recalculating route")return false end
+                    task.wait(.03)
+                until Core.reached(r.Position,point.Position,3)or os.clock()>step
+                if not Core.reached(r.Position,point.Position,3)then break end
+            end
+        end
+      end
+      return false
+    end)
+    finish(false)
+    if not ok then error(result)end
+    return result
 end
 connections[#connections+1]=api.remotes.Treadmill.AssignedBeltShifted.OnClientEvent:Connect(function(id)
     state.belt=id
@@ -188,7 +320,9 @@ connections[#connections+1]=api.remotes.Treadmill.AssignedBeltShifted.OnClientEv
 end)
 connections[#connections+1]=player.CharacterRemoving:Connect(function()
     state.training=false
+    restoreRunSpeed()
     state.hatchPending={}
+    state.hatchInFlight=nil;state.returnPath=nil
 end)
 local function stopTraining()
     if not state.training then return true end
@@ -221,17 +355,20 @@ local function pickupEgg(egg)
         note("No enabled CarryAreaEgg prompt for "..egg.Uid.."; not running home")return false
     end
     local r,h=character();local at=promptPosition(prompt)
-    if not r or not at then return false end
+    if not r or not at or not active()or carrying().IsCarrying then return false end
     local reach=math.min(8,prompt.MaxActivationDistance)
     if (r.Position-at).Magnitude>reach-1 then r.CFrame=CFrame.new(at+Vector3.new(2,1,0))end
     h:MoveTo(r.Position)
     h:UnequipTools()
+    if options.fixedRunSpeed or options.autoRunSpeed then optionalAPI("guards","Data.Guards")end
+    if not active()or carrying().IsCarrying then return false end
+    if not prepareReturnPath()then note("No verified running route home; pickup deferred")return false end
     local dispatched=false
     local connection=prompt.Triggered:Connect(function(who)if who==player then dispatched=true end end)
     state.pickupPending={uid=egg.Uid,at=os.clock()}
     state.collectionHoldUntil=os.clock()+20
     local ok,result=pcall(function()
-        if not prompt.Enabled or (r.Position-at).Magnitude>reach then return false end
+        if not active()or character()~=r or carrying().IsCarrying or not prompt.Enabled or (r.Position-at).Magnitude>reach then return false end
         prompt:InputHoldBegin()
         if not pause(math.max(0,tonumber(prompt.HoldDuration)or 1.2))then return false end
         prompt:InputHoldEnd()
@@ -254,18 +391,13 @@ local function returnEgg()
     if not stopTraining()then return false end
     local base=plot();if not base then note("Waiting for own base to stream")return false end
     state.job="return egg"
-    if carry.RunBackWakeDelayRequired and not carry.GuardDisabled then
-        local world=workspace:FindFirstChild("World")
-        local guards=world and world:FindFirstChild("Areas")
-        guards=guards and guards:FindFirstChild("GuardAreas")
-        local area=guards and guards:FindFirstChild(carry.AreaId or "")
-        local guard=area and area:FindFirstChild("Guard")
-        if not guard or not await(function()return not carrying().IsCarrying or guard:GetAttribute("GuardState")=="Chasing"end,8)then
-            note("Waiting for native guardian wake state")return false
-        end
-    end
+    -- Start running immediately after carry confirmation. Waiting for Chasing
+    -- would throw away the native GuardChase.WAKING_DURATION head start.
     local before=api.eggs.ReadOwnerEggs(player.UserId)
-    walk(base.PetArea.Position+Vector3.new(0,3,0),carry.Uid)
+    local arrived=walk(base.PetArea.Position+Vector3.new(0,3,0),carry.Uid)
+    if not arrived and carrying().IsCarrying then
+        note("Return route needs retry; still holding egg, no other task allowed")return false
+    end
     if await(function()return not carrying().IsCarrying end,3)then
         if await(function()
             return Core.claimReceipt(carry.Uid,carry.AssetCategory,before,api.eggs.ReadOwnerEggs(player.UserId))
@@ -275,6 +407,24 @@ local function returnEgg()
         note("Carry ended without matching ownership receipt; egg may have been lost")
     end
     return false
+end
+local function escapePreflight(egg,h)
+ if not options.skipUnsafeEggs then return true end
+ local world=workspace:FindFirstChild("World")
+ local areas=world and world:FindFirstChild("Areas")
+ local guards=areas and areas:FindFirstChild("GuardAreas")
+ local area=guards and guards:FindFirstChild(egg.AreaId)
+ local requirement=area and area:GetAttribute("GuardEscapeSpeeds")
+ if not requirement or type(requirement.Y)~="number"then return true end
+ local available
+ if options.autoRunSpeed then available=options.runSpeedCap
+ elseif options.fixedRunSpeed then available=math.min(options.runSpeed,options.runSpeedCap)
+ else available=h.WalkSpeed*(api.balance.GuardRequirements and api.balance.GuardRequirements.CARRY_SPEED_RATIO or .9)end
+ if available<requirement.Y then
+  note("Deferred "..egg.AreaId.." egg: native escape estimate "..math.ceil(requirement.Y).." exceeds requested running limit "..math.floor(available))
+  return false
+ end
+ return true
 end
 local function stealEgg()
     if pending.carry then note("Previous carry request awaiting reconciliation")return false end
@@ -287,15 +437,19 @@ local function stealEgg()
     if not egg then return false end
     state.pickupAttempted=true
     if not stopTraining()then return false end
+    if not active()or character()~=r or carrying().IsCarrying then return false end
+    if not escapePreflight(egg,h)then blocked[egg.Uid]=os.clock()+10;return false end
     -- Only approach is teleported. Carried return movement never changes CFrame.
     if workspace.StreamingEnabled then pcall(function()player:RequestStreamAroundAsync(egg.BottomCFrame.Position,2)end)end
+    if not active()or character()~=r or carrying().IsCarrying then return false end
     h:MoveTo(r.Position)
     r.CFrame=egg.BottomCFrame+Vector3.new(3,3,0)
     h:MoveTo(r.Position)
     if not pause(.2)then return false end
     local live=api.eggs.ReadFieldEgg(egg.Uid)
     if not live or not Core.allowed(live,options,api.assets.Directory)then return false end
-    if (r.Position-live.BottomCFrame.Position).Magnitude>8 then return false end
+    if character()~=r or (r.Position-live.BottomCFrame.Position).Magnitude>8 then return false end
+    if not escapePreflight(live,h)then blocked[egg.Uid]=os.clock()+10;return false end
     state.pickupAttempted=true
     if not pickupEgg(live)then blocked[egg.Uid]=os.clock()+8;return false end
     return returnEgg()
@@ -351,9 +505,10 @@ local function plantOrHatch()
             end
             if nearestPrompt and type(fireproximityprompt)=="function"then
                 state.hatchPending[uid]=os.clock()+20
+                state.hatchInFlight={uid=uid,untilTime=os.clock()+20}
                 fireproximityprompt(nearestPrompt,nearestPrompt.HoldDuration)
                 if await(function()return api.eggs.ReadOwnedEgg(player.UserId,uid)==nil end,15)then
-                    state.hatches=state.hatches+1;note("Native hatch completed")return true
+                    state.hatchInFlight=nil;state.hatches=state.hatches+1;note("Native hatch completed")return true
                 end
                 note("Hatch pending; no duplicate Begin/Finish call")return false
             end
@@ -613,11 +768,14 @@ end
 if type(readfile)=="function"then pcall(function()
  local loaded=HTTP:JSONDecode(readfile(savePath))
  for k,v in pairs(loaded)do
-  if type(v)=="boolean"and type(options[k])=="boolean"then options[k]=v
+  if (k=="runSpeed"or k=="runMargin"or k=="runSpeedCap")and type(v)=="number"and v==v then
+   options[k]=math.clamp(v,k=="runMargin"and 1 or 16,k=="runMargin"and 100 or 1000)
+  elseif type(v)=="boolean"and type(options[k])=="boolean"then options[k]=v
   elseif (k=="excluded"or k=="excludedPets"or k=="eggTypes"or k=="rarities")and type(v)=="table"then
    for id,on in pairs(v)do if type(id)=="string"and type(on)=="boolean"then options[k][id]=on end end
   end
  end
+ if options.autoRunSpeed then options.fixedRunSpeed=false end
  options.master=false -- Starting a new session always exposes settings before moving.
 end)end
 local renders={}
@@ -643,6 +801,10 @@ local function toggle(container,key,text,map)
  row.Destroying:Connect(function()renders[row]=nil end)
  row.Activated:Connect(function()
   target[key]=not target[key]
+  if target==options and target[key]and key=="fixedRunSpeed"then options.autoRunSpeed=false end
+  if target==options and target[key]and key=="autoRunSpeed"then options.fixedRunSpeed=false end
+  if key=="master"and not options.master then restoreRunSpeed()end
+  if key=="fixedRunSpeed"or key=="autoRunSpeed"then for _,refresh in pairs(renders)do refresh()end end
   if map==options.eggTypes then for _,refresh in pairs(renders)do refresh()end else render()end
   save()
  end)
@@ -767,6 +929,26 @@ ui.text(base,"Cash upgrades spend in-game money. Paid products, selling and rebi
 local training=ui.group(pages.Training,"Speed")
 toggle(training,"treadmill","Train on own treadmill when idle")
 ui.text(training,"Uses own TreadmillBottom and AskWearStill. Leaves the belt before egg, hatch or event movement. Training sessions last 20 seconds.")
+local running=ui.group(pages.Training,"Running and guardian speed")
+toggle(running,"fixedRunSpeed","Use fixed running speed")
+toggle(running,"autoRunSpeed","Auto speed from my chasing guardians")
+toggle(running,"skipUnsafeEggs","Defer eggs above native escape-speed estimate")
+local function runNumber(key,label,minimum,maximum)
+ ui.text(running,label)
+ local box=make("TextBox",{Size=UDim2.new(1,-5,0,24),Text=tostring(options[key]),ClearTextOnFocus=false,
+  TextSize=11,TextColor3=white,BackgroundColor3=Color3.fromRGB(20,29,41)},running)
+ box.FocusLost:Connect(function()
+  local value=tonumber(box.Text)
+  if value and value==value and value>-math.huge and value<math.huge then options[key]=math.clamp(value,minimum,maximum)end
+  box.Text=tostring(options[key]);save()
+ end)
+ renders[box]=function()box.Text=tostring(options[key])end
+ box.Destroying:Connect(function()renders[box]=nil end)
+end
+runNumber("runSpeed","Fixed speed (studs/sec)",16,1000)
+runNumber("runMargin","Auto speed advantage (studs/sec)",1,100)
+runNumber("runSpeedCap","Maximum requested run speed",16,1000)
+ui.text(running,"Modes are exclusive. Auto follows guardians targeting you, including their distance-based acceleration. Return is always Humanoid running, never teleporting. These are temporary local speed requests; server corrections or native slowdowns may prevent outrunning. Diagnostics show requested, measured and guardian speeds.")
 local events=ui.group(pages.Events,"Live activities")
 toggle(events,"events","Collect active event pickups")
 for _,spec in ipairs(eventSpecs)do toggle(events,spec.name,spec.name)end
@@ -888,11 +1070,12 @@ local function diagnosticsText()
  local r,h=character();local carry=carrying();local data=profile()
  local p={}for key in pairs(pending)do p[#p+1]=key end table.sort(p)
  local modules={}for key in pairs(api)do modules[#modules+1]=key end table.sort(modules)
- return table.concat({"EXIS Steal an Egg | build 2","Place "..game.PlaceId.." | Job "..game.JobId,
+ return table.concat({"EXIS Steal an Egg | build 3","Place "..game.PlaceId.." | Job "..game.JobId,
   "FPS "..fps.." | Master "..tostring(options.master).." | Task "..state.job,
   "Health "..tostring(h and math.floor(h.Health)).." | Save "..tostring(data~=nil).." | Base "..tostring(plot()~=nil),
   "Carrying "..tostring(carry.IsCarrying).." | Owned eggs "..Core.count(api.eggs.ReadOwnerEggs(player.UserId)),
   "Delivered "..state.claimed.." | Hatched "..state.hatches.." | Training "..tostring(state.training),
+  "Run requested "..tostring(state.runRequested or "native").." | measured "..tostring(state.runMeasured and math.floor(state.runMeasured)or "—").." | guardian "..tostring(state.guardSpeed or 0).." | capped "..tostring(state.runCapped==true),
   "Pickup "..tostring(state.pickupPending and state.pickupPending.uid or "none"),
   "Pending "..(#p>0 and table.concat(p,", ")or"none"),"Modules "..table.concat(modules,", "),
   "Hatch input "..tostring(type(fireproximityprompt)=="function").." | Files "..tostring(type(writefile)=="function"),
@@ -913,14 +1096,17 @@ button(session,"Save settings now",function()save();note("Settings save requeste
 button(session,"Reload saved settings (paused)",function()
  local ok,err=pcall(function()
   assert(type(readfile)=="function","readfile unavailable")
-  local data=HTTP:JSONDecode(readfile(savePath));options.master=false
+  local data=HTTP:JSONDecode(readfile(savePath));options.master=false;restoreRunSpeed()
   for k,v in pairs(data)do
-   if k~="master"and type(v)=="boolean"and type(options[k])=="boolean"then options[k]=v
+   if (k=="runSpeed"or k=="runMargin"or k=="runSpeedCap")and type(v)=="number"and v==v then
+    options[k]=math.clamp(v,k=="runMargin"and 1 or 16,k=="runMargin"and 100 or 1000)
+   elseif k~="master"and type(v)=="boolean"and type(options[k])=="boolean"then options[k]=v
    elseif (k=="excluded"or k=="excludedPets"or k=="eggTypes"or k=="rarities")and type(v)=="table"then
     for id in pairs(options[k])do options[k][id]=nil end
     for id,on in pairs(v)do if type(id)=="string"and type(on)=="boolean"then options[k][id]=on end end
    end
   end
+  if options.autoRunSpeed then options.fixedRunSpeed=false end
   for _,render in pairs(renders)do render()end
  end)
  note(ok and "Settings reloaded; Master paused"or tostring(err))
@@ -1018,6 +1204,7 @@ connections[#connections+1]=UIS.InputEnded:Connect(function(input)if input==drag
 close.Activated:Connect(function()gui:Destroy()end)
 gui.Destroying:Connect(function()
  alive=false;options.master=false
+ restoreRunSpeed()
  for _,connection in ipairs(connections)do connection:Disconnect()end
  local r,h=character();if r then h:MoveTo(r.Position)end
  task.spawn(stopTraining)
@@ -1033,6 +1220,13 @@ local function periodic(key,seconds,fn)
 end
 local function farmStep()
     if carrying().IsCarrying then state.pickupPending=nil;state.collectionHoldUntil=nil;returnEgg();return end
+    if state.hatchInFlight then
+     local hatch=state.hatchInFlight
+     if api.eggs.ReadOwnedEgg(player.UserId,hatch.uid)==nil then
+      state.hatchInFlight=nil;state.hatches=state.hatches+1;note("Late native hatch receipt confirmed")
+     elseif os.clock()<hatch.untilTime then state.job="waiting for native hatch";return
+     else state.hatchInFlight=nil;note("Hatch receipt timed out; keeping retry backoff")end
+    end
     if state.pickupPending then
      local attempt=state.pickupPending
      if os.clock()-attempt.at<12 then state.job="waiting for pickup receipt";return end
@@ -1057,15 +1251,22 @@ local function farmStep()
     if state.training and not stopTraining()then return end
     if not api.eggs.HasFieldSnapshot()then periodic("sync",10,function()call("field sync",api.eggs.SyncFieldEggs)return true end)end
     if options.hatch and periodic("hatch",2,plantOrHatch)then return end
+    if carrying().IsCarrying then return end
     if options.equip then periodic("equip",15,equipBest)end
+    if carrying().IsCarrying then return end
     if options.upgrades then periodic("upgrades",8,upgrades)end
+    if carrying().IsCarrying then return end
     if options.rewards then periodic("index",30,function()return rpc("Codex","AskRedeemAll")==true end)end
+    if carrying().IsCarrying then return end
     if options.fusion then periodic("fusion",15,fuse)end
+    if carrying().IsCarrying then return end
     if options.events and periodic("events",12,eventCollect)then return end
+    if carrying().IsCarrying then return end
     if options.steal then
      state.pickupAttempted=false
      if periodic("steal",1,stealEgg)or state.pickupAttempted then return end
     end
+    if carrying().IsCarrying then return end
     if options.treadmill then periodic("training",3,train)end
 end
 -- A single worker owns movement and requests. Carrying always finishes first.

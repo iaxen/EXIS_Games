@@ -10,7 +10,7 @@ The script uses the supplied Place 107778070777162 export. The decoded source wa
 | --- | --- |
 | Client.EggState / Shared.Types.AreaEggs | Field snapshot has Records containing Uid, AreaId, NestId, AssetCategory, State, BottomCFrame, BoundsCFrame and BoundsSize. Eligible states match the native prompt controller: Slot and Dropped. GuardCarried is excluded until the native controller exposes a pickup prompt. CarryFieldEgg(uid, optionalSlotKey), ReadCarryState and ownership changes drive the loop. Carried and Claimed entries are excluded. |
 | AreaEggsController / AreaEggSlotIdentity | CarryAreaEgg normally holds 1.2 seconds, or 0.25 with workspace FastEggPickupTime. The native call gets `AreaId:NestId` only for FirstAreaEgg_ UIDs. The script holds the exact selected egg's enabled CarryAreaEgg prompt for its live duration, then uses available native prompt input if needed. It does not make a duplicate raw CarryFieldEgg call after a prompt dispatch. |
-| CarryRunBackEffects | Some eggs wait for the area's Guard.GuardState to become Chasing. Honor this before walking. No CFrame changes during return; no fabricated safe-zone claim. |
+| CarryRunBackEffects | RunBackWakeDelayRequired delays audiovisual run-back effects until Chasing; it is not a movement lock. Start running immediately after exact carry confirmation to retain the native waking head start. No CFrame changes during return; no fabricated safe-zone claim. |
 | Client.PlotState | ResolvePlot(userId) returns PlotFolder, CenterPoint and PetArea. Own base and placement are resolved at runtime; no fixed world coordinates. |
 | EggPlacementController / Client.EggState | PlantEgg(uid, localCFrame) expects a frame relative to CenterPoint. Grid placement stays within PetArea, separates existing eggs and requires replicated Placement. Attempts are bounded so a full plot cannot starve ready hatches. |
 | PlacedEggRenderer / EggHatchAnimation | The native PlacedEggPrompt owns BeginHatch, presentation and FinishHatch. Automation triggers that prompt only for a ready egg near its own placement. It does not bypass growth or send a premature FinishHatch. An ownership-removal receipt marks completion. |
@@ -56,7 +56,7 @@ Performance/session tools work independently of the farm master. They do not cle
 
 ## Launch-stage follow-up
 
-The loader now shows detecting/download/compile/startup stages and retains actual failures. Its download URL includes a build/time query. The Steal an Egg file explicitly returns `false, error` after a caught startup failure so the loader cannot mistake it for success. A complete-script mocked client test reaches the main panel and separately verifies missing-adapter propagation. Roblox Luau compilation also passes. These checks do not reproduce the reported live executor failure; the displayed stage/error remains necessary to diagnose it. Both repositories' READMEs include the current fresh-launch command and troubleshooting guide.
+The loader now shows detecting/download/compile/startup stages and retains actual failures. Its download URL includes a build/time query. The Steal an Egg file explicitly returns `false, error` after a caught startup failure so the loader cannot mistake it for success. A complete-script mocked client test reaches the main panel and separately verifies missing-adapter propagation. Roblox Luau compilation also passes. These checks do not reproduce the reported live executor failure; the displayed stage/error remains necessary to diagnose it. Both repositories' READMEs retain only the launch command and supported games; technical troubleshooting stays here.
 
 
 ## Pickup acknowledgement follow-up
@@ -73,3 +73,46 @@ New tests execute the actual pickup helper and scheduler step for hold timing, n
 The Eggs page now includes the native egg-name catalogue, rarity labels, pet-category identities, search, pagination and include/exclude-all controls. An independent saved eggTypes map filters collection before rarity/distance ranking. A live map list displays native egg names, current biome, rarity and field state with pagination. Shared names retain their pet-category identity so selecting a Forest Egg variant is unambiguous. EggRecords.DisplayName is used when available; native asset egg labels provide a fallback.
 
 The dot-text buttons have been replaced throughout Steal an Egg by the shared Fuzzotopia track/knob switch design. Whole-script UI tests create and click the actual controls to verify on/off knob movement. READMEs intentionally contain only the original launch command and supported game list; technical coverage/limitations remain in this audit.
+
+
+## Deep carry, chase and execution audit
+
+The export's remote declaration inventory and literal client call sites are in [StealAnEgg_Call_Map.md](StealAnEgg_Call_Map.md): 414 declarations across 96 namespaces, with 162 declarations matched to literal replicated-module call sites. This is an index for tracing, not 414 implemented automations. Some calls are server-to-client notifications. Dynamic references, non-replicated scripts and authoritative server validation are outside that inventory.
+
+### Conflicts found and corrected
+
+| Conflict | Result before | Correction |
+| --- | --- | --- |
+| Treating CarryRunBackEffects' visual wake delay as a movement prerequisite | Waiting for Chasing spent the waking head start while holding an egg | Walk immediately after exact-UID carry acknowledgement |
+| Root-to-ground 3D arrival distance | A root above a reached ground waypoint could wait up to three seconds | Horizontal arrival distance with an eight-stud height tolerance; skip reached waypoints |
+| Computing the first home path after pickup | Path computation could consume the escape window | Compute and cache a home path before holding the pickup prompt; defer pickup when no path is found |
+| Waiting for carry release after a failed route | Standing still despite still carrying and being chased | Preserve carry priority and retry routing on the next worker pass |
+| Loading optional guardian modules inside the running loop | A require could yield up to the adapter wait bound during escape | Preload before pickup; chase snapshots only read cached data and observed speeds |
+| Late carry replication during another approach or ordinary walk | A newly acquired egg could be moved by an unrelated job | Guard after yielding streaming/training work, before both approach CFrame writes, during every walk poll, and between scheduler phases |
+| Switching speed modes and overlapping native modifiers | Conflicting speed requests or restoring an obsolete value | Exclusive modes, one temporary speed owner, preserve newer native values, restore on stop, close, pause/reload, route exit and character removal |
+| A slow native hatch finishing after the local receipt wait | Another job could start while the native animation remained pending | Bounded hatch lease reconciles late receipts before resuming ordinary jobs |
+
+The return route uses Humanoid:MoveTo and native jump waypoints. It never assigns character CFrame, velocity or guardian properties. A cached path is consumed only for the same character, within 15 seconds and near its original start/goal. Otherwise pathfinding retries. Paths may still become invalid as geometry streams or barriers change. Rejected paths retain the egg and report the retry; there is no teleport-return fallback.
+
+### Chase computations and controls
+
+`GuardChasePolicy.ResolveWalkSpeed(base, flatRadius, gap)` uses horizontal gap. At or below flatRadius, speed equals base. Above it:
+
+`guardianSpeed = min(base * (1 + (gap / flatRadius - 1) * strength), base * multiplierCap)`
+
+The supplied GameplayBalance defaults are strength 0.5, multiplierCap 4, and waking duration 0.63 seconds. Runtime balance/config values are read rather than freezing those defaults into every guardian. A larger lead can therefore make the guardian faster. With a reference guardian base 16 and flatRadius 10, gap 20 gives 24, and a sufficiently large gap gives 64. The supplied Forest config instead has flatRadius 20 and hit distance 2.5; gap 40 gives 24, and the speed ceiling is 64. Enchanted Forest's exported base 251.075 can reach 1004.3 before live balance overrides. A fixed 64 or an auto cap of 300 cannot promise to outrun every biome.
+
+At native Forest speed 16, preserving 0.63 seconds of waking permits about 10.08 studs of travel before chase starts, assuming immediate unobstructed movement. Actual distance depends on local execution, collision, modifiers and server corrections. The native GuardEscapePrediction models changing chase speed and uses a binary search for required escape speed; a constant-speed catch-time shortcut is not an equivalent model.
+
+The Training page now exposes:
+
+- Fixed running speed: editable studs per second, temporarily requested during walks.
+- Auto speed from my chasing guardians: the maximum of the native baseline and each relevant guardian's observed/predicted speed plus the chosen advantage, bounded by the chosen cap. Snapshots refresh while moving. It includes the carrying area's waking/sleeping guardian so it can prepare before Chasing, and excludes guardians chasing another player.
+- Auto advantage and maximum requested run speed: separately saved numeric settings. Fixed and auto modes cannot be enabled together. Both off preserves native running speed.
+- Defer eggs above native escape-speed estimate: compare published `GuardEscapeSpeeds.Y` to selected running speed/cap, or native speed adjusted by the carry ratio. Recheck after streaming. An absent sign is unknown, not evidence of a safe escape.
+
+The native sign describes an ideal area exit, not the entire obstacle-filled route to the base. Passing the check is an estimate, not a safety guarantee. Auto mode compares its cap during preflight; its actual requested speed follows the guardians and can be lower. Reaching the cap is exposed in diagnostics, alongside measured movement, requested speed and guardian speed. A speed request is a local Humanoid.WalkSpeed change; it does not award SpeedPower, grant treadmill progress, defeat native speed overrides or ensure server acceptance. Native WalkSpeedGovernor applies its own modifiers/overrides. Anchored, seated, PlatformStand, Physics, Ragdoll and Dead states are left to native control.
+
+### Verification of this change
+
+Tests execute production helpers with mocked native state for immediate waking-phase return, root-height arrival, cached-path use, no CFrame writes on return, carry-UID replacement, carry acquisition during unrelated movement, path rejection, no-path pickup deferral, late carry during streaming/prompt discovery, guardian chase calculations, target-player filtering, exclusive switch controls, cap/preflight decisions, speed cleanup and native correction preservation. All 396 regression checks across 20 suites passed, including complete-file UI startup. The updated game file also compiled successfully with the Roblox Luau compiler. No live executor/server session was available, so successful live pickup, guardian escape, every event adapter and long-term AFK survival remain unverified.

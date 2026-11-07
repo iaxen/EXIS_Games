@@ -14,7 +14,7 @@ local function node(class)
   if methods[k]then return methods[k]end
   if t.props[k]~=nil then return t.props[k]end
   if k=='AbsoluteSize'or k=='ViewportSize'then return{X=800,Y=600}end
-  if k=='Activated'or k=='InputBegan'or k=='Destroying'or k=='OnClientEvent'or k=='Idled'or k=='OnTeleport'or k=='CharacterRemoving'or k=='InputEnded'or k=='InputChanged'or k=='RenderStepped'or k=='ErrorMessageChanged'or k=='DescendantAdded'then local s=signal();t.props[k]=s;return s end
+  if k=='Activated'or k=='InputBegan'or k=='Destroying'or k=='OnClientEvent'or k=='Idled'or k=='OnTeleport'or k=='CharacterRemoving'or k=='InputEnded'or k=='InputChanged'or k=='RenderStepped'or k=='ErrorMessageChanged'or k=='DescendantAdded'or k=='FocusLost'then local s=signal();t.props[k]=s;return s end
  end,__newindex=function(t,k,v)
   if k=='Parent'and v then v.children[#v.children+1]=t end
   t.props[k]=v
@@ -93,6 +93,18 @@ local listed=false
 for _,o in ipairs(instances)do if type(o.Text)=='string'and o.Text:find('Forest Egg | Common | Forest | Slot | Chicken',1,true)then listed=true end end
 assert(listed)
 print('PASS live egg list displays native egg name rarity biome and state')
+local fixed,automatic
+for _,o in ipairs(instances)do
+ if o.ClassName=='TextLabel'and o.Text=='USE FIXED RUNNING SPEED'then fixed=o.Parent end
+ if o.ClassName=='TextLabel'and o.Text=='AUTO SPEED FROM MY CHASING GUARDIANS'then automatic=o.Parent end
+end
+assert(fixed and automatic);fixed.Activated:Fire()
+assert(fixed:FindFirstChild('SwitchTrack'):FindFirstChild('SwitchKnob').Position.X.Offset==15)
+automatic.Activated:Fire()
+assert(fixed:FindFirstChild('SwitchTrack'):FindFirstChild('SwitchKnob').Position.X.Offset==2)
+assert(automatic:FindFirstChild('SwitchTrack'):FindFirstChild('SwitchKnob').Position.X.Offset==15)
+automatic.Activated:Fire()
+print('PASS fixed and guardian-auto speed switches are mutually exclusive')
 -- A missing required adapter must propagate a failure return, not false success.
 services.ReplicatedStorage=node('ReplicatedStorage');now=0
 os.clock=function()now=now+1;return now end
@@ -101,4 +113,4 @@ local result,message=assert(load(source))()
 os.clock=originalClock
 assert(result==false and tostring(message):find('Client.EggState',1,true))
 print('PASS complete script returns the missing adapter error to the universal loader')
-print('5 complete startup, switch UI, egg listing and error propagation checks passed')
+print('6 complete startup, switch UI, egg listing and error propagation checks passed')
