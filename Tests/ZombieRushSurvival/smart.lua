@@ -94,7 +94,7 @@ end)
 test('first affordable turret is placed before ordinary upgrades',function()
  local h=setup();h.cfg.autoPlace=true;h.cfg.gun=true;h.cfg.health=true
  h.app.turretEstablished=function()return false end
- h.app.getPlacement=function(role,allow)assert(role=='turret'and allow);return{affordable=true,slot={role='turret'}}end
+ h.app.getPlacement=function(role,allow)if not role then return nil end;assert(role=='turret'and allow);return{affordable=true,slot={role='turret'}}end
  local placed=0;h.app.placeTick=function()placed=placed+1;return true end
  h.app.matchTick();assert(placed==1 and #h.requests==0)
 end)
@@ -124,12 +124,12 @@ test('low health remains an urgent exception to the initial turret order',functi
 end)
 test('an accepted placement finishes its approach before another ordinary job interrupts',function()
  local h=setup();h.cfg.autoPlace=true;h.cfg.gun=true;h.app.turretEstablished=function()return true end
- local pending={slot={role='wall'}};h.app.placementTask=pending;h.app.placeTick=function()return nil end
+ h.app.getPlacement=function()return nil end;local pending={slot={role='wall'}};h.app.placementTask=pending;h.app.placeTick=function()return nil end
  h.app.matchTick();assert(h.app.placementTask==pending and #h.requests==0)
 end)
 test('boss combat prevents placement approaches while upgrades can still run',function()
  local h=setup();h.cfg.autoPlace=true;h.cfg.gun=true;h.cfg.fight=true;h.app.target={boss=true}
- h.app.getPlacement=function()error('no placement during boss engagement')end
+ h.app.getPlacement=function()return nil end
  h.app.matchTick();assert(h.requests[1].args[1]=='PurchaseWeaponTierUpgrade')
 end)
 test('a far initial turret cannot block an affordable defense already in placement range',function()
@@ -140,5 +140,18 @@ test('a far initial turret cannot block an affordable defense already in placeme
  end
  h.app.placeTick=function()assert(h.app.placementTask.slot.role=='wall');return true end
  h.app.matchTick()
+end)
+test('an affordable ready defense interrupts an unfinished distant approach',function()
+ local h=setup();h.cfg.autoPlace=true;h.app.placementTask={slot={role='wall'}}
+ local immediate={inRange=true,affordable=true,slot={role='turret'}}
+ h.app.getPlacement=function()return immediate end
+ h.app.placeTick=function()assert(h.app.placementTask==immediate);return true end
+ h.app.matchTick();assert(h.app.placementTask==nil)
+end)
+test('boss focus does not block an already reachable affordable defense',function()
+ local h=setup();h.cfg.autoPlace=true;h.cfg.fight=true;h.app.target={boss=true}
+ h.app.getPlacement=function()return{inRange=true,affordable=true,slot={role='wall'}}end
+ local placed=false;h.app.placeTick=function()placed=true;return true end
+ h.app.matchTick();assert(placed)
 end)
 print(tests..' smart scheduling and route-geometry checks passed')

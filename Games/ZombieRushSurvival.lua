@@ -873,6 +873,7 @@ local function run()
     function app.changed()
         app.revision = app.revision + 1
         app.planKey = nil
+        if app.requestBuildWake then app.requestBuildWake() end
         if app.saveQueued then return end
         app.saveQueued = true
         task.delay(0.3, function() app.saveQueued = false if app.alive then app.save() end end)
@@ -1091,9 +1092,18 @@ local function run()
     function app.matchTick()
         local _, human = app.root()
         if not human then return end
-        -- Survival remains urgent; ordinary spending uses a randomized fair cycle.
+        -- Urgent health remains first; affordable in-range defenses spend next.
         if human.Health / human.MaxHealth < 0.5 and app.upgradeCandidate("health") then app.upgradeTick("health") return end
         local boss = cfg.fight and cfg.bossFirst and app.target and app.target.boss
+        if cfg.autoPlace then
+            local instant = app.getPlacement()
+            if instant and instant.inRange then
+                app.placementTask, app.buildGoal = instant, nil
+                local result=app.placeTick()
+                if result~=nil then app.placementTask=nil end
+                return
+            end
+        end
         if cfg.autoPlace and not boss and not app.turretEstablished() then
             local first = app.placementTask and app.placementTask.slot.role == "turret" and app.placementTask
                 or app.getPlacement("turret", true)
@@ -1115,6 +1125,7 @@ local function run()
             if result == nil then return end -- Keep a moving placement until it completes.
             if app.matchMix and app.placementKey then Core.finishChoice(app.matchMix, app.placementKey) end
             app.placementTask, app.placementKey = nil, nil
+            if result==true then return end
         end
         if cfg.autoPlace and not boss then
             local candidate = app.getPlacement()
@@ -1127,6 +1138,58 @@ local function run()
         end
         app.buildGoal = nil
         app.upgradeTick()
+    end
+    function app.requestBuildWake()
+        if not app.alive or not cfg.enabled or not cfg.autoPlace or app.mode~="MATCH" or app.editing then return end
+        app.buildWakePending=true
+        if app.matchBusy or app.buildWakeScheduled then return end
+        app.buildWakeScheduled=true
+        task.defer(function()
+            app.buildWakeScheduled=false
+            if app.alive and cfg.enabled and cfg.autoPlace and app.mode=="MATCH" and not app.editing then app.runMatchBurst() end
+        end)
+    end
+    function app.runMatchBurst()
+        if app.matchBusy then return end
+        if not app.alive or not cfg.enabled or app.mode~="MATCH" or app.editing or not app.active() then return end
+        app.matchBusy,app.buildWakePending=true,false
+        local map,class,revision=app.mapId,app.className,app.revision
+        local ok,err=xpcall(function()
+            for count=1,8 do
+                if not app.alive or not cfg.enabled or app.editing or app.mode~="MATCH" or not app.active()
+                    or app.mapId~=map or app.className~=class or app.revision~=revision then break end
+                local before=app.placedSerial or 0
+                app.matchTick()
+                if (app.placedSerial or 0)==before then break end
+                -- One frame for native prices/replication and UI work. No grind
+                -- timer or extra purchase delay between successful placements.
+                task.wait()
+                if count==8 then app.buildWakePending=true end
+            end
+        end,Diagnostics.traceback)
+        app.matchBusy=false
+        if not ok then app.note("worker","ERROR: "..tostring(err)) app.buildWakePending=false end
+        if app.buildWakePending then app.requestBuildWake() end
+    end
+    function app.bindBuildCash()
+        local cash=app.data("Stats","Cash")
+        if cash==app.buildCashNode then return end
+        if app.buildCashConnection then app.buildCashConnection:Disconnect() end
+        app.buildCashNode,app.buildCashConnection=cash,nil
+        app.buildCashValue=cash and tonumber(cash.Value) or nil
+        if cash then
+            app.buildCashConnection=app.connect(cash:GetPropertyChangedSignal("Value"),function()
+                local previous,current=app.buildCashValue,tonumber(cash.Value)
+                app.buildCashValue=current
+                if current and (not previous or current>previous) then
+                    -- New funds invalidate only a funds rejection, never a
+                    -- collision/rate-limit/server-safety rejection.
+                    if app.placeFailureReason=="funds" then app.next.place=0 end
+                    app.requestBuildWake()
+                end
+            end)
+            app.requestBuildWake()
+        end
     end
     function app.skipTick()
         if app.mode ~= "MATCH" or not app.alive or not app.root() or app.editing then return end
@@ -1738,7 +1801,6 @@ local function run()
         return nil
     end
     function app.placeTick()
-        if app.target and app.target.boss and cfg.bossFirst and cfg.fight then app.buildGoal = nil return end
         if app.editing then app.buildGoal = nil return false end
         local candidate = app.placementTask or app.getPlacement()
         if not candidate then app.buildGoal = nil return false end
@@ -1754,6 +1816,9 @@ local function run()
         local maxDistance = placement.GetPlacementDistances(spec.info, spec.grid or 1)
         local inRange = (root.Position - candidate.point).Magnitude <= maxDistance
             and math.abs(root.Position.Y-candidate.point.Y) <= (spec.maxElevation or 5)
+        if app.target and app.target.boss and cfg.bossFirst and cfg.fight and not inRange then
+            app.buildGoal=nil app.placementReadiness="WAITING: boss combat; safe in-range placements remain allowed" return false
+        end
         -- The native range is to the requested surface point. Do not force a
         -- move to an arbitrary side/height when we can already place safely.
         local lift = human.HipHeight + root.Size.Y / 2
@@ -1806,17 +1871,27 @@ local function run()
         if not app.afford(currency, price) then return false end
         app.stopWalk()
         app.placing = true
+        app.placeFailureReason=nil
         local result = app.invoke("place", app.find(RS, "DeployableSystem_Remotes", "Place"),
             candidate.slot.name, candidate.point, {Facing = candidate.slot.facing or spec.facing})
         app.placing = false
         if type(result) == "table" and result.ok == true then
+            if candidate.map~=app.mapId or candidate.class~=app.className or candidate.revision~=app.revision or not app.alive then
+                app.planKey=nil app.note("defense","PLACEMENT RESPONSE ARRIVED AFTER MAP / CLASS / AREA CHANGE; REPLANNING") return false
+            end
             app.pendingPlacements = app.pendingPlacements or {}
             app.pendingPlacements[candidate.key] = {slot = candidate.slot, expires = os.clock() + 5}
             app.next.place = os.clock()
+            app.placedSerial=(app.placedSerial or 0)+1
+            app.placeFailureReason=nil
             app.defenseCache = nil
             app.note("defense", "PLACED " .. candidate.slot.name:upper())
         elseif result then
-            app.rejected[candidate.key] = os.clock() + 8
+            app.placeFailureReason=result.reason
+            if result.reason~="funds" then app.rejected[candidate.key]=os.clock()+8 end
+            if result.reason=="occupied" or result.reason=="support" or result.reason=="surface" or result.reason=="range" then
+                app.next.place=os.clock() -- Skip this slot without blocking other valid slots.
+            end
             app.note("defense", "REJECTED: " .. tostring(result.reason or "UNKNOWN"))
         end
         return result and result.ok == true or false
@@ -2891,6 +2966,7 @@ end
             local ok, err = pcall(function()
                 local before = app.mapId .. tostring(app.className) .. app.mode
                 app.detect()
+                app.bindBuildCash()
                 if before ~= app.mapId .. tostring(app.className) .. app.mode then
                     if app.mapView and app.mapView.map ~= app.mapId then app.closeMapEditor(false) end
                     app.planKey, app.target, app.buildGoal, app.surface, app.defenseCache = nil, nil, nil, nil, nil
@@ -2911,7 +2987,7 @@ end
                     elseif app.mode == "LOBBY" then
                         if not app.classTick() then app.weaponTick() end
                     elseif app.active() and app.mapId ~= "Unknown" then
-                        app.matchTick()
+                        app.runMatchBurst()
                     end
                 end
             end)

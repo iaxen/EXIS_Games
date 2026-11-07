@@ -41,8 +41,11 @@ test('placement sends the chosen border slot facing instead of a shared first-ed
  local h=setup();h.candidate.slot.facing=3;h.app.placeTick()
  assert(h.events[1].args[3].Facing==3)
 end)
-test('a pending boss suppresses placement while fight mode is enabled',function()
- local h=setup();h.app.target={boss=true};h.cfg.fight=true;h.app.placeTick();assert(#h.events==0)
+test('boss combat allows safe in-range placement but does not start a distant approach',function()
+ local h=setup();h.app.target={boss=true};h.cfg.fight=true;assert(h.app.placeTick()==true and #h.events==1)
+ h=setup();h.app.target={boss=true};h.cfg.fight=true
+ h.app.root=function()return{Position=v(100,3,0),Size=v(2,2,2)},{HipHeight=2}end
+ assert(h.app.placeTick()==false and #h.events==0 and not h.app.buildGoal)
 end)
 test('a class map or region change cancels a stale placement',function()
  for _,key in ipairs({'class','map','revision'})do
@@ -183,5 +186,17 @@ test('placement diagnostics show funds and valid-floor blockers instead of silen
  assert(h.app.placementReadiness:find('WAITING FOR CASH',1,true))
  h.app.afford=function()return true end;h.app.ground=function()return nil end;assert(h.app.getPlacement()==nil)
  assert(h.app.placementReadiness:find('no valid support',1,true))
+end)
+test('a funds rejection does not lock a valid slot behind the spatial rejection delay',function()
+ local h=setup();h.app.invoke=function()return{ok=false,reason='funds'}end
+ assert(h.app.placeTick()==false and h.app.rejected.slot1==nil and h.app.placeFailureReason=='funds')
+end)
+test('a late response cannot claim an old placement in the new map plan',function()
+ local h=setup();h.app.invoke=function()h.app.mapId='Map2';return{ok=true}end
+ assert(h.app.placeTick()==false and not h.app.pendingPlacements and not h.app.placedSerial)
+end)
+test('occupied-slot rejection leaves other valid slots immediately eligible',function()
+ local h=setup();h.app.invoke=function()h.app.next.place=5;return{ok=false,reason='occupied'}end
+ assert(h.app.placeTick()==false and h.app.next.place==0 and h.app.rejected.slot1==8)
 end)
 print(tests..' movement / placement / input checks passed')
