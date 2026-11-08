@@ -1,5 +1,7 @@
 # MrBeast team roles and survival — v6
 
+> Historical v6 notes. The current menu uses [combined job toggles in v7](Mrbeast_Combined_Jobs_v7.md).
+
 This update uses the supplied day-13 report, both saved configurations, the full report log and supplied parts 53–59 of session `20261108_133037_512473`. The user clarified that they control two accounts and repeatedly revived the character. The final HP-zero snapshot therefore does not explain the earlier live stalls by itself.
 
 ## Four job configurations
