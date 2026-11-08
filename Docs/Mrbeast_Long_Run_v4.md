@@ -1,3 +1,5 @@
+> Chest ESP, bounded wall batches, scheduler performance, diagnostics and Long Run hold padding are updated in [Mrbeast_Performance_v5.md](Mrbeast_Performance_v5.md).
+
 # MrBeast Long Run v4 — menu, harvesting, base stations and walls
 
 This update follows the day-three report with 264 harvest activations / 154 damage receipts, slow repeated swings, delayed resource drops, and a request to simplify the menu and protect the whole station beach. Validation uses the supplied client/shared source export and deterministic tests. Live server acceptance and mobile layout are not certified.

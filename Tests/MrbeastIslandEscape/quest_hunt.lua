@@ -117,6 +117,7 @@ test('a quest read timeout clears pending state so the next poll can retry',func
  work.boundedRead=function()error('read timed out')end
  work.readQuest(true);queue[1]();assert(not work.questFetchPending)
  work.boundedRead=function(fn)return fn()end
+ work.readQuest(true);assert(#queue==1);now=now+5.1
  work.readQuest(true);queue[2]();assert(work.questCache and work.questRequirement.itemId=='wood')
 end)
 test('quest scheduler dispatches partial delivery instead of a false ready loop',function()

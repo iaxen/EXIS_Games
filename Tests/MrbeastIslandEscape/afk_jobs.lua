@@ -21,7 +21,7 @@ local function model(name,point)
  return m
 end
 local function setup()
- due={};now=0;inventory={Wood=0,Stone=0,Ore=0,Coal=0,Ingot=0,Meat=0};sceneRows={entities={},drops={},chests={}};schedule={};events={};status={};buildingSet={}
+ alive=true;due={};now=0;inventory={Wood=0,Stone=0,Ore=0,Coal=0,Ingot=0,Meat=0};sceneRows={entities={},drops={},chests={}};schedule={};events={};status={};buildingSet={}
  os.clock=function()return now end
  opts={jobTimeout=15,onlyNeeded=true,settleTime=0,guardRadius=14,huntRadius=40}
  flags={autoFarm=true,progression=true,choiceRewards=true,smelt=true,tidyBag=true}
@@ -32,6 +32,7 @@ local function setup()
  for id,name in pairs({wood='Wood',stone='Stone',ore='Ore',coal='Coal',ingot='Ingot',meat='Meat'})do
   local item={id=id,displayName=name,isBagItem=true};cfg.item.byId[id]=item;cfg.item.byDisplayName[name]=item;cfg.item.byName[name]=item
  end
+ world=function()return sceneRows end
  config=function()return cfg end
  count=function(name)return inventory[name]or 0 end
  work={needs={},amounts={},resourceNeeds={},sent=0,waiting={},objective=nil}
@@ -630,6 +631,89 @@ test('a disappearing resource drop without an inventory receipt is never reporte
  local context={center=vec(0,0,0),wanted={wood=true},before={}}
  assert(work.drainTreeDrops(context,'questAcquire')and context.noLoot and not context.seen and now>=4)
  assert(status.questAcquire:find('LOOT RECEIPT UNCONFIRMED',1,true))
+end)
+test('native open knowledge removes an existing chest ESP marker immediately without marking loot complete',function()
+ local m=chest();local destroyed=0;local state=work.chestState(m)
+ work.espMarkers={[m]={billboard={Destroy=function()destroyed=destroyed+1 end},highlight={Destroy=function()destroyed=destroyed+1 end}}}
+ work.markChestOpened(m)
+ assert(destroyed==2 and not work.espMarkers[m] and work.chestOpened(m) and not state.complete)
+end)
+test('the ESP pass excludes known-open chests and cleans old markers without probing them',function()
+ loadBody('    function work.espTick()', '    function work.statusTick()')
+ local m=chest();work.chestState(m).acceptedAt=0
+ local destroyed=false;work.espMarkers={[m]={billboard={Destroy=function()destroyed=true end}}};work.espFolder={}
+ work.espCategory=function()return'espChests'end;flags.espChests=true;opts.espDistance=600;opts.espLimit=48
+ work.probeChest=function()error('known-open chest must not be queried')end
+ work.espTick();assert(destroyed and not work.espMarkers[m])
+end)
+test('one authoritative opened read is reused instead of polling the same chest repeatedly',function()
+ local m=chest();local reads=0
+ call=function(_,op)assert(op=='isOpened');reads=reads+1;return true end
+ assert(work.readChestField(m,'opened')and work.readChestField(m,'opened')and reads==1)
+end)
+test('enabled native prompts avoid remote status reads while disabled prompts are not assumed opened',function()
+ local m=chest();m.FindFirstChildWhichIsA=function()return{Enabled=true}end
+ call=function()error('native enabled prompt already confirms unopened/unlocked')end
+ assert(not work.readChestField(m,'opened')and not work.readChestField(m,'locked'))
+ now=2;m.FindFirstChildWhichIsA=function()return{Enabled=false}end
+ call=function()return false end
+ assert(not work.readChestField(m,'opened')and not work.chestOpened(m))
+end)
+test('ESP status probes are single-flight and retry after a timeout with a global backoff',function()
+ local queue={};task.spawn=function(fn)queue[#queue+1]=fn end
+ local m=chest();call=function()error('read timed out')end
+ work.probeChest(m)
+ for i=1,20 do work.probeChest(model('Box'))end
+ assert(#queue==1 and work.chestProbeBusy and work.chestProbeRequests==1)
+ queue[1]();assert(not work.chestProbeBusy and work.chestProbeFailures==1)
+ work.probeChest(model('Box'));assert(#queue==1)
+ now=6;work.probeChest(model('Box'));assert(#queue==2)
+end)
+test('an opened chest discovered by a background probe loses its marker',function()
+ local queue={};task.spawn=function(fn)queue[#queue+1]=fn end
+ local m=chest();local removed=false
+ work.espMarkers={[m]={billboard={Destroy=function()removed=true end}}};call=function()return true end
+ work.probeChest(m);assert(not work.chestOpened(m));queue[1]()
+ assert(removed and work.chestOpened(m)and not work.espMarkers[m])
+end)
+test('a chest with no safe approach backs off so it cannot interrupt every food hunt',function()
+ local m=chest();call=function()return false end;travel=function()return false end
+ assert(not work.openChest()and failed[m]>=now+12 and not work.chestCandidate())
+end)
+test('a status read timeout defers that chest instead of immediately retrying the same remote',function()
+ local m=chest();local calls=0;call=function()calls=calls+1;error('read timed out')end
+ assert(not pcall(work.readChestField,m,'opened')and failed[m]>=15 and calls==1)
+ assert(not work.chestCandidate());assert(not pcall(work.readChestField,m,'opened')and calls==1)
+end)
+test('a stopped master avoids all readiness and rank calculations',function()
+ loadBody('    function work.pick(', '    function work.nextQueuedJob(')
+ flags.autoFarm=false;work.rank=function()error('disabled master must not scan combat')end
+ work.jobEnabled=function()error('disabled master must not evaluate job predicates')end
+ assert(not work.pick({{key='combat'}},now))
+end)
+test('disabled individual jobs do not run expensive rank calculations',function()
+ loadBody('    function work.pick(', '    function work.nextQueuedJob(')
+ work.jobEnabled=function()return false end;work.rank=function()error('disabled job must not scan threats')end
+ assert(not work.pick({{key='combat'}},now))
+end)
+test('disabled jobs skip round and night scans as well as rank calculations',function()
+ loadBody('    function work.jobEnabled(', '    function work.keyEnabled(')
+ work.roundLost=function()error('disabled job should not inspect the whole team')end
+ work.nightPaused=function()error('disabled job should not scan night threats')end
+ flags.combat=false
+ assert(not work.jobEnabled{key='combat'})
+ assert(not work.jobEnabled{key='combat',enabled=function()return false end})
+end)
+test('a pending ESP status probe does not start a duplicate foreground chest read',function()
+ local queue={};task.spawn=function(fn)queue[#queue+1]=fn end
+ local m=chest();call=function()return false end
+ work.probeChest(m);assert(not work.chestCandidate());queue[1]();assert(work.chestCandidate()==m)
+end)
+test('paused material planning does not scan recipes or fetch quests',function()
+ loadBody('    function work.refreshNeeds()', '    work.waitReasons =')
+ flags.autoFarm=false;config=function()error('paused planning must not inspect the catalogue')end
+ work.readQuest=function()error('paused planning must not poll quests')end
+ work.refreshNeeds()
 end)
 os.clock=realClock
 assert(loadfile(path))

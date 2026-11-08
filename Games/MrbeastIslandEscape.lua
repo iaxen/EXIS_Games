@@ -620,13 +620,37 @@ local function runIslandEscape()
     opts.combatMargin = math.clamp(opts.combatMargin, 0.25, 5)
     opts.combatHeight = math.clamp(opts.combatHeight, 1, 10)
     opts.retreatHealth = math.clamp(opts.retreatHealth, 5, 90)
+    function work.recordCost(name,seconds)
+        work.costs=work.costs or {}
+        local row=work.costs[name] or {calls=0,total=0,max=0,slow=0}
+        work.costs[name]=row
+        row.calls=row.calls+1;row.total=row.total+seconds;row.last=seconds;row.max=math.max(row.max,seconds)
+        if seconds>=.05 then row.slow=row.slow+1 end
+    end
+    function work.performanceReport()
+        local rows={"PERFORMANCE • ELAPSED TIMES (REMOTE WAITS INCLUDED)"}
+        rows[#rows+1]=string.format("Frame average %.1f ms / worst %.1f ms / frames over 50 ms %d",(work.frameAverage or 0)*1000,(work.frameWorst or 0)*1000,work.frameSlow or 0)
+        local ranked={}
+        for name,row in pairs(work.costs or {})do ranked[#ranked+1]={name=name,row=row} end
+        table.sort(ranked,function(a,b)return a.row.total>b.row.total end)
+        for i=1,math.min(8,#ranked)do
+            local entry=ranked[i];local row=entry.row
+            rows[#rows+1]=string.format("%s: %d calls / total %.0f ms / average %.2f ms / max %.1f ms / slow %d",entry.name,row.calls,row.total*1000,row.total/row.calls*1000,row.max*1000,row.slow)
+        end
+        rows[#rows+1]="Chest probes: "..tostring(work.chestProbeRequests or 0).." / failures "..tostring(work.chestProbeFailures or 0).." / one background probe at a time"
+        rows[#rows+1]="Wall scan: "..tostring(work.wallScanChecked or 0).." slot checks / cache hits "..tostring(work.wallSiteHits or 0).." / maximum 12 slots per batch"
+        rows[#rows+1]="Totals overlap when one profiled helper calls another; elapsed times are not CPU attribution."
+        return table.concat(rows,"\n")
+    end
     function work.boundedRead(read, label)
         local done, result = false, nil
+        local started=os.clock()
         if diagnostic then diagnostic:record(label,"REQUEST STARTED","INFO",true) end
         local thread=task.spawn(function() result=table.pack(pcall(read)) done=true end)
         local deadline=os.clock()+6.5
         repeat
             if done then
+                work.recordCost("RPC "..tostring(label),os.clock()-started)
                 if not result[1] then
                     if diagnostic then diagnostic:record(label,result[2],"ERROR",true) end
                     error(result[2])
@@ -640,6 +664,7 @@ local function runIslandEscape()
             task.wait()
         until not alive or os.clock()>=deadline
         task.cancel(thread)
+        work.recordCost("RPC "..tostring(label),os.clock()-started)
         if diagnostic then diagnostic:record(label,"READ TIMED OUT; queue can continue","ERROR",true) end
         error(tostring(label).." read timed out; queue can continue")
     end
@@ -1495,6 +1520,7 @@ local function runIslandEscape()
             end
             b.Text = tostring(opts[key])
         end)
+        return b
     end
     function work.slider(parent, key, label, lo, hi, step)
         local row = make("Frame", {Size = UDim2.new(1, 0, 0, 48), BackgroundTransparency = 1}, parent)
@@ -1556,6 +1582,8 @@ local function runIslandEscape()
         flags.escape, flags.emergencyHover = false, false
         opts.onlyNeeded, opts.fastHarvest, opts.avoidEnemies, opts.safeCombat = true, true, true, true
         opts.interval = 0
+        opts.chestHoldPadding = .15
+        if work.chestHoldField then work.chestHoldField.Text=tostring(opts.chestHoldPadding) end
         for _, render in pairs(toggles) do render() end
         motion.cancel("LONG RUN PRESET APPLIED")
         if work.releaseHover then work.releaseHover(true) end
@@ -1874,7 +1902,7 @@ local function runIslandEscape()
     text(explorationSafety,"Applies only to chests, puzzles, artifacts and selected travel. It does not remove server walls or change combat/camp safety.")
     toggle(group(explore, "TRAILS AND CLUES"), "followFootprints", "Follow chest footprints and objective hints")
     toggle(movementOptions, "autoSprint", "Use native sprint while travelling")
-    number(chestUI, "chestHoldPadding", "CHEST EXTRA HOLD (SECONDS)", 0, 4)
+    work.chestHoldField=number(chestUI, "chestHoldPadding", "CHEST EXTRA HOLD (SECONDS)", 0, 4)
     work.hintLabel = text(group(explore,"LIVE OBJECTIVE HINTS"), "READING LOADED ARTIFACT AND CHEST CLUES")
     work.liveLabel = make("TextLabel", {AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 10, 1, -10),
         Size = UDim2.fromOffset(math.min(285, viewport.X - 20), 82), BackgroundColor3 = Color3.fromRGB(8, 12, 18),
@@ -1906,10 +1934,14 @@ local function runIslandEscape()
     end)
     local diagnosticText = text(diag, "NO ERRORS RECORDED")
     diagnosticText.LayoutOrder = 100000
-    local function refreshDiagnostics()
+    local function refreshDiagnostics(force)
+        if not force and os.clock()<(work.nextDiagnosticBuild or 0) then return end
+        work.nextDiagnosticBuild=os.clock()+(work.selectedPage=="Diagnostics" and .5 or 2)
         local lines = {}
         for key in pairs(toggles) do
-            lines[#lines + 1] = key:upper() .. ": " .. (flags[key] and (taskStatus[key] or "WAITING") or "OFF")
+            if key:sub(1,7)~="bundle_" and key~="wallMain" then
+                lines[#lines + 1] = key:upper() .. ": " .. (flags[key] and (taskStatus[key] or "WAITING") or "OFF")
+            end
         end
         table.sort(lines)
         local _, human = root()
@@ -1921,16 +1953,18 @@ local function runIslandEscape()
         work.diagnosticSnapshot = "PLACE "..game.PlaceId.." | DAY "..tostring(day and day.Value or "UNKNOWN").." | PHASE "..tostring(phase and phase.Value or "UNKNOWN")
             .."\nHP "..tostring(human and human.Health or "NO CHARACTER").." | BAG "..tostring(used).."/"..tostring(capacity).." | REQUESTS "..work.sent
             .."\nAUTO FARM "..tostring(flags.autoFarm).." | CURRENT JOB "..tostring(work.active or "NONE").."\nQUEUE: " .. tostring(taskStatus.queue or "IDLE") .. "\nMOVEMENT: " .. tostring(motion.owner or "IDLE") .. "\nHOSTILE SCAN: "..tostring(opts.threatScanRadius).." STUDS\nMRBEAST: "..tostring(work.questStatus or "WAITING").."\n"..tostring(questInfo.Text).."\n" .. table.concat(lines, "\n") .. "\n"..(work.automationReport and work.automationReport()or"").."\n\nRECENT ERRORS\n" .. (#recentErrors > 0 and table.concat(recentErrors, "\n") or "NONE")
-        diagnosticText.Text = work.diagnosticSnapshot .. "\n\n" .. diagnostic:summary(true) .. "\n\nRECENT LOG\n" .. diagnostic:tail()
+        if force or work.selectedPage=="Diagnostics" then
+            diagnosticText.Text = work.diagnosticSnapshot .. "\n\n" .. diagnostic:summary(true) .. "\n\nRECENT LOG\n" .. diagnostic:tail()
+        end
     end
     button(diag, "COPY DIAGNOSTICS", function()
-        refreshDiagnostics()
+        refreshDiagnostics(true)
         assert(type(setclipboard) == "function", "Clipboard unavailable")
         setclipboard(diagnostic:report(work.diagnosticSnapshot))
         say("DIAGNOSTICS COPIED")
     end)
     button(diag, "SAVE FULL LOG", function()
-        refreshDiagnostics()
+        refreshDiagnostics(true)
         local file, err = diagnostic:saveReport(work.diagnosticSnapshot)
         assert(file, err)
         say("LOG SAVED: " .. file)
@@ -4347,15 +4381,94 @@ local function runIslandEscape()
         end
         return state
     end
+    function work.chestKnowledgeFor(model)
+        local scene=world()
+        if not work.chestKnowledge or work.chestKnowledgeScene~=scene then
+            work.chestKnowledgeScene=scene
+            work.chestKnowledge=setmetatable({}, {__mode="k"})
+        end
+        local row=work.chestKnowledge[model]
+        if not row then row={};work.chestKnowledge[model]=row end
+        return row
+    end
+    function work.markChestOpened(model)
+        local row=work.chestKnowledgeFor(model)
+        row.opened=true;row.openedUntil=math.huge
+        local state=work.chestStates and work.chestStates[model]
+        if state then state.acceptedAt=state.acceptedAt or os.clock() end
+        local marker=work.espMarkers and work.espMarkers[model]
+        if marker then
+            marker.billboard:Destroy()
+            if marker.highlight then marker.highlight:Destroy() end
+            work.espMarkers[model]=nil
+        end
+    end
+    function work.chestOpened(model)
+        local state=work.chestStates and work.chestStates[model]
+        if state and (state.acceptedAt or state.complete) then return true end
+        return work.chestKnowledgeFor(model).opened==true
+    end
+    function work.readChestField(model,field)
+        local row=work.chestKnowledgeFor(model)
+        if field=="opened" and work.chestOpened(model) then return true end
+        local now=os.clock()
+        if row[field]~=nil and now<(row[field.."Until"] or 0) then return row[field] end
+        local prompt=model:FindFirstChildWhichIsA("ProximityPrompt",true)
+        -- Native ChestClient only enables its prompt when neither opened nor locked.
+        local state=work.chestStates and work.chestStates[model]
+        if prompt and prompt.Enabled and not (state and state.requestedAt) then
+            row[field]=false;row[field.."Until"]=now+1
+            return false
+        end
+        if now<(row.retryAt or 0) then error("Chest status deferred after a failed read") end
+        local ok,value=pcall(call,"ChestService",field=="opened" and "isOpened" or "isLocked",model)
+        if not ok then
+            row.retryAt=os.clock()+15;failed[model]=row.retryAt
+            error(value)
+        end
+        row[field]=value==true;row[field.."Until"]=os.clock()+(field=="opened" and 1 or 3)
+        if field=="opened" and value then work.markChestOpened(model) end
+        return row[field]
+    end
+    function work.probeChest(model)
+        if work.chestOpened(model) then return end
+        local row=work.chestKnowledgeFor(model)
+        local state=work.chestStates and work.chestStates[model]
+        if state and (state.requestedAt or work.chestResume==model) and not state.acceptedAt then return end
+        local now=os.clock()
+        local prompt=model:FindFirstChildWhichIsA("ProximityPrompt",true)
+        if prompt and prompt.Enabled then row.opened=false;row.openedUntil=now+2;return end
+        if work.chestProbeBusy or now<(work.chestProbeAt or 0) or now<(row.openedUntil or 0)
+            or now<(row.retryAt or 0) then return end
+        work.chestProbeBusy=true;row.pending=true;work.chestProbeAt=now+.5
+        local scene=world()
+        work.chestProbeRequests=(work.chestProbeRequests or 0)+1
+        task.spawn(function()
+            local ok,value=pcall(call,"ChestService","isOpened",model)
+            if alive and model.Parent and scene==world() then
+                if ok then
+                    row.opened=value==true;row.openedUntil=os.clock()+30
+                    if value then work.markChestOpened(model) end
+                else
+                    row.retryAt=os.clock()+30;work.chestProbeAt=os.clock()+5
+                    work.chestProbeFailures=(work.chestProbeFailures or 0)+1
+                end
+            end
+            row.pending=nil;work.chestProbeBusy=nil
+        end)
+    end
     function work.chestCandidate()
         local rows = config().chest.byId
         local resume = work.chestResume
         if resume and not resume.Parent then work.chestResume = nil end
         if resume and resume.Parent and not (failed[resume] and failed[resume] > os.clock())
+            and not (work.chestKnowledge and work.chestKnowledge[resume] and work.chestKnowledge[resume].pending)
+            and not (work.chestStates and work.chestStates[resume] and work.chestStates[resume].complete)
             and work.safeResource(resume) then return resume end
         return nearest(work.models("chests"), function(model)
             local state = work.chestStates and work.chestStates[model]
             return model:IsA("Model") and rows[model.Name] and not (state and state.complete)
+                and not (work.chestKnowledge and work.chestKnowledge[model] and work.chestKnowledge[model].pending)
                 and not (failed[model] and failed[model] > os.clock()) and work.safeResource(model)
         end)
     end
@@ -4377,7 +4490,7 @@ local function runIslandEscape()
         if not model then return false end
         local state = work.chestState(model)
         if not state.requestedAt then
-            if call("ChestService", "isOpened", model) then
+            if work.readChestField(model,"opened") then
                 state.acceptedAt, state.requestedAt = os.clock(), os.clock()
                 state.recoveredOpen = true
                 -- A previous interrupted opener may have left its loot on the ground.
@@ -4387,7 +4500,7 @@ local function runIslandEscape()
                         and (point - center).Magnitude <= 16 then state.before[drop] = nil end
                 end
             end
-            if call("ChestService", "isLocked", model) then failed[model] = os.clock() + 1 return false end
+            if not state.acceptedAt and work.readChestField(model,"locked") then failed[model] = os.clock() + 1 return false end
         end
         local info = config().chest.byId[model.Name]
         local radius = math.max(1, (tonumber(info.openDistance) or 10) - 1)
@@ -4397,7 +4510,13 @@ local function runIslandEscape()
         -- PrimaryPart. A model pivot is not necessarily that activation point.
         local approach = prompt and prompt.Parent or model.PrimaryPart or model
         if approach and approach:IsA("Attachment") then approach = approach.Parent end
-        if not travel(approach, key, radius) then return false end
+        if not travel(approach, key, radius) then
+            if not work.preempted then
+                failed[model]=os.clock()+12
+                note(key,"CHEST HAS NO SAFE APPROACH • BACKING OFF 12 SECONDS")
+            end
+            return false
+        end
         work.chestResume = model
         if not state.requestedAt then
             local prompted, heldFull = work.interactPrompt(model, key, opts.chestHoldPadding)
@@ -4409,6 +4528,7 @@ local function runIslandEscape()
             -- fall back to the verified native call after a complete E hold.
             if prompted ~= true then call("ChestService", "requestOpen", model) end
             state.requestedAt = state.requestedAt or os.clock()
+            work.chestKnowledgeFor(model).openedUntil=0
         end
         local character, serial = player.Character, motion.serial
         local maximum = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
@@ -4418,7 +4538,7 @@ local function runIslandEscape()
             local now = os.clock()
             if not state.acceptedAt and now >= (state.nextCheck or 0) then
                 state.nextCheck = now + 0.4
-                if call("ChestService", "isOpened", model) then state.acceptedAt = now end
+                if work.readChestField(model,"opened") then state.acceptedAt = now;work.markChestOpened(model) end
             end
             if not state.acceptedAt and now - state.requestedAt > 3 then
                 state.requestedAt = nil
@@ -4633,14 +4753,17 @@ local function runIslandEscape()
         local cache=work.questCache
         local canFetch=true
         if type(root)=="function"then local _,human=root();canFetch=not human or human.Health>0 end
-        if canFetch and not work.questFetchPending and(not cache or os.clock()-cache.at>=(force and .5 or 2))then
+        if canFetch and os.clock()>=(work.questReadRetryAt or 0) and not work.questFetchPending and(not cache or os.clock()-cache.at>=(force and .5 or 2))then
             local token={character=player.Character,generation=work.questGeneration or 0};work.questFetchPending=token
             task.spawn(function()
                 local ok,index,alt,revision=pcall(function()return work.boundedRead(q.client.fetchQuest,"MrBeast quest")end)
                 if work.questFetchPending==token then work.questFetchPending=nil end
                 if alive and ok and player.Character==token.character and scene==world()
                     and token.generation==(work.questGeneration or 0)then apply(index,alt,revision)
-                elseif not ok and scene==world()then work.questStatus="QUEST SYNC FAILED • KEEPING REQUEST AND RETRYING"end
+                elseif not ok and scene==world()then
+                    work.questStatus="QUEST SYNC FAILED • KEEPING REQUEST AND RETRYING"
+                    if tostring(index):find("timed out",1,true) then work.questReadRetryAt=os.clock()+5 end
+                end
             end)
         end
         cache=work.questCache
@@ -4773,6 +4896,7 @@ local function runIslandEscape()
                 local state = work.chestState(model)
                 state.acceptedAt = state.acceptedAt or os.clock()
                 state.requestedAt = state.requestedAt or state.acceptedAt
+                work.markChestOpened(model)
             end)
         end
         local service = RS.Engine.Service:FindFirstChild("MrbeastChoice")
@@ -5829,6 +5953,7 @@ local function runIslandEscape()
         return acted
     end
     function work.refreshNeeds()
+        if flags.autoFarm==false then return end
         if work.refreshAt and os.clock() < work.refreshAt then
             return
         end
@@ -5900,8 +6025,11 @@ local function runIslandEscape()
         water = "NO READY COCONUTS OR BAG FULL",
     }
     function work.jobEnabled(job)
-        if flags.autoFarm == false or work.finished or work.roundLost() or work.nightPaused(job) then return false end
-        return job.enabled and job.enabled() or (not job.enabled and flags[job.key] == true)
+        if flags.autoFarm == false or work.finished then return false end
+        if job.enabled then
+            if not job.enabled() then return false end
+        elseif flags[job.key]~=true then return false end
+        return not work.roundLost() and not work.nightPaused(job)
     end
     function work.keyEnabled(key)
         if flags.autoFarm == false or work.finished or work.roundLost() then return false end
@@ -5977,15 +6105,16 @@ local function runIslandEscape()
         return rank[key] or 11
     end
     function work.pick(jobs, now, ceiling, urgentOnly)
+        if flags.autoFarm==false then return end
         local best, bestScore
         for _, job in ipairs(jobs) do
             if job.key ~= work.skipJob and now >= (due[job.key] or 0) then
                 local ok, ready, rank = pcall(function()
+                    if not work.jobEnabled(job)then return false,math.huge end
                     local rank = work.rank(job)
                     if work.hover and job.key ~= "nightHold" and job.key ~= "fuel" and job.key ~= "eat" and job.key~="foodCache" then return false,rank end
                     if urgentOnly and not work.interruptsInteraction(job) then return false,rank end
                     if (ceiling and rank >= ceiling) or (bestScore and rank >= bestScore) then return false, rank end
-                    if not work.jobEnabled(job)then return false,rank end
                     local previous=work.readinessKey;work.readinessKey=job.key
                     local ok,result=pcall(function()return not job.ready or job.ready()end)
                     work.readinessKey=previous
@@ -6803,8 +6932,15 @@ local function runIslandEscape()
             local category = work.espCategory(model, folder)
             local point = pos(model)
             if not category or not flags[category] or not point then return end
+            if category=="espChests" and work.chestOpened(model) then return end
             local distance = (point - r.Position).Magnitude
-            if distance <= opts.espDistance then targets[#targets + 1] = {model = model, category = category, distance = distance} end
+            if distance <= opts.espDistance then
+                if category=="espChests" then
+                    work.probeChest(model)
+                    if work.chestOpened(model) then return end
+                end
+                targets[#targets + 1] = {model = model, category = category, distance = distance}
+            end
         end
         local groups = {
             {"resources", "Static", flags.espTrees or flags.espStone or flags.espIron or flags.espOtherResources},
@@ -6850,7 +6986,8 @@ local function runIslandEscape()
                 local item = c.item.byDisplayName[model.Name]
                 local title = item and itemLabel("item", item.id, item) or model.Name
                 local human = model:FindFirstChildOfClass("Humanoid")
-                marker.label.Text = title .. " • " .. math.floor(row.distance) .. " STUDS" .. (human and (" • HP " .. math.ceil(human.Health)) or "")
+                local label=title .. " • " .. math.floor(row.distance) .. " STUDS" .. (human and (" • HP " .. math.ceil(human.Health)) or "")
+                if marker.label.Text~=label then marker.label.Text=label end
             end
         end
         for model, marker in pairs(work.espMarkers) do
@@ -7612,13 +7749,22 @@ local function runIslandEscape()
                 if point and not seenStations[model] then stations[#stations+1]=point;seenStations[model]=true end
             end
         end
+        local tileRows=tiles:GetChildren()
+        local signatures={}
+        for _,point in ipairs(stations)do signatures[#signatures+1]=tostring(point) end
+        table.sort(signatures)
+        local signature=tostring(#tileRows).."|"..table.concat(signatures,"|")
+        local cache=work.wallRegionCache
+        if cache and cache.scene==scene and cache.signature==signature and os.clock()<cache.expires then
+            return cache.region,cache.stations,cache.uncovered
+        end
         local rows={}
         local function contains(row,point)
             local q=row.frame:PointToObjectSpace(point)
             return math.abs(q.X)<=row.size.X/2+.5 and math.abs(q.Z)<=row.size.Z/2+.5
                 and math.abs(q.Y)<=math.max(30,row.size.Y/2+10)
         end
-        for _,tile in ipairs(tiles:GetChildren())do
+        for _,tile in ipairs(tileRows)do
             local box=tile:FindFirstChild("BoundingBox")
             if box and box:IsA("BasePart")then
                 local name=tile.Name:lower()
@@ -7665,6 +7811,7 @@ local function runIslandEscape()
             for _,row in ipairs(region)do if contains(row,point)then covered=true break end end
             if not covered then uncovered=uncovered+1 end
         end
+        work.wallRegionCache={scene=scene,signature=signature,region=region,stations=stations,uncovered=uncovered,expires=os.clock()+1}
         return region,stations,uncovered
     end
     function work.inBaseBeach(point,size)
@@ -7757,6 +7904,11 @@ local function runIslandEscape()
             if not exit then d=d+1000000 end
             if slot.layer==1 and(not distance or d<distance)then gate,distance=p,d end
         end
+        table.sort(candidates,function(a,b)
+            if a.layer~=b.layer then return a.layer<b.layer end
+            local origin=center or Vector3.new(0,0,0)
+            return (a.box.Position-origin).Magnitude<(b.box.Position-origin).Magnitude
+        end)
         local plan={scene=scene,signature=signature,id=asset.id,slots=candidates,gate=gate,gateWidth=math.max(10,length*1.5),
             regionTiles=#beaches,stationCount=#(stations or {}),uncoveredStations=uncovered or 0}
         work.wallPlanCache=plan
@@ -7805,27 +7957,37 @@ local function runIslandEscape()
         local api=module("FreeBuild")
         if not plan or not api then return end
         work.wallRetry=work.wallRetry or{}
-        local r=root()
-        local best,score
-        local total,occupied,blocked=0,0,0
-        for index,slot in ipairs(plan.slots)do
-            local p=slot.box.Position
+        local cached=work.wallSiteCache
+        if cached and cached.plan==plan and os.clock()<cached.expires
+            and not work.wallOccupied(cached.site.box,asset) and work.safeWorkPoint(cached.site.box.Position,3) then
+            work.wallSiteHits=(work.wallSiteHits or 0)+1
+            return cached.site
+        end
+        local scan=work.wallScan
+        if not scan or scan.plan~=plan then scan={plan=plan,index=1};work.wallScan=scan end
+        local checked,blocked,occupied=0,0,0
+        for _=1,math.min(12,#plan.slots)do
+            local index=scan.index;scan.index=index%#plan.slots+1
+            local slot=plan.slots[index];local p=slot.box.Position
+            checked=checked+1;work.wallScanChecked=(work.wallScanChecked or 0)+1
             local gateGap=plan.gate and Vector3.new(p.X-plan.gate.X,0,p.Z-plan.gate.Z).Magnitude<plan.gateWidth
-            if not gateGap then total=total+1 end
             if not gateGap and os.clock()>=(work.wallRetry[index]or 0)and work.insideBorder(p)then
                 local ground=work.wallGround(p)
                 if ground and work.safeWorkPoint(ground,3)then
                     local frame=CFrame.new(0,ground.Y+asset.size.Y/2-p.Y,0)*slot.box
                     if work.wallOccupied(frame,asset)then occupied=occupied+1
                     elseif work.wallFooting(frame,asset)and not api.checkOverlap(frame,asset.size,{},.1)then
-                        local value=slot.layer*100000+(r and(frame.Position-r.Position).Magnitude or 0)
-                        if not score or value<score then best,score={index=index,box=frame,frame=frame*asset.offset:Inverse(),asset=asset,plan=plan},value end
+                        local site={index=index,box=frame,frame=frame*asset.offset:Inverse(),asset=asset,plan=plan}
+                        work.wallSiteCache={plan=plan,site=site,expires=os.clock()+.75}
+                        work.wallStatus="BASE BEACH "..tostring(plan.regionTiles).." TILES / "..tostring(plan.stationCount).." STATIONS • "..#plan.slots.." TOTAL SLOTS • NEXT FREE SLOT "..index.." / LAYER "..slot.layer.." • "..tostring(plan.uncoveredStations).." STATIONS OUTSIDE REGION"
+                        work.wallScanMore=true
+                        return site
                     else blocked=blocked+1 end
                 else blocked=blocked+1 end
             elseif not gateGap then blocked=blocked+1 end
         end
-        work.wallStatus="BASE BEACH "..tostring(plan.regionTiles).." TILES / "..tostring(plan.stationCount).." STATIONS • "..occupied.." WALLS PRESENT / "..total.." PLANNED SLOTS • "..blocked.." BLOCKED • "..tostring(plan.uncoveredStations).." STATIONS OUTSIDE LOADED REGION"
-        return best
+        work.wallScanMore=#plan.slots>12
+        work.wallStatus="BASE BEACH "..tostring(plan.regionTiles).." TILES / "..tostring(plan.stationCount).." STATIONS • "..#plan.slots.." TOTAL SLOTS (ENTRANCE INCLUDED) • LAST BATCH "..checked.." CHECKED / "..occupied.." PRESENT / "..blocked.." BLOCKED • "..tostring(plan.uncoveredStations).." STATIONS OUTSIDE REGION"
     end
     function work.wallGoal()
         if not flags.greatWall then return end
@@ -7840,8 +8002,8 @@ local function runIslandEscape()
     end
     function work.wallReady()
         if os.clock()<(work.wallCheckAt or 0)then return work.wallReadyValue==true end
-        work.wallCheckAt=os.clock()+1
         local goal=work.wallGoal()
+        work.wallCheckAt=os.clock()+(work.wallScanMore and .1 or 1)
         work.wallReadyValue=goal and(count(goal.info.displayName)>0 or work.buildingSynced and work.structureStation()~=nil and work.goalRunnable(goal))or false
         return work.wallReadyValue
     end
@@ -7856,6 +8018,7 @@ local function runIslandEscape()
             local before=count(goal.info.displayName)
             call("FreeBuild","requestPlace",goal.id,site.frame);work.sent=work.sent+1
             local placed=work.await(key,function()return work.wallOccupied(site.box,site.asset)and count(goal.info.displayName)<before end,4)
+            work.wallSiteCache=nil;work.wallCheckAt=0
             if not placed then work.wallRetry[site.index]=os.clock()+5 end
             note(key,placed and"EXI WALL PLACEMENT CONFIRMED"or"WALL PLACEMENT / INVENTORY RECEIPT UNCONFIRMED")
             return placed
@@ -7871,7 +8034,7 @@ local function runIslandEscape()
         return pickups(key,true)or gatherResource(key,true)
     end
     function work.automationReport()
-        local c=config();local rows={"AUTOMATION AUDIT v4 • LONG RUN / CONFIRMED LOOT"}
+        local c=config();local rows={"AUTOMATION AUDIT v5 • CHEST CACHE / PERFORMANCE"}
         local torch=work.shadowWeapon()
         rows[#rows+1]="Shadow: "..(not flags.killShadow and"OFF"or torch and"TORCH AVAILABLE; CONFIRMS TorchHits"or"BLOCKED: NO NATIVE LIGHT-SOURCE TOOL")
         rows[#rows+1]="Craft station: "..(work.stationSynced and"SYNCED"or"WAITING FOR SERVER STOCK")
@@ -7891,6 +8054,7 @@ local function runIslandEscape()
         rows[#rows+1]="Defence urgent: "..tostring(work.combatUrgent()).." | Guard radius "..tostring(opts.guardRadius).." | Evade recovery "..tostring(math.max(0,(work.evadeRecoverUntil or 0)-os.clock()))
         rows[#rows+1]="Bulk collection: "..tostring(flags.bulkCollect).." | Recipe fire level: "..tostring((work.fireState()or{}).level or"UNKNOWN")
         rows[#rows+1]="Next reward retry in: "..tostring(math.max(0,math.ceil((work.choiceRetryAt or 0)-os.clock()))).."s"
+        rows[#rows+1]=work.performanceReport and work.performanceReport() or "PERFORMANCE: NO SAMPLES YET"
         return table.concat(rows,"\n")
     end
     function work.followTrail()
@@ -8437,6 +8601,15 @@ local function runIslandEscape()
     end
     work.jobs, work.jobsByKey = jobsList, {}
     for _, job in ipairs(jobsList) do work.jobsByKey[job.key] = job end
+    for _,name in ipairs({"pick","espTick","wallSite","wallRegion","planProgression","hostiles","sceneIndex","automationReport"})do
+        local original=work[name]
+        if original then work[name]=function(...)
+            local started=os.clock()
+            local result=table.pack(original(...))
+            work.recordCost(name,os.clock()-started)
+            return table.unpack(result,1,result.n)
+        end end
+    end
     function work.settleCuts()
         work.captureCampDrops()
         work.pollLateDrops()
@@ -8537,6 +8710,10 @@ local function runIslandEscape()
                     return
                 end
                 work.bindFastServices()
+                if flags.autoFarm==false then
+                    queueLabel.Text="JOB: MASTER PAUSED"
+                    return
+                end
                 safely("survival sync", work.survivalSync)
                 safely("material planning", work.refreshNeeds)
                 work.settleCuts()
@@ -8623,17 +8800,23 @@ local function runIslandEscape()
                 safely("diagnostic view", refreshDiagnostics)
                 work.nextDiagnosticAt = os.clock() + 0.5
             end
-            local wakeAt = os.clock() + math.max(0, opts.interval)
+            local delay=flags.autoFarm==false and .15 or math.max(0,opts.interval)
+            local wakeAt = os.clock() + delay
             repeat
                 task.wait()
-                local ready = work.pick(jobsList, os.clock(), 9)
-                if ready then break end
+                if delay>0 and flags.autoFarm~=false then
+                    local ready = work.pick(jobsList, os.clock(), 9)
+                    if ready then break end
+                end
             until not alive or os.clock() >= wakeAt
         end
     end)
     local hoverElapsed=0
     connections[#connections+1]=game:GetService("RunService").Heartbeat:Connect(function(dt)
         work.frameDuration = dt
+        work.frameAverage=work.frameAverage and (work.frameAverage*.95+dt*.05) or dt
+        work.frameWorst=math.max(work.frameWorst or 0,dt)
+        if dt>.05 then work.frameSlow=(work.frameSlow or 0)+1 end
         hoverElapsed=hoverElapsed+dt
         if hoverElapsed>=.15 then
             hoverElapsed=0
