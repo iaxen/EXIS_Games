@@ -195,6 +195,7 @@ local function runIslandEscape()
     local recentErrors = {}
     local opts = {
         move = "Walk",
+        useRefuge=false,keepRefugeLocked=false,unlockObjectives=true,
         teamRole = "Custom", chunkRevisit = 30, campWorkRadius = 120, travelRation = 0,
         interval = 0,
         schedulerVersion = 4,
@@ -550,8 +551,16 @@ local function runIslandEscape()
                     opts.taskMaterialsVersionLoaded = d.options.taskMaterialsVersion == 1
                     if d.options.evadeMove == "Walk" or d.options.evadeMove == "Tween" or d.options.evadeMove == "Teleport" then opts.evadeMove = d.options.evadeMove end
                     if type(d.options.espLabelsOnly) == "boolean" then opts.espLabelsOnly = d.options.espLabelsOnly end
-                    for _, name in ipairs({"onlyNeeded", "fastHarvest", "emergencyEscape", "avoidEnemies", "exploreOutsideBorder"}) do
+                    for _, name in ipairs({"onlyNeeded", "fastHarvest", "emergencyEscape", "avoidEnemies", "exploreOutsideBorder","useRefuge","keepRefugeLocked","unlockObjectives"}) do
                         if type(d.options[name]) == "boolean" then opts[name] = d.options[name] end
+                    end
+                    local refuge=d.options.refuge
+                    if type(refuge)=="table"then
+                        local valid=true
+                        for _,name in ipairs({"x","y","z"})do local n=refuge[name];if type(n)~="number"or n~=n or math.abs(n)>1000000 then valid=false end end
+                        if valid then opts.refuge={x=refuge.x,y=refuge.y,z=refuge.z,
+                            tileId=type(refuge.tileId)=="string"and refuge.tileId:sub(1,200)or nil,
+                            seed=(type(refuge.seed)=="number"or type(refuge.seed)=="string")and refuge.seed or nil}end
                     end
                     if type(d.options.codes) == "string" then opts.codes = d.options.codes:sub(1, 4096) end
                     if ({Custom=true,Mixed=true,Explorer=true,Defender=true,Builder=true,Gatherer=true})[d.options.teamRole] then opts.teamRole=d.options.teamRole end
@@ -921,13 +930,15 @@ local function runIslandEscape()
             return {}
         end
         local result = {}
+        local indoor=work.refugeTravel and(p-work.refugeTravel).Magnitude<2 or work.refugeAllowsPoint and work.refugeAllowsPoint(p)
         local distance = math.max(0, math.min(4, radius * 0.6))
         local height = math.max(2, h.HipHeight + r.Size.Y / 2)
         for i = -1, 7 do
             local angle = i * math.pi / 4
             local offset=i<0 and 0 or distance
             local probe = p + Vector3.new(math.cos(angle) * offset, 0, math.sin(angle) * offset)
-            local floor = motion.floor(probe, target, 120, 12)
+            if indoor then probe=Vector3.new(probe.X,opts.refuge.y,probe.Z)end
+            local floor = motion.floor(probe, target, 120, indoor and 0 or 12)
             if floor then
                 local stand = floor + Vector3.new(0, height, 0)
                 local horizontal = Vector2.new(stand.X - p.X, stand.Z - p.Z).Magnitude
@@ -1774,7 +1785,7 @@ local function runIslandEscape()
         toggle(campProjects,"greatWall","Great Wall of EXI • three beach layers", "Auto gathers wood, crafts the native wall and places three layers around the whole connected station beach, including Basic Block. Keeps an entrance and replaces destroyed walls. Survival and gear come first.")
         toggle(group(p.explore,"BOAT PREPARATION"), "buildBoat", "Build the boat", "Uses live recipe / contribution requirements. Building does not trigger escape.")
         toggle(group(p.quests, "CHOICE REWARDS"), "choiceRewards", "Take MrBeast choice rewards", "Selects useful rewards automatically, including an already-open menu.")
-        toggle(group(p.explore, "ARTIFACTS"), "artifacts", "Fetch the four artifacts", "Compass, Map, Plastic Bucket and Radio. Locked or unsafe locations are skipped.")
+        toggle(group(p.explore, "ARTIFACTS"), "artifacts", "Fetch the four artifacts", "Compass, Map, Plastic Bucket and Radio. Clears native unlock requirements when enabled, then holds the artifact prompt. Unsafe fights wait for recovery.")
         local night = group(p.survival, "NIGHT SURVIVAL")
         toggle(night,"nightExplore","Explore at night after loaded hostiles are cleared", "Keeps checking for newly spawned enemies; unloaded enemies cannot be verified.")
         toggle(night, "holdNight", "Pause routine work at night", "Optional. Turn off to keep working at safe targets inside the border. Defence and urgent survival always take priority.")
@@ -2001,6 +2012,12 @@ local function runIslandEscape()
     local explorationSafety=group(explore,"EXPLORATION BORDER")
     switch(explorationSafety,"ALLOW EXPLORATION OUTSIDE UNLOCKED BORDER",function()return opts.exploreOutsideBorder end,function(v)opts.exploreOutsideBorder=v end)
     text(explorationSafety,"Applies only to chests, puzzles, artifacts and selected travel. It does not remove server walls or change combat/camp safety.")
+    local refugeUI=group(explore,"EMERGENCY REFUGE / UNLOCK TASKS")
+    button(refugeUI,"SET REFUGE HERE • STAND INSIDE FIRST",function()work.setRefuge()end)
+    toggles.refugeUse=switch(refugeUI,"USE SAVED EMERGENCY REFUGE",function()return opts.useRefuge end,function(v)opts.useRefuge=v;save()end)
+    switch(refugeUI,"KEEP REFUGE ROOM LOCKED",function()return opts.keepRefugeLocked end,function(v)opts.keepRefugeLocked=v;work.unlockPlan=nil;save()end)
+    switch(refugeUI,"CLEAR NATIVE CHEST / ARTIFACT UNLOCK TASKS",function()return opts.unlockObjectives end,function(v)opts.unlockObjectives=v;work.unlockPlan=nil;save()end)
+    text(refugeUI,"Save the tribal room from inside it. Lock protection is optional and applies to the saved refuge tile; other tiles still get native unlock tasks. New map seeds require a new refuge. Damage inside temporarily rejects the point.")
     toggle(group(explore, "TRAILS AND CLUES"), "followFootprints", "Follow chest footprints and objective hints")
     toggle(movementOptions, "autoSprint", "Use native sprint while travelling")
     work.chestHoldField=number(chestUI, "chestHoldPadding", "CHEST EXTRA HOLD (SECONDS)", 0, 4)
@@ -2736,7 +2753,8 @@ local function runIslandEscape()
         end
         local hunger = h:GetAttribute("hunger")
         local max = h:GetAttribute("maxHunger") or 100
-        if h.Health / h.MaxHealth * 100 > opts.health and (not hunger or hunger / max * 100 > opts.hunger) then
+        local healthTarget=work.recoveryNeeded and work.recoveryNeeded()and math.max(85,opts.health)or opts.health
+        if h.Health / h.MaxHealth * 100 > healthTarget and (not hunger or hunger / max * 100 > opts.hunger) then
             return
         end
         if work.noFood() and work.takeMeal and not work.takeMeal("eat") then return false end
@@ -3586,6 +3604,7 @@ local function runIslandEscape()
     end
     function work.safeWorkPoint(point, margin)
         if not work.insideBorder(point) then return false end
+        if work.refugeAllowsPoint and work.refugeAllowsPoint(point)then return true end
         if opts.avoidEnemies and work.threatEnvelope and work.threatEnvelope(point,1.25)<(margin or 0)then return false end
         for _, row in ipairs(work.hostiles()) do
             if row.model.Parent and row.human.Health > 0 then
@@ -3604,6 +3623,7 @@ local function runIslandEscape()
             local anchor=work.campDropAnchor();local center=anchor and pos(anchor);local point=pos(model)
             if not center or not point or(point-center).Magnitude>math.min(45,tonumber(opts.campWorkRadius)or 120)then return false end
         end
+        if work.weatherWorkAllowed and not work.weatherWorkAllowed(pos(model))then return false end
         local id = model:GetAttribute("resourceId")
         local info = id and config().worldResource.byId[id]
         local hp = model:GetAttribute("hp")
@@ -3935,11 +3955,17 @@ local function runIslandEscape()
         if not opts.avoidEnemies then return end
         local r, human = root()
         if not r then return end
+        if work.refugeAllowsPoint and work.refugeAllowsPoint(r.Position)then return end
         local _, target = work.danger(r.Position, opts.dangerRadius)
         local damaged = work.observedHealth and human.Health < work.observedHealth
         work.observedHealth = human.Health
         if damaged then work.damageUntil = math.max(work.damageUntil or 0,os.clock()+1) end
         local incoming=work.incomingThreat and work.incomingThreat(r.Position)
+        local fightingNow=({combat=true,hunt=true,foodHunt=true,autoAttack=true,unlockObjective=true,shadowHunt=true})[work.active]
+        -- Keep the large travel warning buffer, but use actual attack reach during a fight.
+        if fightingNow and work.attackEnvelope and work.attackEnvelope(r.Position,.7)>1
+            and human.Health/human.MaxHealth*100>math.max(60,opts.retreatHealth)and os.clock()>=(work.damageUntil or 0)
+            and(not work.recoveryNeeded or not work.recoveryNeeded())then return end
         if incoming and not work.hover then
             if opts.teamRole and opts.teamRole~="Custom" and opts.teamRole~="Defender" and not flags.roleDefender then
                 local healthyBuilder=(flags.roleBuilder or opts.teamRole=="Builder") and human.Health/human.MaxHealth*100>=80
@@ -3947,7 +3973,7 @@ local function runIslandEscape()
                 if not healthyBuilder then return incoming end
             end
             local phase=work.attackPhase and work.attackPhase(incoming)or "unknown"
-            local fighting=work.active=="combat"or work.active=="hunt"or work.active=="autoAttack"
+            local fighting=work.active=="combat"or work.active=="hunt"or work.active=="autoAttack"or work.active=="unlockObjective"
             -- A healthy native-range counter may finish one real hit window.
             -- Keep evasion for distant predicted contact, actual strike phases,
             -- new damage, low health and crowds; unknown animation alone must
@@ -3963,7 +3989,7 @@ local function runIslandEscape()
             if p and Vector3.new(r.Position.X-p.X,0,r.Position.Z-p.Z).Magnitude <= work.enemyReach(target)+3 then return target end
         end
         if work.hover then return end -- the independent hover guard handles movement; ground evasion cannot move an anchored root.
-        local fighting = work.active == "combat" or work.active == "hunt" or work.active == "autoAttack" or work.huntingNeeds ~= nil
+        local fighting = work.active == "combat" or work.active == "hunt" or work.active == "autoAttack" or work.active=="unlockObjective" or work.huntingNeeds ~= nil
         if not fighting then
             if (flags.combat or flags.aura or flags.autoAttack) and human.Health / human.MaxHealth * 100 > opts.retreatHealth
                 and os.clock() >= (work.damageUntil or 0) then
@@ -4023,15 +4049,17 @@ local function runIslandEscape()
     end
     function work.safeDestination(point, key)
         if not work.insideBorder(point,nil,key) then return false end
+        if work.refugeTravel and(point-work.refugeTravel).Magnitude<2 and work.refugePoint and work.refugePoint()then return true end
         local owner = work.active or key
         local risk = work.danger(point, opts.dangerRadius)
+        if work.kiting then return work.attackEnvelope(point,.7)>1 and work.combatClear(point)end
         if owner == "evade" or work.escapeMove then
             if work.threatEnvelope and work.threatEnvelope(point,1.25)<0 then return false end
             if work.retargeting then return work.safeWorkPoint(point, 0) end
             local r = root()
             return r and risk <= work.danger(r.Position, opts.dangerRadius)
         end
-        if owner == "combat" or owner == "hunt" or owner=="foodHunt"or owner=="shadowHunt"or work.huntingNeeds~=nil then return work.combatClear(point) end
+        if owner == "combat" or owner == "hunt" or owner=="foodHunt"or owner=="shadowHunt"or owner=="unlockObjective"or work.huntingNeeds~=nil then return work.combatClear(point) end
         return work.safeWorkPoint(point, 0)
     end
     function work.combatClear(point)
@@ -4060,11 +4088,12 @@ local function runIslandEscape()
                 local distance=(closest-row.point).Magnitude
                 if work.projectedEnemyGap then distance=math.min(distance,work.projectedEnemyGap(row,closest,1.25))end
                 local radius = opts.avoidEnemies and opts.dangerRadius or 0
+                if work.kiting then radius=work.enemyReach(row.model)+(opts.combatMargin or 1)+1 end
                 if flags.runShadow and (not row.attackable or row.model.Name:lower():find("shadow", 1, true)) then radius = math.max(radius, opts.shadowRadius) end
                 if owner == "evade" or work.escapeMove then
                     local initial = (a - row.point).Magnitude
                     if radius > 0 and ((initial < radius and distance + 0.1 < initial) or (initial >= radius and distance < radius)) then return false end
-                elseif owner == "combat" or owner == "hunt" or owner=="foodHunt"or owner=="shadowHunt"or work.huntingNeeds~=nil then
+                elseif owner == "combat" or owner == "hunt" or owner=="foodHunt"or owner=="shadowHunt"or owner=="unlockObjective"or work.huntingNeeds~=nil then
                     local elevated = false
                     local clearance = row.model == work.attackTarget and work.meleeClearance(row.model, work.attackStats) or work.enemyReach(row.model) + opts.combatMargin
                     if not elevated and distance < clearance then
@@ -4087,6 +4116,7 @@ local function runIslandEscape()
         local currentRisk, nearestEnemy = work.danger(r.Position, radius)
         local incoming=work.incomingThreat and work.incomingThreat(r.Position)
         if currentRisk==0 and not incoming then work.evadeIntent=nil;return true end
+        if work.tryRefuge and work.tryRefuge(key)then work.evadeRecoverUntil=os.clock()+2;return true end
         if work.retargetEvade(key)then work.evadeRecoverUntil=os.clock()+2;return true end
         local best, bestScore
         local lift = math.max(2, human.HipHeight + r.Size.Y / 2)
@@ -4255,8 +4285,9 @@ local function runIslandEscape()
     end
     function work.attackPlan(key, stats)
         local hunting = key=="hunt"or key=="foodHunt"or work.huntingNeeds~=nil or work.huntingPassive
+        local objective=key=="unlockObjective"and work.unlockWork
         local cached = work.attackPlanCache
-        if cached and cached.key == key and cached.stats == stats and (not hunting or work.huntEligible(cached.target)) and cached.target.Parent and cached.human and cached.human.Health > 0
+        if cached and(not objective or work.unlockTargetMatches(cached.target,objective))and cached.key == key and cached.stats == stats and (not hunting or work.huntEligible(cached.target)) and cached.target.Parent and cached.human and cached.human.Health > 0
             and os.clock() < cached.expires and (pos(cached.target) - cached.targetPoint).Magnitude < 1
             and work.stanceScore(cached.position, cached.target, stats) then return cached.target, cached.position end
         local negative=work.attackNoPlan
@@ -4269,15 +4300,16 @@ local function runIslandEscape()
         local fire = built("Campfire")
         local center = fire and pos(fire)
         local candidates = {}
-        for _, row in ipairs(hunting and work.creatures() or work.hostiles()) do
+        for _, row in ipairs((hunting or objective)and work.creatures() or work.hostiles()) do
             local d = (row.point - r.Position).Magnitude
             local baseDistance = center and (row.point - center).Magnitude or math.huge
             local combatNear=not opts.teamRole or opts.teamRole=="Custom" or (flags.roleDefender or opts.teamRole=="Defender") or d<=opts.dangerRadius
             local healthy=not row.hostile or not human or human.Health/human.MaxHealth*100>opts.retreatHealth
-            if row.attackable and healthy and (key~="combat"or combatNear) and row.model.Parent and row.human.Health > 0 and work.insideBorder(row.point)
+            if row.attackable and healthy and(not objective or work.unlockTargetMatches(row.model,objective))
+                and(not work.engagementAllowed or work.engagementAllowed(row.model,stats))and (key~="combat"or combatNear) and row.model.Parent and row.human.Health > 0 and work.insideBorder(row.point)
                 and (not work.canHitMob or work.canHitMob(row.model,stats))
                 and not (failed[row.model] and failed[row.model] > os.clock())
-                and ((key == "combat" and ((flags.combat and baseDistance <= opts.baseRadius) or d <= math.max(opts.guardRadius,flags.combat and opts.huntRadius or 0,opts.avoidEnemies and opts.dangerRadius or 0)))
+                and (objective or(key == "combat" and ((flags.combat and baseDistance <= opts.baseRadius) or d <= math.max(opts.guardRadius,flags.combat and opts.huntRadius or 0,opts.avoidEnemies and opts.dangerRadius or 0)))
                     or(key=="shadowHunt"and work.isShadow(row.model)and d<=opts.huntRadius)
                     or (hunting and d <= opts.huntRadius and work.huntEligible(row.model))) then
                 candidates[#candidates + 1] = {row = row, distance = d, baseDistance = baseDistance}
@@ -4331,17 +4363,29 @@ local function runIslandEscape()
         local r, human = root()
         local tool, stats = work.meleeWeapon(key)
         if not r or not tool then note(key, "USABLE WEAPON REQUIRED") return false end
-        equip(tool)
+        if equip(tool)==false then note(key,"WEAPON NO LONGER OWNED / EQUIPPABLE")return false end
         local character, serial = player.Character, motion.serial
         local deadline, misses = os.clock() + math.clamp(opts.jobTimeout, 15, 600), 0
         local defeated = false
         while work.running(key, character, serial) and os.clock() < deadline do
             if not work.pause(key,math.max(0,(work.nextStrikeAt or 0)-os.clock())) then return defeated end
             r, human = root()
+            if not r or not human then return defeated end
+            if work.recoveryNeeded and work.recoveryNeeded()then
+                work.lastFightDecision="RECOVER • HEALTH HYSTERESIS / DAMAGE BURST"
+                work.retreat(key);return defeated
+            end
+            local fresh,freshStats=work.meleeWeapon(key)
+            if not fresh then note(key,"NO USABLE WEAPON / AMMO")return defeated end
+            if fresh~=tool then
+                tool,stats=fresh,freshStats;work.attackPlanCache=nil
+                if equip(tool)==false then return defeated end
+            end
             if human.Health / human.MaxHealth * 100 <= opts.retreatHealth
                 or (os.clock() < (work.damageUntil or 0) and ((opts.teamRole and opts.teamRole~="Custom")or select(3, work.danger(r.Position, opts.dangerRadius)) >= 3)) then work.retreat(key) return false end
             local target, position = work.attackPlan(key, stats)
             if not target then
+                if key=="unlockObjective"then note(key,"NO LOADED REQUIRED TILE TARGET / SAFE ATTACK STANCE")return defeated end
                 if key=="shadowHunt"then return defeated end
                 -- A crowded safe-stance search must not suppress every native
                 -- attack. Counter once from here, then immediately create space.
@@ -4402,7 +4446,7 @@ local function runIslandEscape()
             for _, attacked in ipairs(targets) do work.recordGuard(attacked) end
             if not target.Parent or (work.mobRemaining and work.mobRemaining(target)or enemyHuman.Health) <= 0 then
                 defeated = true work.threatCacheAt = 0
-                if key=="shadowHunt"then return true end
+                if key=="shadowHunt"or key=="unlockObjective"then return true end
                 if huntContext then
                     work.huntLoot = work.huntLoot or {}
                     work.huntLoot[#work.huntLoot + 1] = huntContext
@@ -4412,7 +4456,8 @@ local function runIslandEscape()
                 end
             end
             if misses >= 3 then
-                failed[target] = os.clock() + 1
+                failed[target] = os.clock() + 5
+                work.lastFightDecision="NATIVE HITS UNCONFIRMED • BACKOFF / REPOSITION"
                 note(key, "HITS UNCONFIRMED; REPOSITION / RETREAT")
                 work.retreat(key)
                 return defeated
@@ -4427,6 +4472,7 @@ local function runIslandEscape()
         local c = config()
         local goal = work.probingGoal or work.activeGoal or work.objective or work.selectedCraftMaterialGoal()
         local function eligible(model)
+            if work.weatherWorkAllowed and not work.weatherWorkAllowed(pos(model))then return false end
             if not model.Parent or not work.dropAllowed(model) then return false end
             local info = c.item.byDisplayName[model.Name]
             if not info or not work.pickupEligible(model) then return false end
@@ -4763,7 +4809,10 @@ local function runIslandEscape()
                         and (point - center).Magnitude <= 16 then state.before[drop] = nil end
                 end
             end
-            if not state.acceptedAt and work.readChestField(model,"locked") then failed[model] = os.clock() + 1 return false end
+            if not state.acceptedAt and work.readChestField(model,"locked")then
+                failed[model]=os.clock()+2;work.unlockCheckAt=0
+                note(key,"NATIVE LOCK ACTIVE • REQUIRED TILE TASK QUEUED")return false
+            end
         end
         local info = config().chest.byId[model.Name]
         local radius = math.max(1, (tonumber(info.openDistance) or 10) - 1)
@@ -5153,6 +5202,14 @@ local function runIslandEscape()
             end)end
         end
         local chestService = RS.Engine.Service:FindFirstChild("ChestService")
+        local locked=chestService and chestService:FindFirstChild("LockStateRemote")
+        if locked then connections[#connections+1]=locked.OnClientEvent:Connect(function(model,value)
+            if not model then return end
+            local row=work.chestKnowledgeFor(model)
+            row.locked=value==true;row.lockedUntil=os.clock()+3
+            work.unlockPlan=nil;work.unlockCheckAt=0
+            if not value then failed[model]=nil;due.chests=0 end
+        end)end
         local opened = chestService and chestService:FindFirstChild("RemoteEvent")
         if opened then
             connections[#connections + 1] = opened.OnClientEvent:Connect(function(model)
@@ -6364,10 +6421,12 @@ local function runIslandEscape()
         if job.enabled then
             if not job.enabled() then return false end
         elseif flags[job.key]~=true then return false end
+        if work.routineBlocked and work.routineBlocked(job.key)then return false end
         return not work.roundLost() and not work.nightPaused(job)
     end
     function work.keyEnabled(key)
         if flags.autoFarm == false or work.finished or work.roundLost() then return false end
+        if work.routineBlocked and work.routineBlocked(key)then return false end
         if key == "progression" and work.progressionEnabled() then return true end
         if flags[key] == true then return true end
         local job = work.jobsByKey and work.jobsByKey[key]
@@ -6375,12 +6434,15 @@ local function runIslandEscape()
     end
     function work.rank(job)
         local key = job.key
-        if key=="exploreMap"or key=="greatWall"or key=="structures"or key=="stockpile"then
+        if key=="exploreMap"or key=="greatWall"or key=="structures"or key=="stockpile"or key=="artifacts"or key=="unlockObjective"then
             work.roleLastServed=work.roleLastServed or{}
             work.roleLastServed[key]=work.roleLastServed[key]or os.clock()
             if os.clock()-work.roleLastServed[key]>=30 or work.active==key and os.clock()<(work.roleTurnUntil or 0)then return 2.99 end
         end
         if key == "evade" then return 0 end
+        if key=="recovery"then return .65 end
+        if key=="artifacts"then return 3.009 end
+        if key=="unlockObjective"then return 3.04 end
         if key=="shareGuns" then return 3.035 end
         if key=="travelFood" then return 3.045 end
         if key=="takeTeamGuns" then return 3.008 end
@@ -6500,6 +6562,9 @@ local function runIslandEscape()
             work.preempted = {from = work.active, to = "nightHold", rank = 10}
             motion.cancel("NIGHT HOLD • ROUTINE WORK PAUSED")
             return false
+        end
+        if key=="unlockObjective"and work.unlockWork and(not flags[work.unlockWork.kind]or work.protectedObjective(work.unlockWork.model))then
+            motion.cancel("UNLOCK OBJECTIVE DISABLED / REFUGE LOCK PROTECTED")return false
         end
         if key=="questAcquire"and work.questWork and not work.questPlanCurrent(work.questWork)then
             motion.cancel("MRBEAST REQUEST CHANGED • REPLANNING ACQUISITION")
@@ -6696,6 +6761,268 @@ local function runIslandEscape()
             if id == "boat" or tostring(info.assetId):lower():find("boat", 1, true) then return id end
         end
     end
+    -- Native unlock rules describe work on one tile; they never authorize bypassing a lock.
+    function work.unlockRule(model)
+        local id=model:GetAttribute("MapLockCnId")
+        local row=id and config().mapLock and config().mapLock.byCnId[id]
+        local trigger=row and row.unlockTrigger
+        if type(trigger)~="string"then return end
+        local ratio=trigger:match("^击杀地块内任意怪物(%d+)%%$")
+        if ratio then return{kind="kill_ratio",ratio=tonumber(ratio)/100,description=trigger}end
+        local name,n=trigger:match("^击杀地块内(.+)x(%d+)$")
+        if name then
+            local mob=config().mob and config().mob.byName and config().mob.byName[name]
+            if mob then return{kind="kill_mob_count",mobId=mob.id,count=tonumber(n),description=trigger}end
+        end
+        name,n=trigger:match("^解谜(.+)x(%d+)$")
+        if name then return{kind="puzzle_count",puzzleId=name,count=tonumber(n),description=trigger}end
+        return{kind="unsupported",description=trigger}
+    end
+    function work.tileForPoint(point)
+        local scene=world();local tiles=scene and scene:FindFirstChild("Tiles")
+        for _,tile in ipairs(tiles and tiles:GetChildren()or{})do
+            local box=tile:FindFirstChild("BoundingBox")
+            if box then
+                local p=box.CFrame:PointToObjectSpace(point)
+                if math.abs(p.X)<=box.Size.X/2 and math.abs(p.Z)<=box.Size.Z/2 then return tile end
+            end
+        end
+    end
+    function work.sameObjectiveTile(model,goal)
+        local tileId=model:GetAttribute("spawnBlockId")or model:GetAttribute("MapLockTileId")
+        if tileId~=nil then return tileId==goal.tileId end
+        local point=pos(model);local tile=point and work.tileForPoint(point)
+        return tile and tile.Name==goal.tileId or false
+    end
+    function work.protectedObjective(model)
+        local refuge=opts.refuge
+        return opts.keepRefugeLocked==true and refuge and refuge.tileId~=nil
+            and refuge.tileId==model:GetAttribute("MapLockTileId")and work.refugeMatchesMap()
+    end
+    function work.unlockTargetMatches(model,goal)
+        if not goal or not work.sameObjectiveTile(model,goal)then return false end
+        if goal.rule.kind=="guard_area"then
+            local point,center=pos(model),pos(goal.model)
+            return point and center and(point-center).Magnitude<=35 and work.isHostile(model,work.mobInfo(model))or false
+        end
+        if goal.rule.kind=="kill_ratio"then return true end
+        local info=work.mobInfo(model)
+        return goal.rule.kind=="kill_mob_count"and info and info.id==goal.rule.mobId or false
+    end
+    function work.unlockCandidate()
+        if work.unlockPlan and flags[work.unlockPlan.kind]and work.unlockPlan.model.Parent and os.clock()<(work.unlockCheckAt or 0)
+            and not work.protectedObjective(work.unlockPlan.model)then return work.unlockPlan end
+        work.unlockCheckAt=os.clock()+.75;work.unlockPlan=nil
+        local r=root();if not r then return end
+        local best,score
+        for _,entry in ipairs({{flags.artifacts,"artifacts"},{flags.chests,"chests"}})do
+            if entry[1]then for _,model in ipairs(work.models(entry[2]))do
+                local point=pos(model)
+                local prompt=model:FindFirstChildWhichIsA("ProximityPrompt",true)
+                local known=entry[2]=="chests"and work.chestKnowledgeFor(model)or nil
+                local done=entry[2]=="artifacts"and work.artifacts[model.Name]or entry[2]=="chests"and work.chestOpened(model)
+                local blocked=known and known.locked==true or prompt and not prompt.Enabled
+                local guarded=prompt and prompt.Enabled and not work.safeResource(model)
+                if point and not done and(blocked or guarded) and work.insideBorder(point)and not work.protectedObjective(model)
+                    and os.clock()>=(work.unlockBackoff and work.unlockBackoff[model]or 0)then
+                    local rule=work.unlockRule(model);local tileId=model:GetAttribute("MapLockTileId")
+                    if guarded and not blocked then rule={kind="guard_area",description="CLEAR LOCAL THREATS FOR NATIVE HOLD"}end
+                    if rule and tileId then
+                        local value=(point-r.Position).Magnitude+(entry[2]=="artifacts"and -300 or 0)
+                        if not score or value<score then
+                            best,score={model=model,tileId=tileId,rule=rule,kind=entry[2]},value
+                        end
+                    end
+                end
+            end end
+        end
+        work.unlockPlan=best
+        return best
+    end
+    function work.unlockObjectiveTick()
+        local key="unlockObjective";local goal=work.unlockCandidate()
+        if not goal then return false end
+        local model=goal.model
+        if goal.kind=="artifacts"and work.artifacts[model.Name]then work.unlockPlan=nil;return false end
+        work.unlockBackoff=work.unlockBackoff or setmetatable({}, {__mode="k"})
+        if work.protectedObjective(model)then note(key,"REFUGE LOCK PRESERVED BY SWITCH")return false end
+        if work.recoveryNeeded()or work.stormActive()then note(key,"RECOVER / WEATHER FIRST • UNLOCK REMAINS QUEUED")return false end
+        if goal.kind=="chests"then
+            if work.readChestField(model,"opened")or(goal.rule.kind~="guard_area"and not work.readChestField(model,"locked"))then
+                work.unlockBackoff[model]=os.clock()+5;work.unlockPlan=nil;failed[model]=nil;due.chests=0
+                return false
+            end
+        else
+            local prompt=model:FindFirstChildWhichIsA("ProximityPrompt",true)
+            if prompt and prompt.Enabled and goal.rule.kind~="guard_area"then work.unlockPlan=nil;due.artifacts=0;return false end
+        end
+        note(key,model.Name.." • "..goal.rule.description.." • TILE "..tostring(goal.tileId))
+        if goal.rule.kind=="unsupported"then
+            work.unlockBackoff[model]=os.clock()+20;work.unlockPlan=nil
+            note(key,"UNSUPPORTED NATIVE UNLOCK RULE • NO RANDOM FIGHTS")return false
+        end
+        if goal.rule.kind=="puzzle_count"then
+            for _,puzzle in ipairs(work.models("explore"))do
+                if puzzle.Name==goal.rule.puzzleId and work.sameObjectiveTile(puzzle,goal)and work.safeResource(puzzle)then
+                    local prompt=puzzle:FindFirstChildWhichIsA("ProximityPrompt",true)
+                    if prompt and prompt.Enabled and travel(prompt.Parent,key,math.max(.5,prompt.MaxActivationDistance-1))then
+                        if call("PuzzlePropService","isSolved",puzzle)then
+                            work.unlockBackoff[model]=os.clock()+3;work.unlockPlan=nil;return false
+                        end
+                        local sent,held=work.interactPrompt(puzzle,key)
+                        if sent==false and not held then note(key,"PUZZLE HOLD UNCONFIRMED")return false end
+                        if sent~=true then call("PuzzlePropService","requestSolve",puzzle)end
+                        local solved=work.await(key,function()return not puzzle.Parent or call("PuzzlePropService","isSolved",puzzle)==true end,3)
+                        note(key,solved and "NATIVE PUZZLE SOLVE CONFIRMED • SERVER UNLOCK STILL CHECKED"or "PUZZLE SOLVE UNCONFIRMED")
+                        return solved
+                    end
+                end
+            end
+            work.unlockBackoff[model]=os.clock()+5;work.unlockPlan=nil
+            note(key,"REQUIRED PUZZLE NOT READY / NOT LOADED")return false
+        end
+        work.unlockWork=goal
+        local ok,result=pcall(defend,key)
+        work.unlockWork,work.attackPlanCache=nil,nil
+        work.unlockCheckAt=0
+        if not ok then error(result)end
+        if not work.preempted and not result then work.unlockBackoff[model]=os.clock()+3;work.unlockPlan=nil end
+        -- A real kill is progress, not proof of unlock. Recheck native state next time.
+        note(key,result and "REQUIRED KILL CONFIRMED • SERVER UNLOCK STILL CHECKED"or "REQUIRED FIGHT DEFERRED • GEAR / SAFE STANCE / HEALTH")
+        return result
+    end
+    function work.weatherWorkAllowed(point)
+        if not work.stormActive or not work.stormActive()then return true end
+        local camp=work.campDropAnchor();local center=camp and pos(camp)
+        return point and center and(point-center).Magnitude<=60 or false
+    end
+    function work.artifactProgress()
+        local loaded,locked,unsafe,owned=0,0,0,0
+        for _,name in ipairs({"Compass","Map","Plastic Bucket","Radio"})do if work.artifacts[name]then owned=owned+1 end end
+        for _,model in ipairs(work.models("artifacts"))do
+            if not work.artifacts[model.Name]then
+                loaded=loaded+1
+                local prompt=model:FindFirstChildWhichIsA("ProximityPrompt",true)
+                if not prompt or not prompt.Enabled then locked=locked+1 elseif not work.safeResource(model)then unsafe=unsafe+1 end
+            end
+        end
+        return owned.." / 4 collected • "..loaded.." loaded remaining / "..locked.." locked or prompt unavailable / "..unsafe.." guarded"
+    end
+    function work.routineBlocked(key)
+        if work.recoveryNeeded()and({unlockObjective=true,artifacts=true,chests=true,exploreMap=true,puzzles=true,stockpile=true,hunt=true,foodHunt=true,greatWall=true,structures=true,questAcquire=true,progression=true,combat=true,autoAttack=true})[key]then return true end
+        if work.stormActive()and({unlockObjective=true,artifacts=true,chests=true,exploreMap=true,puzzles=true,hunt=true,foodHunt=true,questAcquire=true,travel=true})[key]then return true end
+        return false
+    end
+    function work.recoveryNeeded()
+        local _,human=root();if not human or human.Health<=0 then return false end
+        local hp=human.Health/math.max(1,human.MaxHealth)*100
+        local burst=os.clock()-(work.damageBurstAt or -math.huge)<3 and(work.damageBurst or 0)or 0
+        if hp<=opts.retreatHealth or burst>=human.MaxHealth*.25 then work.recovering=true end
+        if work.recovering and hp>=math.max(85,(opts.retreatHealth or 55)+20)
+            and os.clock()>=(work.damageUntil or 0)then work.recovering=false end
+        return work.recovering==true
+    end
+    function work.engagementAllowed(target,stats)
+        local info=work.mobInfo(target)or{}
+        if not work.isHostile(target,info)or work.isShadow(target)then return true end
+        local _,human=root();if not human or work.recoveryNeeded()then return false end
+        local reach=work.enemyReach(target)+(opts.combatMargin or 1)
+        if (tonumber(stats.range)or 0)>reach+1 then return true end
+        local damage=tonumber(stats.atkDmg)or 0
+        if damage<=0 then return false end
+        local remaining=work.mobRemaining and work.mobRemaining(target)or target:FindFirstChildOfClass("Humanoid").Health
+        local hits=math.max(1,math.ceil(remaining/damage))
+        local seconds=(hits-1)*math.max(.1,tonumber(stats.useCd)or .7)+math.max(.1,tonumber(stats.windup)or .2)
+        local incoming=tonumber(info.atkDmg)or tonumber(info.attackDamage)or work.lastHitDamage or 10
+        local cooldown=math.max(.25,tonumber(info.atkCd)or tonumber(info.attackCooldown)or tonumber(info.attackCd)or 1)
+        local expected=math.ceil(seconds/cooldown)*math.max(0,incoming)
+        local budget=math.max(0,human.Health-human.MaxHealth*(opts.retreatHealth or 55)/100)
+        if expected>=budget then
+            work.lastFightDecision="DEFER "..target.Name.." • CLOSE-RANGE DAMAGE BUDGET • UPGRADE / RANGE NEEDED"
+            return false
+        end
+        return true
+    end
+    function work.attackEnvelope(point,lead)
+        local margin=math.huge
+        for _,row in ipairs(work.hostiles())do
+            if row.model.Parent and row.human.Health>0 and math.abs(point.Y-row.point.Y)<24 then
+                local radius=work.enemyReach(row.model)+(opts.combatMargin or 1)
+                if work.isShadow(row.model)then radius=math.max(radius,opts.shadowRadius or 60)end
+                margin=math.min(margin,work.projectedEnemyGap(row,point,lead or .7)-radius)
+            end
+        end
+        return margin
+    end
+    function work.refugeMatchesMap()
+        local refuge=opts.refuge;local scene=world()
+        local seed=scene and scene:FindFirstChild("Seed")
+        return refuge and(scene==work.refugeScene or seed and refuge.seed~=nil and tostring(seed.Value)==tostring(refuge.seed))or false
+    end
+    function work.setRefuge()
+        local r=root();local scene=world()
+        if not r or not scene or not work.insideBorder(r.Position)then say("STAND INSIDE YOUR REFUGE FIRST")return false end
+        local floor=motion.floor(r.Position,nil,8,0)
+        if not floor then say("REFUGE NEEDS A VERIFIED FLOOR")return false end
+        local tile=work.tileForPoint(r.Position);local seed=scene:FindFirstChild("Seed")
+        opts.refuge={x=r.Position.X,y=r.Position.Y,z=r.Position.Z,tileId=tile and tile.Name,seed=seed and seed.Value}
+        opts.useRefuge=true;work.refugeScene=scene;work.refugeFailedUntil=0
+        work.unlockPlan=nil
+        save();for _,render in pairs(toggles)do render()end
+        note("refuge",tile and "POINT SAVED • SAFETY UNVERIFIED UNTIL USED"or "POINT SAVED • TILE UNKNOWN; LOCK PROTECTION UNAVAILABLE")
+        return true
+    end
+    function work.refugePoint()
+        if not opts.useRefuge or not work.refugeMatchesMap()or os.clock()<(work.refugeFailedUntil or 0)then return end
+        local v=opts.refuge;local point=Vector3.new(v.x,v.y,v.z)
+        if not work.insideBorder(point)then return end
+        local floor=motion.floor(point,nil,8,0)
+        if not floor or point.Y-floor.Y<0 or point.Y-floor.Y>8 then return end
+        if work.hoverBodyClear and not work.hoverBodyClear(point)then return end
+        for _,row in ipairs(work.hostiles())do
+            local distance=(row.point-point).Magnitude
+            if work.isShadow(row.model)and distance<(opts.shadowRadius or 60)then return end
+            if distance<work.enemyReach(row.model)+6 and work.lineOfSight(point,row.model)then return end
+        end
+        return point
+    end
+    function work.refugeAllowsPoint(point)
+        local refuge=opts.refuge
+        if not opts.useRefuge or not refuge or not point then return false end
+        if(point-Vector3.new(refuge.x,refuge.y,refuge.z)).Magnitude>8 or not work.refugePoint()then return false end
+        for _,row in ipairs(work.hostiles())do
+            if(row.point-point).Magnitude<(opts.dangerRadius or 24)and work.lineOfSight(point,row.model)then return false end
+        end
+        return true
+    end
+    function work.tryRefuge(key)
+        local point=work.refugePoint();local r=root()
+        if not point or not r then return false end
+        if(r.Position-point).Magnitude<=3 then return true end
+        work.refugeTravel=point
+        local ok,moved=pcall(travel,point,key,.5,"Teleport")
+        work.refugeTravel=nil
+        if not ok then error(moved)end
+        if moved then work.refugeUsedAt=os.clock();note("refuge","ARRIVED • WATCHING FOR DAMAGE / INTRUSION")end
+        return moved
+    end
+    function work.recoveryDestination()
+        local point=work.refugePoint()
+        if point then return point,true end
+        local camp=work.campDropAnchor();local p=camp and work.campDropPoint(camp,"food")
+        if p and work.safeWorkPoint(p,4)then return p,false end
+    end
+    function work.recoveryReady()
+        if not work.recoveryNeeded()then return false end
+        local point=work.recoveryDestination();local r=root()
+        return r and point and(r.Position-point).Magnitude>4 or false
+    end
+    function work.recoveryTick()
+        if work.tryRefuge("recovery")then return true end
+        local point=work.recoveryDestination()
+        note("recovery","RETREATING TO CHECKED RECOVERY POINT • HEAL BEFORE REENGAGING")
+        return point and travel(point,"recovery",1,"Teleport")or false
+    end
     function work.artifactCandidate()
         local scene = world()
         return nearest(work.models("artifacts"), function(model)
@@ -6716,17 +7043,40 @@ local function runIslandEscape()
         end
         return false
     end
+    function work.refreshArtifactState()
+        local extra=RS.Engine.Service:FindFirstChild("BoatExtra")
+        local remote=extra and extra:FindFirstChild("requiresGetRemote")
+        if not remote then return false end
+        local ok,list=pcall(function()return work.boundedRead(function()return remote:InvokeServer()end,"artifact receipt")end)
+        if not ok or type(list)~="table"then return false end
+        work.artifacts={}
+        for _,name in ipairs(list)do work.artifacts[name]=true end
+        return true
+    end
     function work.fetchArtifact()
         local model = work.artifactCandidate()
         if not model then return false end
         local part = model:FindFirstChild("promptPart")
         local prompt = part and part:FindFirstChildOfClass("ProximityPrompt")
-        if not prompt or not travel(part, "artifacts", math.max(1, prompt.MaxActivationDistance - 1)) then return false end
-        if not work.interactPrompt(model, "artifacts") then return false end
-        local confirmed = work.await("artifacts", function() return not model.Parent or work.artifacts[model.Name] end,
-            math.max(2, prompt.HoldDuration + 1))
-        if not work.preempted then failed[model] = os.clock() + (confirmed and 0.1 or 2) end
-        note("artifacts", confirmed and "ARTIFACT COLLECTED" or "ARTIFACT NOT CONFIRMED / INTERRUPTED")
+        if not prompt or not prompt.Enabled or not travel(part, "artifacts", math.max(1, prompt.MaxActivationDistance - 1)) then return false end
+        note("artifacts","HOLDING NATIVE ARTIFACT PROMPT • "..model.Name)
+        local triggered,held=work.interactPrompt(model,"artifacts",math.max(0,5-(tonumber(prompt.HoldDuration)or 0)))
+        if triggered~=true and not work.artifacts[model.Name]then
+            if not held or work.preempted then note("artifacts","ARTIFACT HOLD INTERRUPTED")return false end
+            if prompt.Enabled and model.Parent then
+                if type(fireproximityprompt)~="function"then
+                    note("artifacts","FULL HOLD COMPLETE • EXECUTOR PROMPT TRIGGER UNAVAILABLE")return false
+                end
+                local ok,err=pcall(fireproximityprompt,prompt)
+                if not ok then note("artifacts","ARTIFACT PROMPT TRIGGER ERROR: "..tostring(err))return false end
+            end
+        end
+        local confirmed=work.await("artifacts",function()return work.artifacts[model.Name]==true end,2)
+        if not confirmed and not work.preempted and work.refreshArtifactState then
+            work.refreshArtifactState();confirmed=work.artifacts[model.Name]==true
+        end
+        if not work.preempted then failed[model]=os.clock()+(confirmed and .1 or 3)end
+        note("artifacts",confirmed and "ARTIFACT COLLECTED • SERVER LIST CONFIRMED"or "ARTIFACT SERVER RECEIPT UNCONFIRMED / INTERRUPTED")
         return confirmed
     end
     work.artifacts = {}
@@ -6745,8 +7095,8 @@ local function runIslandEscape()
         if changed then connections[#connections + 1] = changed.OnClientEvent:Connect(update) end
         local get = extra and extra:FindFirstChild("requiresGetRemote")
         if get then task.spawn(function()
-            local ok, list = pcall(function() return get:InvokeServer() end)
-            if alive and ok then update(list) end
+            local ok, list = pcall(function()return work.boundedRead(function()return get:InvokeServer()end,"artifact configuration")end)
+            if alive and ok and type(list)=="table"then update(list)end
         end) end
         local result = RS.Engine.Service:FindFirstChild("GameResult")
         result = result and result:FindFirstChild("onResultRemote")
@@ -7377,7 +7727,9 @@ local function runIslandEscape()
             return work.shelterNeeded()and human and human.Health/human.MaxHealth*100<=opts.retreatHealth or false
         end
         if key=="combat"then return not work.combatUrgent or work.combatUrgent()end
-        if key=="shadowHunt" or key=="eat" or key=="autoAttack" then return true end
+        if key=="recovery"then return work.recoveryNeeded and work.recoveryNeeded()or false end
+        if key=="autoAttack"then return not work.combatUrgent or work.combatUrgent()end
+        if key=="shadowHunt" or key=="eat" then return true end
         if key=="foodCache"then return work.mealNeeded()and work.noFood()end
         if key=="escape" then return opts.emergencyEscape==true end
         if key=="fuel" then
@@ -7447,7 +7799,7 @@ local function runIslandEscape()
         if not human or human.Health<=0 or flags.eat==false then return false end
         local hunger=human.GetAttribute and human:GetAttribute("hunger")
         local maximum=human.GetAttribute and(human:GetAttribute("maxHunger")or 100)or 100
-        return human.Health/human.MaxHealth*100<=(opts.health or 50)
+        return human.Health/human.MaxHealth*100<=(work.recoveryNeeded and work.recoveryNeeded()and math.max(85,opts.health or 50)or(opts.health or 50))
             or hunger~=nil and hunger/math.max(1,maximum)*100<=(opts.hunger or 40)
     end
     function work.foodKeepCount(id,tool)
@@ -7772,7 +8124,14 @@ local function runIslandEscape()
         local r, human = root()
         if not r or not target.Parent then return false end
         local center, best, score = pos(target), nil, nil
-        local radius = math.max(work.enemyReach(target) + opts.combatMargin + 3, 8)
+        local safeGap=work.enemyReach(target)+(opts.combatMargin or 1)+3
+        local currentGap=Vector3.new(r.Position.X-center.X,0,r.Position.Z-center.Z).Magnitude
+        if currentGap>=safeGap and work.attackPhase(target)~="strike"
+            and(not work.attackEnvelope or work.attackEnvelope(r.Position,.7)>1)then
+            work.lastFightDecision="HOLD SAFE RANGE • FINISH NATIVE COOLDOWN"
+            return false
+        end
+        local radius = math.max(safeGap, 8)
         for i = 0, 11 do
             local angle = i * math.pi / 6
             local probe = center + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
@@ -7780,7 +8139,8 @@ local function runIslandEscape()
             if ground then
                 local point = ground + Vector3.new(0, human.HipHeight + r.Size.Y / 2, 0)
                 local risk = work.danger(point, opts.dangerRadius)
-                if work.insideBorder(point) and motion.clearSegment(r.Position, point, target)
+                if work.insideBorder(point) and(opts.evadeMove=="Teleport"or motion.clearSegment(r.Position, point, target))
+                    and(not work.attackEnvelope or work.attackEnvelope(point,.7)>1)
                     and risk <= work.danger(r.Position, opts.dangerRadius) then
                     local value = risk * 100 + (point - r.Position).Magnitude
                     if not score or value < score then best, score = point, value end
@@ -7788,9 +8148,10 @@ local function runIslandEscape()
             end
         end
         if not best then return false end
-        work.escapeMove = true
+        work.lastFightDecision="KITE • STRIKE / INCOMING CONTACT"
+        work.escapeMove,work.kiting = true,true
         local ok, result = pcall(travel, best, key, 0.5, opts.evadeMove)
-        work.escapeMove = nil
+        work.escapeMove,work.kiting = nil,nil
         work.attackPlanCache, work.threatCacheAt = nil, 0
         if not ok then error(result) end
         return result
@@ -8399,8 +8760,13 @@ local function runIslandEscape()
         return pickups(key,true)or gatherResource(key,true)
     end
     function work.automationReport()
-        local c=config();local rows={"AUTOMATION AUDIT v7 • COMBINED JOBS / RECEIPTS"}
+        local c=config();local rows={"AUTOMATION AUDIT v8 • OBJECTIVE COMBAT / REFUGE"}
         rows[#rows+1]="Active jobs: "..table.concat(select(2,work.roleUnion())," + ").." | chunk visits "..tostring(work.chunkVisits or 0).." | revivals resumed "..tostring(work.reviveCount or 0)
+        local pending=work.unlockWork or work.unlockPlan
+        rows[#rows+1]="Artifacts: "..work.artifactProgress()
+        rows[#rows+1]="Unlock objective: "..(pending and(pending.model.Name.." • "..pending.rule.description.." • TILE "..tostring(pending.tileId))or "NONE / SEARCHING LOADED LOCK METADATA")
+        rows[#rows+1]="Combat decision: "..tostring(work.lastFightDecision or "WAITING").." • recovering "..tostring(work.recovering==true).." • recent damage "..tostring(work.damageBurst or 0)
+        rows[#rows+1]="Refuge: "..(opts.useRefuge and opts.refuge and "CONFIGURED; SAFETY MONITORED"or "NOT SET").." • keep room locked "..tostring(opts.keepRefugeLocked==true).." • damage events "..tostring(work.refugeDamageEvents or 0)
         rows[#rows+1]="Survival: retreat "..tostring(opts.retreatHealth).."% / eat at "..tostring(opts.health).."% HP • damage events "..tostring(work.damageEvents or 0).." • spatial cache hits "..tostring(work.spatialHits or 0)
         rows[#rows+1]="Travel meals kept: "..tostring(opts.travelRation or 0).." • team roles resume after revival; manual toggles remain saved"
         rows[#rows+1]="Gun handoff: "..(flags.shareGuns and "LEAVE GUNS AT CAMP" or flags.takeTeamGuns and "COLLECT CAMP GUN UPGRADES" or "MANUAL / SOLO")
@@ -8590,9 +8956,11 @@ local function runIslandEscape()
         if not human then return false end
         local hunger=human.GetAttribute and human:GetAttribute("hunger")
         local maximum=human.GetAttribute and(human:GetAttribute("maxHunger")or 100)or 100
-        return human.Health/human.MaxHealth*100<=opts.retreatHealth or hunger and hunger/math.max(1,maximum)<.15 or false
+        return(work.recoveryNeeded and work.recoveryNeeded())or human.Health/human.MaxHealth*100<=opts.retreatHealth or hunger and hunger/math.max(1,maximum)<.15 or false
     end
     function work.autoAttackReady()
+        if ({combat=true,hunt=true,foodHunt=true,shadowHunt=true,unlockObjective=true})[work.active]then return false end
+        if work.recoveryNeeded and work.recoveryNeeded()then return false end
         local _,human=root()
         if human and human.Health/human.MaxHealth*100<=opts.retreatHealth then return false end
         if os.clock()<(work.damageUntil or 0)or os.clock()<(work.nextStrikeAt or 0)or os.clock()<(work.evadeRecoverUntil or 0)then return false end
@@ -8607,7 +8975,16 @@ local function runIslandEscape()
         if not r or not tool then return false end
         local target=work.enemy(stats.range or 6, false)
         if not target or not work.stanceScore(r.Position,target,stats) then return false end
-        return work.strike(tool,stats,{target},{},"autoAttack")
+        local human=target:FindFirstChildOfClass("Humanoid")
+        local before=work.mobRemaining and work.mobRemaining(target)or human and human.Health
+        if not before or not work.strike(tool,stats,{target},{},"autoAttack")then return false end
+        local hit=work.await("autoAttack",function()return not target.Parent or(work.mobRemaining and work.mobRemaining(target)or human.Health)<before end,
+            math.max(.35,(tonumber(stats.windup)or .2)+.45))
+        work.attackCommit=nil
+        if hit then work.attackReceipts=(work.attackReceipts or 0)+1 end
+        note("autoAttack",hit and "NATIVE DAMAGE CONFIRMED"or "NATIVE DAMAGE UNCONFIRMED")
+        if not work.preempted then work.kite(target,"autoAttack")end
+        return hit
     end
     function work.readObjectiveHints()
         local lines, seen, c = {}, {}, config()
@@ -8661,6 +9038,16 @@ local function runIslandEscape()
         if not human then return end
         local same=work.healthHuman==human
         if same and work.healthSample and human.Health<work.healthSample then
+            local loss=work.healthSample-human.Health
+            work.damageBurst=os.clock()-(work.damageBurstAt or -math.huge)<3 and(work.damageBurst or 0)+loss or loss
+            work.damageBurstAt=os.clock();work.lastHitDamage=loss
+            if opts.refuge and work.refugeMatchesMap and work.refugeMatchesMap()then
+                local v=opts.refuge;local point=Vector3.new(v.x,v.y,v.z)
+                if r and(r.Position-point).Magnitude<10 then
+                    work.refugeFailedUntil=os.clock()+60;work.refugeDamageEvents=(work.refugeDamageEvents or 0)+1
+                    note("refuge","DAMAGE AT REFUGE • REJECTING POINT FOR 60 SECONDS")
+                end
+            end
             work.damageUntil=os.clock()+3
             work.attackCommit,work.attackPlanCache=nil,nil
             work.nextPriorityCheck=0
@@ -8980,6 +9367,9 @@ local function runIslandEscape()
         return result
     end
     local jobsList = {
+        {key="recovery",enabled=function()return flags.combat or flags.runShadow or opts.useRefuge end,ready=function()return work.recoveryReady and work.recoveryReady()or false end,run=work.recoveryTick},
+        {key="unlockObjective",enabled=function()return opts.unlockObjectives and(flags.artifacts or flags.chests)and(flags.combat or flags.autoAttack)end,
+            ready=function()return work.unlockCandidate()~=nil end,run=work.unlockObjectiveTick},
         {key="travelFood",enabled=function()return (tonumber(opts.travelRation)or 0)>0 end,ready=work.travelFoodReady,run=work.travelFoodTick},
         {key="shareGuns",enabled=function()return flags.shareGuns end,ready=function()return work.gunHandoff~=nil or work.carriedGun()~=nil and work.campDropAnchor()~=nil end,run=work.shareGunsTick},
         {key="takeTeamGuns",enabled=function()return flags.takeTeamGuns end,ready=function()return work.teamGunCandidate()~=nil end,run=work.takeTeamGunTick},
