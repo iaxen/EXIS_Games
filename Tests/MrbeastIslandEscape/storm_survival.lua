@@ -262,9 +262,10 @@ test('storage planning finds an empty site and places the owned native item ther
  local assets={getFreeBuildModelByCnId=function(id)assert(id=='storage');return{FindFirstChild=function()return{Size=vec(4,4,4)}end,Destroy=function()end}end}
  RS.Assets={AssetsManager=assets};local original=require;require=function(api)return api end
  local goal={id='storage',info=cfg.item.byId.storage,role='storage'}
+ work.inBaseBeach=function()return true end
  local frame=work.structurePlacement(goal);assert(frame and work.storagePlannedFrame==frame and math.abs(frame.Position.X)>=31)
  local placed=false
- call=function(name,action,id,cf)assert(name=='FreeBuild'and action=='requestPlace'and id=='storage'and cf==frame);placed=true end
+ call=function(name,action,id,cf)assert(name=='FreeBuild'and action=='requestPlace'and id=='storage'and cf==frame);placed=true;bag[1].Parent=nil end
  work.findStructure=function(_,id)if placed and id=='storage'then return{}end end
  assert(work.placeStructure(goal,'structures'));require=original
 end)
