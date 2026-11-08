@@ -1611,7 +1611,8 @@ local function run()
                         canRotate = placement.FacesCharacter(info),
                         blocking = defs.GetBoolean(info,"Physics","ZombieBlocking",false) or defs.GetBoolean(info,"FakeWall","Enabled",false),
                         info = info, primary = primary, range = placement.GetFunctionalRange(effective),
-                        maxElevation = defs.GetNumber(info,"Placement","MaxElevationDifference",5)}
+                        maxElevation = defs.GetNumber(info,"Placement","MaxElevationDifference",5),
+                        buildDuration=defs.GetNumber(effective,"Build","Duration",1)}
                 else app.note("layout", "MISSING DEFENSE TEMPLATE: " .. name) end
             end
         end
@@ -1704,6 +1705,7 @@ local function run()
                     end
                     local name = model:GetAttribute("TypeName")
                     local info = name and defs.Types[name]
+                    box.model=model
                     box.name, box.role, box.owned = name, info and Core.role(name,info) or "unknown", model:GetAttribute("OwnerUserId") == player.UserId
                     box.blocking = info and (defs.GetBoolean(info,"Physics","ZombieBlocking",false) or defs.GetBoolean(info,"FakeWall","Enabled",false)) or false
                     boxes[#boxes + 1] = box
@@ -1800,12 +1802,102 @@ local function run()
         end
         return nil
     end
+    function app.freezePlacement(root, human)
+        app.stopWalk()
+        human:MoveTo(root.Position)
+        local velocity=root.AssemblyLinearVelocity
+        if velocity then root.AssemblyLinearVelocity=Vector3.new(0,velocity.Y,0) end
+    end
+    function app.finishPlacementHold(hold)
+        if not hold or app.placementHold==hold then
+            app.placementHold=nil app.placing=false app.placementResumeAt=os.clock()+.08
+        end
+    end
+    function app.validPlacementHold(hold)
+        local root,human=app.root()
+        local candidate=hold and hold.candidate
+        if not hold or hold.cancelled or app.placementHold~=hold or root~=hold.root or not app.active()
+            or not cfg.autoPlace or app.editing or candidate.map~=app.mapId or candidate.class~=app.className
+            or candidate.revision~=app.revision then return nil end
+        if (root.Position-hold.origin).Magnitude>.75 or os.clock()<(app.damageEvadeUntil or 0)
+            or not app.placementSafe(root.Position) then return nil end
+        if os.clock()>=(hold.nextFloor or 0) then
+            if not app.floorSupport(root.Position) then return nil end
+            hold.nextFloor=os.clock()+.1
+        end
+        return root,human
+    end
+    function app.stabilizePlacement(candidate)
+        local root=app.root()
+        if not root then return nil end
+        local hold={candidate=candidate,root=root,origin=root.Position}
+        app.placementHold,app.placing=hold,true
+        local previous,stable,deadline=root.Position,0,os.clock()+.75
+        app.placementReadiness="SETTLING PLAYER AT PLACEMENT POSITION"
+        repeat
+            local current,human=app.validPlacementHold(hold)
+            if not current then break end
+            app.freezePlacement(current,human)
+            task.wait()
+            current=app.validPlacementHold(hold)
+            if not current then break end
+            stable=(current.Position-previous).Magnitude<=.08 and stable+1 or 0
+            previous=current.Position
+            if stable>=2 and os.clock()-(app.lastDodgeAt or -10)>=.12 then
+                hold.nextFloor=0
+                if app.validPlacementHold(hold) then return hold end
+                break
+            end
+        until os.clock()>=deadline
+        app.finishPlacementHold(hold)
+        app.placementReadiness="WAITING: placement position did not settle safely"
+        app.note("defense",app.placementReadiness)
+        return nil
+    end
+    function app.confirmPlacement(candidate,hold)
+        local duration=math.max(0,candidate.slot.spec.buildDuration or 1)
+        local deadline=os.clock()+math.min(12,math.max(3,duration+3))
+        local seenAt
+        app.placementReadiness="HOLDING STILL: WAITING FOR DEFENSE / NATIVE CONSTRUCTION"
+        repeat
+            local root,human=app.validPlacementHold(hold)
+            if not root then
+                app.placementReadiness="PLACEMENT HOLD INTERRUPTED; survival / changed position takes priority"
+                app.note("defense",app.placementReadiness) return false
+            end
+            app.freezePlacement(root,human)
+            for _,box in ipairs(app.defenseBoxes()) do
+                local model=box.model
+                if model and model.Parent and model:GetAttribute("Destroyed")~=true
+                    and (model:GetAttribute("Health") or 1)>0 and box.owned and box.name==candidate.slot.name
+                    and math.abs(box.x-candidate.slot.x)<.1 and math.abs(box.z-candidate.slot.z)<.1 then
+                    seenAt=seenAt or os.clock()
+                    local building,built=model:GetAttribute("Building"),model:GetAttribute("Built")
+                    local finish=tonumber(model:GetAttribute("BuildEndServerTime"))
+                    local start=tonumber(model:GetAttribute("BuildStartServerTime") or model:GetAttribute("PlacedServerTime"))
+                    local nativeDuration=tonumber(model:GetAttribute("BuildDuration")) or duration
+                    local now=workspace:GetServerTimeNow()
+                    if building~=true and (built==true or finish and now>=finish
+                        or not finish and start and now>=start+math.max(0,nativeDuration)
+                        or not finish and not start and built~=false and os.clock()-seenAt>=duration) then return true end
+                end
+            end
+            task.wait()
+        until os.clock()>=deadline
+        app.placementReadiness="SERVER ACCEPTED; DEFENSE CONSTRUCTION NOT CONFIRMED BEFORE TIMEOUT"
+        app.note("defense",app.placementReadiness)
+        return false
+    end
     function app.placeTick()
         if app.editing then app.buildGoal = nil return false end
         local candidate = app.placementTask or app.getPlacement()
         if not candidate then app.buildGoal = nil return false end
         if candidate.class ~= app.className or candidate.map ~= app.mapId or candidate.revision ~= app.revision then
             app.placementTask, app.buildGoal = nil, nil return false
+        end
+        local initialBox=Core.placementBox(candidate.slot,candidate.point.X,candidate.point.Z)
+        if not Core.strictFits(initialBox,app.placementRegion().points or {}) then
+            app.note("defense","REJECTED: complete defense footprint must stay inside the selected border") return false
         end
         local root, human = app.root()
         if not root then return false end
@@ -1819,15 +1911,16 @@ local function run()
         if app.target and app.target.boss and cfg.bossFirst and cfg.fight and not inRange then
             app.buildGoal=nil app.placementReadiness="WAITING: boss combat; safe in-range placements remain allowed" return false
         end
-        -- The native range is to the requested surface point. Do not force a
-        -- move to an arbitrary side/height when we can already place safely.
+        -- Approach a reserved safe position beside the slot, then stop there
+        -- through placement and construction rather than firing while passing.
         local lift = human.HipHeight + root.Size.Y / 2
         local outward = Vector3.new(root.Position.X - candidate.point.X, 0, root.Position.Z - candidate.point.Z)
         if outward.Magnitude < 0.1 then outward = Vector3.new(1, 0, 0) end
         local side = candidate.point + outward.Unit * math.min(8, math.max(candidate.slot.w, candidate.slot.d) / 2 + 3)
         local sideHit = app.ground(side.X, side.Z, candidate.point.Y)
         local stand = (sideHit and sideHit.Position or candidate.point) + Vector3.new(0, lift, 0)
-        if not inRange and (not sideHit or not app.placementSafe(stand)) then
+        local needsApproach=not inRange or (root.Position-stand).Magnitude>3
+        if needsApproach and (not sideHit or not app.placementSafe(stand)) then
             local safe, best
             -- Stay out of reach while placing up to the native distance ahead.
             -- Tight floors can use a closer ring when the outer ring has no support.
@@ -1850,9 +1943,13 @@ local function run()
             end
             stand = safe
         end
-        if not inRange then
+        needsApproach=not inRange or (root.Position-stand).Magnitude>3
+        if needsApproach then
+            if app.target and app.target.boss and cfg.bossFirst and cfg.fight then
+                app.buildGoal=nil app.note("defense","WAITING: boss combat before placement approach") return false
+            end
             app.buildGoal = stand
-            app.note("defense", "MOVING INTO PLACEMENT RANGE")
+            app.note("defense", "APPROACHING RESERVED PLACEMENT POSITION")
             return nil
         end
         app.buildGoal = nil
@@ -1869,32 +1966,42 @@ local function run()
         if not client then return false end
         local currency, price = client.GetCurrentPrice(candidate.slot.name)
         if not app.afford(currency, price) then return false end
-        app.stopWalk()
-        app.placing = true
-        app.placeFailureReason=nil
-        local result = app.invoke("place", app.find(RS, "DeployableSystem_Remotes", "Place"),
-            candidate.slot.name, candidate.point, {Facing = candidate.slot.facing or spec.facing})
-        app.placing = false
-        if type(result) == "table" and result.ok == true then
-            if candidate.map~=app.mapId or candidate.class~=app.className or candidate.revision~=app.revision or not app.alive then
-                app.planKey=nil app.note("defense","PLACEMENT RESPONSE ARRIVED AFTER MAP / CLASS / AREA CHANGE; REPLANNING") return false
-            end
-            app.pendingPlacements = app.pendingPlacements or {}
-            app.pendingPlacements[candidate.key] = {slot = candidate.slot, expires = os.clock() + 5}
-            app.next.place = os.clock()
-            app.placedSerial=(app.placedSerial or 0)+1
+        local hold
+        local ok,done=xpcall(function()
+            hold=app.stabilizePlacement(candidate)
+            if not hold then return false end
+            -- Position, funds and occupancy may change while coming to rest.
+            currency,price=client.GetCurrentPrice(candidate.slot.name)
+            if not app.afford(currency,price) or app.occupied(candidate.slot) or not app.validPlacementHold(hold) then return false end
             app.placeFailureReason=nil
-            app.defenseCache = nil
-            app.note("defense", "PLACED " .. candidate.slot.name:upper())
-        elseif result then
-            app.placeFailureReason=result.reason
-            if result.reason~="funds" then app.rejected[candidate.key]=os.clock()+8 end
-            if result.reason=="occupied" or result.reason=="support" or result.reason=="surface" or result.reason=="range" then
-                app.next.place=os.clock() -- Skip this slot without blocking other valid slots.
+            local result = app.invoke("place", app.find(RS, "DeployableSystem_Remotes", "Place"),
+                candidate.slot.name, candidate.point, {Facing = candidate.slot.facing or spec.facing})
+            if type(result) == "table" and result.ok == true then
+                if candidate.map~=app.mapId or candidate.class~=app.className or candidate.revision~=app.revision or not app.alive then
+                    app.planKey=nil app.note("defense","PLACEMENT RESPONSE ARRIVED AFTER MAP / CLASS / AREA CHANGE; REPLANNING") return false
+                end
+                app.pendingPlacements = app.pendingPlacements or {}
+                app.pendingPlacements[candidate.key] = {slot = candidate.slot, expires = os.clock() + math.max(8,(spec.buildDuration or 1)+6)}
+                app.next.place = os.clock()
+                if not app.confirmPlacement(candidate,hold) then return false end
+                app.placedSerial=(app.placedSerial or 0)+1
+                app.placeFailureReason=nil
+                app.defenseCache = nil
+                app.placementReadiness="CONFIRMED BUILT: "..candidate.slot.name:upper()
+                app.note("defense",app.placementReadiness)
+            elseif result then
+                app.placeFailureReason=result.reason
+                if result.reason~="funds" then app.rejected[candidate.key]=os.clock()+8 end
+                if result.reason=="occupied" or result.reason=="support" or result.reason=="surface" or result.reason=="range" then
+                    app.next.place=os.clock() -- Skip this slot without blocking other valid slots.
+                end
+                app.note("defense", "REJECTED: " .. tostring(result.reason or "UNKNOWN"))
             end
-            app.note("defense", "REJECTED: " .. tostring(result.reason or "UNKNOWN"))
-        end
-        return result and result.ok == true or false
+            return result and result.ok==true or false
+        end,Diagnostics.traceback)
+        app.finishPlacementHold(hold or app.placementHold)
+        if not ok then app.note("defense","ERROR: "..tostring(done)) return false end
+        return done
     end
     function app.weapon()
         local guns = app.module(modules, "GunData")
@@ -2212,7 +2319,8 @@ local function run()
         local horizon=math.max(.15,cfg.dodgeInterval or .3)
         local _,currentMargin=Core.teleportClearance({x=root.Position.X,y=root.Position.Y,z=root.Position.Z},mobs,horizon)
         local emergency=currentMargin<2 or now<(app.damageEvadeUntil or 0)
-        if app.placing and not emergency then return false end
+        if (app.placing or now<(app.placementResumeAt or 0)) and not emergency then return false end
+        if emergency and app.placementHold then app.placementHold.cancelled=true end
         if now<(app.next.dodgeTeleport or 0)and not(emergency and now-(app.lastDodgeAt or -10)>=.12)then return false end
         local candidates,seen={},{}
         app.dodgeRejected=app.dodgeRejected or {}
@@ -2295,7 +2403,12 @@ local function run()
         app.observedHealth = human and human.Health
         -- Do not leave native range while the server is processing a placement.
         -- An incoming threat can still interrupt this brief hold.
-        if app.placing and root and app.placementSafe(root.Position) then return end
+        if (app.placing or os.clock()<(app.placementResumeAt or 0)) and root and app.placementSafe(root.Position)
+            and os.clock()>=(app.damageEvadeUntil or 0) then
+            if app.placementHold then app.freezePlacement(root,human) end
+            return
+        end
+        if app.placementHold then app.placementHold.cancelled=true end
         local teleportMode=cfg.fight and cfg.dodgeTeleport
         if teleportMode then app.stopWalk();app.teleportDodgeTick() end
         local danger = not teleportMode and root and (app.airRisk(root.Position) > 0 or os.clock() < (app.damageEvadeUntil or 0))
