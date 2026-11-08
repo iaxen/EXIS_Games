@@ -3534,6 +3534,34 @@ local function runIslandEscape()
         for _, enabled in pairs(flags) do if enabled == true then return true end end
         return false
     end
+    function work.combatUrgent()
+        local r,human=root()
+        if not r or not human or human.Health<=0 then return false end
+        for _,row in ipairs(work.hostiles())do
+            if row.attackable and row.model.Parent and row.human.Health>0 and not(work.isShadow and work.isShadow(row.model))then
+                local gap=(row.point-r.Position).Magnitude
+                if gap<=work.enemyReach(row.model)+3 then return true end
+            end
+        end
+        local target=work.baseThreat and work.baseThreat()
+        local fire=built("Campfire")
+        local point=target and pos(target);local center=fire and pos(fire)
+        return point and center and(point-center).Magnitude<=16 or false
+    end
+    function work.counterWindow(target,key)
+        local r,human=root()
+        if not r or not human or human.Health/human.MaxHealth*100<=math.max(60,opts.retreatHealth)
+            or os.clock()<(work.damageUntil or 0)or os.clock()<(work.evadeRecoverUntil or 0)then return false end
+        if work.attackPhase and work.attackPhase(target)=="strike"then return false end
+        if select(3,work.danger(r.Position,opts.dangerRadius))>=3 then return false end
+        local commit=work.attackCommit
+        if commit and commit.target==target and os.clock()<commit.expires then
+            return human.Health>=commit.health
+        end
+        if os.clock()<(work.nextStrikeAt or 0)then return false end
+        local _,stats=work.meleeWeapon(key)
+        return stats and work.stanceScore(r.Position,target,stats,true)~=nil or false
+    end
     function work.personalThreat()
         local shadow = work.shadowThreat()
         if not shadow and flags.killShadow and work.shadowCandidate then shadow=work.shadowCandidate()end
@@ -3557,7 +3585,12 @@ local function runIslandEscape()
         if incoming and not work.hover then
             local phase=work.attackPhase and work.attackPhase(incoming)or "unknown"
             local fighting=work.active=="combat"or work.active=="hunt"or work.active=="autoAttack"
-            -- A known recovery/windup can permit one counter; unknown attacks and closing mobs do not require a damage receipt.
+            -- A healthy native-range counter may finish one real hit window.
+            -- Keep evasion for distant predicted contact, actual strike phases,
+            -- new damage, low health and crowds; unknown animation alone must
+            -- not cancel every swing before its native hit window.
+            if (fighting or flags.combat or flags.autoAttack)and work.counterWindow
+                and work.counterWindow(incoming,work.active)then return end
             if not fighting or(phase~="windup"and phase~="recovery")or os.clock()<(work.evadeRecoverUntil or 0)
                 or human.Health/human.MaxHealth*100<=math.max(opts.retreatHealth or 35,60)then return incoming end
         end
@@ -3877,6 +3910,11 @@ local function runIslandEscape()
             end
         end
         table.sort(candidates, function(a, b)
+            if key=="combat"then
+                local urgentA=a.distance<=work.enemyReach(a.row.model)+3
+                local urgentB=b.distance<=work.enemyReach(b.row.model)+3
+                if urgentA~=urgentB then return urgentA end
+            end
             if key == "combat" and a.baseDistance ~= b.baseDistance then return a.baseDistance < b.baseDistance end
             return a.distance < b.distance
         end)
@@ -3888,6 +3926,7 @@ local function runIslandEscape()
                 local ranged=stats.toolType=="gun" or stats.toolType=="infGun" or stats.toolType=="ranged"
                 local score = ranged and (-candidate.distance*10-candidate.row.human.Health*0.001) or stance-candidate.row.human.Health*0.05
                 if key == "combat" and not ranged then score = score + math.max(0, opts.baseRadius - candidate.baseDistance) * 2 end
+                if key=="combat"and candidate.distance<=work.enemyReach(candidate.row.model)+3 then score=score+100000 end
                 if candidate.row.model == work.attackTarget then score = score + 6 end
                 if not bestScore or score > bestScore then target, position, bestScore = candidate.row.model, point, score end
             end
@@ -3971,8 +4010,10 @@ local function runIslandEscape()
             if not work.strike(tool, stats, targets, {}, key) then return defeated end
             local damaged = work.await(key, function() return not target.Parent or (work.mobRemaining and work.mobRemaining(target)or enemyHuman.Health) < before end,
                 math.max(0.35, math.min(tonumber(stats.windup) or 0, tonumber(stats.useCd) or 0.7) + 0.45))
+            work.attackCommit=nil
+            if damaged then work.attackReceipts=(work.attackReceipts or 0)+1 end
             if work.preempted then return defeated end
-            if work.kite then work.kite(target, key) end
+            if work.kite then work.kite(target,key)end
             misses = damaged and 0 or misses + 1
             for _, attacked in ipairs(targets) do work.recordGuard(attacked) end
             if not target.Parent or (work.mobRemaining and work.mobRemaining(target)or enemyHuman.Health) <= 0 then
@@ -4430,7 +4471,9 @@ local function runIslandEscape()
             end
         end
         local cache=work.questCache
-        if not work.questFetchPending and(not cache or os.clock()-cache.at>=(force and .5 or 2))then
+        local canFetch=true
+        if type(root)=="function"then local _,human=root();canFetch=not human or human.Health>0 end
+        if canFetch and not work.questFetchPending and(not cache or os.clock()-cache.at>=(force and .5 or 2))then
             local token={character=player.Character,generation=work.questGeneration or 0};work.questFetchPending=token
             task.spawn(function()
                 local ok,index,alt,revision=pcall(function()return work.boundedRead(q.client.fetchQuest,"MrBeast quest")end)
@@ -5082,6 +5125,7 @@ local function runIslandEscape()
         return work.canCollect() and work.mealAvailable()
     end
     local function enemyReady()
+        if os.clock()<(work.evadeRecoverUntil or 0)then return false end
         local _,stats=work.meleeWeapon("combat")
         if not stats then return false end
         return work.attackPlan("combat",stats)~=nil or work.retaliationTarget(stats)~=nil
@@ -5711,7 +5755,10 @@ local function runIslandEscape()
         if key=="shadowHunt"then return 1.4 end
         if key=="greatWall"then return 6.8 end
         if key=="equipArmour"then return 2.9 end
-        if key == "combat" then return (flags.combat and work.baseThreat()) and 1 or 1.5 end
+        if key=="combat"then
+            if work.combatUrgent then return work.combatUrgent()and 1.5 or 6.5 end
+            return(flags.combat and work.baseThreat())and 1 or 1.5
+        end
         if key == "escape" and opts.emergencyEscape then return 0.8 end
         if key == "mrbeastReward" then return 3.005 end
         if key=="eat"then return work.criticalMeal and work.criticalMeal()and .4 or 2 end
@@ -5757,7 +5804,10 @@ local function runIslandEscape()
         local rank = {buildCurrent=5.1,build=5.2,craft=5.3,smeltCollect=5.4,smelt=5.5,
             mrbeastReward=6,quest=6.1,recoverDrops=7,drops=7.1,gather=7.2,water=7.3,
             chests=8,puzzles=8.1,artifacts=8.2,escape=9.1,travel=9.2,nightHold=10,fish=10.5}
-        if key == "nightHold" and not work.hover and work.shelterNeeded() then return -0.1 end
+        if key=="nightHold"and not work.hover and work.shelterNeeded()then
+            local _,human=root()
+            return human and human.Health/human.MaxHealth*100<=opts.retreatHealth and .3 or 9.5
+        end
         return rank[key] or 11
     end
     function work.pick(jobs, now, ceiling, urgentOnly)
@@ -5875,14 +5925,19 @@ local function runIslandEscape()
         end
         work.nextStrikeAt = os.clock() + math.max(0, tonumber(stats.useCd) or 0.7)
         if #targets > 0 then
-            -- Use the game-bound Tool so its windup, hit window and hit selection run.
+            -- Bound the commitment to this native windup/hit window. Survival
+            -- checks still cancel on new damage, known strikes or unsafe health.
+            local _,human=root()
+            work.attackCommit={target=targets[1],health=human.Health,
+                expires=os.clock()+math.min(tonumber(stats.windup)or 0,tonumber(stats.useCd)or .7)+.5}
             if work.activateWeapon then
-                if not work.activateWeapon(tool, stats, targets[1], key) then return false end
+                if not work.activateWeapon(tool,stats,targets[1],key)then work.attackCommit=nil return false end
             else tool:Activate() end
         else
             RS.Events.meleeHitRemote:FireServer(targets, resources)
         end
         work.sent = work.sent + 1
+        if #targets>0 then work.attackRequests=(work.attackRequests or 0)+1 end
         return true
     end
     local function blueprintReady(onlySelected)
@@ -6657,7 +6712,12 @@ local function runIslandEscape()
     function work.interruptsInteraction(job)
         local key=job.key
         if key=="evade" then return not work.retaliatingUntil or os.clock()>=work.retaliatingUntil end
-        if key=="combat" or key=="shadowHunt" or key=="eat" or key=="autoAttack" then return true end
+        if key=="nightHold"then
+            local _,human=root()
+            return work.shelterNeeded()and human and human.Health/human.MaxHealth*100<=opts.retreatHealth or false
+        end
+        if key=="combat"then return not work.combatUrgent or work.combatUrgent()end
+        if key=="shadowHunt" or key=="eat" or key=="autoAttack" then return true end
         if key=="foodCache"then return work.mealNeeded()and work.noFood()end
         if key=="escape" then return opts.emergencyEscape==true end
         if key=="fuel" then
@@ -7311,7 +7371,8 @@ local function runIslandEscape()
         end
         table.sort(candidates,function(a,b)
             local function cost(row)
-                local n=0
+                local label=(tostring(row.id).." "..tostring(row.info.displayName or"")):lower()
+                local n=(label:find("half",1,true)or label:find("半",1,true))and 1000 or 0
                 for id,v in pairs(row.recipe)do
                     local item=c.item.byId[id]or{}
                     local text=(tostring(id).." "..tostring(item.displayName or"")):lower()
@@ -7504,7 +7565,7 @@ local function runIslandEscape()
         return pickups(key,true)or gatherResource(key,true)
     end
     function work.automationReport()
-        local c=config();local rows={"AUTOMATION AUDIT v1"}
+        local c=config();local rows={"AUTOMATION AUDIT v2 • COMBAT HANDOFFS"}
         local torch=work.shadowWeapon()
         rows[#rows+1]="Shadow: "..(not flags.killShadow and"OFF"or torch and"TORCH AVAILABLE; CONFIRMS TorchHits"or"BLOCKED: NO NATIVE LIGHT-SOURCE TOOL")
         rows[#rows+1]="Craft station: "..(work.stationSynced and"SYNCED"or"WAITING FOR SERVER STOCK")
@@ -7515,6 +7576,8 @@ local function runIslandEscape()
         local passive,hostile=0,0
         for _,row in ipairs(work.creatures())do if row.hostile then hostile=hostile+1 else passive=passive+1 end end
         rows[#rows+1]="Loaded living mobs: "..hostile.." hostile / "..passive.." passive; unstreamed mobs unknown"
+        rows[#rows+1]="Attack cycles: "..tostring(work.attackRequests or 0).." activations attempted / "..tostring(work.attackReceipts or 0).." damage receipts"
+        rows[#rows+1]="Defence urgent: "..tostring(work.combatUrgent()).." | Guard radius "..tostring(opts.guardRadius).." | Evade recovery "..tostring(math.max(0,(work.evadeRecoverUntil or 0)-os.clock()))
         rows[#rows+1]="Bulk collection: "..tostring(flags.bulkCollect).." | Recipe fire level: "..tostring((work.fireState()or{}).level or"UNKNOWN")
         rows[#rows+1]="Next reward retry in: "..tostring(math.max(0,math.ceil((work.choiceRetryAt or 0)-os.clock()))).."s"
         return table.concat(rows,"\n")
@@ -7544,7 +7607,7 @@ local function runIslandEscape()
         return human.Health/human.MaxHealth*100<=opts.retreatHealth or hunger and hunger/math.max(1,maximum)<.15 or false
     end
     function work.autoAttackReady()
-        if os.clock()<(work.nextStrikeAt or 0)then return false end
+        if os.clock()<(work.nextStrikeAt or 0)or os.clock()<(work.evadeRecoverUntil or 0)then return false end
         local r=root();local tool,stats=work.meleeWeapon("autoAttack")
         if not r or not tool then return false end
         local target=work.enemy(stats.range or 6,false)
