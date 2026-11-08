@@ -310,5 +310,78 @@ test('iron nodes with mixed stone drops still belong to the iron mining category
  cfg.itemDrop.byId.mixed={{itemCN='Stone'},{itemCN='Iron Ore'}}
  assert(work.resourceKind{dropId='mixed',requireToolType='pickaxe'}=='iron')
 end)
+test('eighty-stud guard targets are ordinary hunts rather than immediate defence emergencies',function()
+ body('    function work.combatUrgent(', '    function work.personalThreat(')
+ local m=object('Treant');m.point=vec(70,3,0);hostiles={{model=m,point=m.point,human={Health=100},attackable=true}}
+ work.enemyReach=function()return 4 end;opts.guardRadius=80
+ assert(not work.combatUrgent())
+ hostiles[1].point=vec(5,3,0);assert(work.combatUrgent())
+end)
+test('food gathering and equipment work outrank ordinary distant hostile hunting',function()
+ body('    function work.rank(job)', '    function work.pick(')
+ work.combatUrgent=function()return false end
+ assert(work.rank{key='foodHunt'}<work.rank{key='combat'})
+ assert(work.rank{key='craft'}<work.rank{key='combat'})
+ work.combatUrgent=function()return true end;assert(work.rank{key='combat'}<work.rank{key='foodHunt'})
+end)
+test('a healthy combat job does not get interrupted by routine night shelter during approach',function()
+ body('    function work.rank(job)', '    function work.pick(')
+ work.shelterNeeded=function()return true end;work.combatUrgent=function()return true end
+ assert(work.rank{key='nightHold'}>work.rank{key='combat'})
+ h.Health=20;assert(work.rank{key='nightHold'}<work.rank{key='combat'})
+end)
+test('a queued night shelter is not discarded for an ordinary far-away hunt',function()
+ body('    function work.rank(job)', '    function work.checkpoint(')
+ body('    function work.interruptsInteraction(', '    function work.foodReserveTarget(')
+ local fight={key='combat',ready=function()return true end};local shelter={key='nightHold',ready=function()return true end}
+ work.combatUrgent=function()return false end;work.shelterNeeded=function()return true end
+ work.jobEnabled=function()return true end;work.jobsByKey={nightHold=shelter};work.pendingHandoff='nightHold'
+ assert(work.nextQueuedJob({fight,shelter},now)==shelter and work.pendingHandoff==nil)
+end)
+test('a native-range counter finishes its hit window despite an unknown incoming animation',function()
+ body('    function work.combatUrgent(', '    function work.baseThreat(')
+ body('    function work.strike(', '    local function blueprintReady(')
+ local target=object('Treant');target.point=vec(3,3,0);target.Humanoid={Health=50}
+ work.active='combat';work.shadowThreat=function()end;work.incomingThreat=function()return target end
+ work.danger=function()return 0,target,1 end;work.attackPhase=function()return'unknown'end
+ work.meleeWeapon=function()return{}, {range=4,windup=.2,useCd=1}end
+ work.stanceScore=function()return 1 end;work.checkpoint=function()return work.personalThreat()==nil end
+ work.pause=function(_,seconds)now=now+seconds;return work.checkpoint()end
+ equip=function()end;work.setSprint=function()end
+ local t=object('Axe','Tool');t.Parent=player.Character;local swings=0
+ work.activateWeapon=function()
+  swings=swings+1
+  for i=1,5 do now=now+.05;assert(not work.personalThreat(),'counter was evaded before the native hit window')end
+  target.Humanoid.Health=40;return true
+ end
+ assert(work.strike(t,{range=4,windup=.2,useCd=1},{target},{},'combat')and swings==1 and target.Humanoid.Health==40)
+end)
+test('counter commitment does not suppress evasion after damage known strikes or crowding',function()
+ body('    function work.combatUrgent(', '    function work.personalThreat(')
+ local target=object('Treant');target.point=vec(3,3,0)
+ work.attackCommit={target=target,expires=1,health=100};work.danger=function()return 0,target,1 end
+ h.Health=90;assert(not work.counterWindow(target,'combat'))
+ h.Health=100;work.attackPhase=function()return'strike'end;assert(not work.counterWindow(target,'combat'))
+ work.attackPhase=function()return'unknown'end;work.danger=function()return 0,target,3 end;assert(not work.counterWindow(target,'combat'))
+end)
+test('completed evade recovery prevents immediately restarting the same attack job',function()
+ local enemyReady=assert(load(extract('    local function enemyReady()', '    function work.needItem(')..'\nreturn enemyReady'))()
+ work.evadeRecoverUntil=2;work.meleeWeapon=function()return{},{}end;work.attackPlan=function()return{}end
+ assert(not enemyReady());now=2.1;assert(enemyReady())
+end)
+test('full wooden wall is preferred over a cheaper half wall',function()
+ wall();local half=item('木半墙','Wood Half Wall',{recipeId='half'});cfg.recipe.byId.half={require_wood=1};cfg.freeBuild.byCnId[half.id]={}
+ assert(work.wallRecipe().id=='木墙')
+end)
+test('immediate player contact takes targeting priority over a more distant camp mob',function()
+ body('    function work.attackPlan(', '    local function defend(')
+ local near,far=object('NearMob'),object('CampMob');near.point=vec(53,3,0);far.point=vec(10,3,0)
+ near.Humanoid={Health=100};far.Humanoid={Health=100}
+ hostiles={{model=near,point=near.point,human=near.Humanoid,attackable=true},{model=far,point=far.point,human=far.Humanoid,attackable=true}}
+ r.Position=vec(50,3,0);opts.baseRadius=45;opts.guardRadius=80;opts.dangerRadius=20
+ built=function()return{point=vec(0,3,0)}end;work.enemyReach=function()return 4 end
+ work.combatPosition=function(m)return m.point,10 end
+ assert(work.attackPlan('combat',{range=4,toolType='axe'})==near)
+end)
 assert(loadfile('Games/MrbeastIslandEscape.lua'))
 print(n..' automation, native geometry, bulk collection, gear, Shadow and wall checks passed; module compiles')
