@@ -4,7 +4,7 @@ local sourcePath = (arg and arg[1]) or os.getenv('EXIS_MRBEAST_SOURCE') or 'Game
 local f=assert(io.open(sourcePath));local source=f:read('*a');f:close()
 local function extract(a,b)local i=assert(source:find(a,1,true));local j=assert(source:find(b,i+#a,true));return source:sub(i,j-1)end
 local chunks={
- extract('    function work.submitUnits(', '    function work.bagState()'),
+ extract('    function work.furnaceWoodArgument(', '    function work.bagState()'),
  extract('    function work.contribute(', '    local function craftTick()'),
  extract('    function work.goalRunnable(', '    function work.planProgression()'),
  extract('    function work.bagSubmissionReady()', '    function work.shelterNeeded()'),
@@ -111,6 +111,42 @@ test('furnace drains both available ingredient stacks including unmatched leftov
  end
  assert(work.smeltBag('smelt'));assert(inventory.Ore==0 and inventory.Coal==0 and #events==8)
 end)
+test('furnace wood is capped at six across repeated jobs and delayed stock receipts',function()
+ configData.misc.furnaceMatter2Id='wood';furnaceData.matter2Count=0
+ buildings.Furnace={};inventory.Wood=30
+ receipt('Furnace','addMatter','Wood',.1)
+ assert(work.smeltBag('smelt'));assert(#events==6 and inventory.Wood==24)
+ assert(not work.smeltBag('tidyBag'));assert(#events==6)
+ work.reconcileFurnaceWood({matter2Count=3});furnaceData.matter2Count=3
+ assert(work.furnaceAllowance('matter2')==0)
+ work.reconcileFurnaceWood({matter2Count=6});furnaceData.matter2Count=6
+ assert(not work.smeltBag('progression')and #events==6)
+ work.reconcileFurnaceWood({matter2Count=4});furnaceData.matter2Count=4
+ assert(work.smeltBag('smelt')and #events==8 and inventory.Wood==22)
+end)
+test('furnace waits for its native wood stock before sending any fuel',function()
+ configData.misc.furnaceMatter1Id='wood';inventory.Wood=30;buildings.Furnace={}
+ assert(not work.smeltBag('smelt')and #events==0)
+end)
+test('the furnace combined-material action uses the same six wood ceiling',function()
+ configData.misc.furnaceMatter2Id='wood';inventory.Wood=20;inventory.Ore=20;buildings.Furnace={};furnaceData.matter2Count=5
+ call=function()events[#events+1]=true;inventory.Wood=inventory.Wood-1;inventory.Ore=inventory.Ore-1 end
+ assert(work.submitUnits('smelt','Furnace','addBoth',{wood=20,ore=20}))
+ assert(#events==1 and inventory.Wood==19)
+ assert(not work.submitUnits('tidyBag','Furnace','addBoth',{wood=20,ore=20})and #events==1)
+end)
+test('an interrupted unacknowledged wood request remains reserved',function()
+ configData.misc.furnaceMatter2Id='wood';inventory.Wood=20;buildings.Furnace={};furnaceData.matter2Count=0
+ call=function()events[#events+1]=true;work.preempted=true end
+ assert(not work.submitUnits('smelt','Furnace','addMatter',{wood=20},'matter2'))
+ assert(#events==6 and work.furnaceWoodPending.count==6)
+ work.preempted=nil;now=10
+ assert(not work.submitUnits('smelt','Furnace','addMatter',{wood=20},'matter2')and #events==6)
+end)
+test('an empty furnace material request cannot send fuel without an inventory budget',function()
+ configData.misc.furnaceMatter2Id='wood';inventory.Wood=20;furnaceData.matter2Count=0
+ assert(not work.submitUnits('smelt','Furnace','addMatter',{},'matter2')and #events==0)
+end)
 test('one construction job submits all matching materials to all blueprints',function()
  configData.build.byId={a={assetId='A',recipeId='ra'},b={assetId='B',recipeId='rb'}}
  configData.recipe.byId={ra={require_wood=4},rb={require_stone=3}}
@@ -143,6 +179,10 @@ test('missing supplies use safe resource candidates and restore the active need 
  work.resourceCandidate=function(key,needed)assert(key=='progression'and needed and work.needs.wood==100);return{}end
  assert(work.goalRunnable{kind='craft',amounts={wood=3}})
  assert(work.needs==original)
+end)
+test('a partial wooden wall recipe can gather or submit instead of disappearing from readiness',function()
+ inventory.Wood=1;work.canCollect=function()return false end
+ assert(work.goalRunnable({kind='structure',amounts={wood=3}}))
 end)
 test('partial blueprint supplies are actionable before the bag is full',function()
  inventory.Wood=2

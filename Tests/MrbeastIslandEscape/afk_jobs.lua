@@ -272,15 +272,15 @@ test('needed-only chest gathering stops once the task inventory is sufficient',f
  buildGoal(1);inventory.Wood=1
  assert(not work.needsDrop('wood','chests'))
 end)
-test('recovering four wood drops collects and immediately deposits only the two still needed',function()
+test('recovering wood collects the entire resource before any submission even when only two are requested',function()
  loadBody('    function work.drainTreeDrops(', '    function work.recoverTreeDrops()')
  local goal=buildGoal(2);local drops={model('Wood'),model('Wood'),model('Wood'),model('Wood')}
  world=function()return{FindFirstChild=function(_,key)if key=='DroppedItems'then return{GetChildren=function()return drops end}end end}end
  work.watchLateDrops=function()end
  work.contribute=function()inventory.Wood=0;goal.info.amounts.wood=goal.info.amounts.wood-1;events[#events+1]='deposit';return true end
  assert(work.drainTreeDrops({center=vec(0,0,0),wanted={wood=true},before={}},'progression'))
- assert(countEvent('pickup:Wood')==2 and countEvent('deposit')==2)
- assert(drops[3].Parent and drops[4].Parent and inventory.Wood==0)
+ assert(countEvent('pickup:Wood')==4 and countEvent('deposit')==0)
+ assert(not drops[3].Parent and not drops[4].Parent and inventory.Wood==4)
 end)
 test('an impossible direct craft does not collect a recipe larger than the bag can hold',function()
  loadBody('    function work.goalRunnable(', '    function work.chooseUpgrade()')
@@ -568,6 +568,59 @@ test('resource recovery waits for delayed drops and retries one rejected pickup 
  local context={center=vec(0,0,0),wanted={wood=true},before={}}
  assert(work.drainTreeDrops(context,'questAcquire'))
  assert(attempts==3 and inventory.Wood==2 and now>=2.55 and context.seen and not context.noLoot)
+end)
+test('nearby resource drops use one native request burst then confirm the entire batch',function()
+ loadBody('    function work.collectResourceCluster(', '    function work.drainTreeDrops(')
+ local drops={model('Wood'),model('Wood'),model('Stone'),model('Stone')}
+ local folder={GetChildren=function()return drops end}
+ work.collectModel=function()error('cluster should not wait separately for every item')end
+ local callsAt={};call=function(_,_,drop)
+  callsAt[#callsAt+1]=now
+  later(.5,function()inventory[drop.Name]=inventory[drop.Name]+1;drop.Parent=false end)
+ end
+ local context={center=vec(0,0,0),wanted={wood=true,stone=true},before={}}
+ assert(work.collectResourceCluster(context,'gather',drops[1],folder))
+ assert(#callsAt==4 and callsAt[1]==0 and callsAt[4]==0 and inventory.Wood==2 and inventory.Stone==2)
+ assert(now<.6 and context.seen and not context.pendingCollect)
+end)
+test('a resource request burst reserves available bag space and leaves overflow for recovery',function()
+ loadBody('    function work.collectResourceCluster(', '    function work.drainTreeDrops(')
+ inventory.Stone=4;local drops={model('Wood'),model('Wood'),model('Wood')}
+ local context={center=vec(0,0,0),wanted={wood=true},before={}}
+ assert(work.collectResourceCluster(context,'gather',drops[1],{GetChildren=function()return drops end}))
+ assert(inventory.Wood==1 and drops[2].Parent and drops[3].Parent)
+end)
+test('resource surplus is collected before leaving even when the current quest no longer needs it',function()
+ loadBody('    function work.collectResourceCluster(', '    function work.recoverTreeDrops()')
+ local drops={model('Wood'),model('Wood'),model('Stone')}
+ world=function()return{FindFirstChild=function()return{GetChildren=function()return drops end}end}end
+ work.watchLateDrops=function()end;work.needsDrop=function()return false end
+ assert(work.drainTreeDrops({center=vec(0,0,0),wanted={wood=true,stone=true},before={}},'progression'))
+ assert(inventory.Wood==2 and inventory.Stone==1 and not drops[3].Parent)
+end)
+test('a pickup prompt startup delay is awaited once before collecting the cluster',function()
+ loadBody('    function work.collectResourceCluster(', '    function work.drainTreeDrops(')
+ local drop=model('Wood');local prompt={Enabled=false,HoldDuration=0}
+ drop.FindFirstChildWhichIsA=function()return prompt end
+ later(.5,function()prompt.Enabled=true end)
+ local first;call=function(_,_,d)first=now;inventory.Wood=1;d.Parent=false end
+ assert(work.collectResourceCluster({center=vec(0,0,0),wanted={wood=true},before={}},'gather',drop,{GetChildren=function()return{drop}end}))
+ assert(first>=.5 and first<.6)
+end)
+test('an interrupted native loot burst keeps its receipt and never resends an accepted pickup',function()
+ loadBody('    function work.collectResourceCluster(', '    function work.drainTreeDrops(')
+ local drops={model('Wood'),model('Wood')};local context={center=vec(0,0,0),wanted={wood=true},before={}}
+ local sent=0;call=function(_,_,d)sent=sent+1;work.preempted=true;later(.2,function()inventory.Wood=1;d.Parent=false end)end
+ local folder={GetChildren=function()return drops end}
+ assert(not work.collectResourceCluster(context,'gather',drops[1],folder)and sent==1 and context.pendingCollect)
+ work.preempted=nil
+ assert(work.collectResourceCluster(context,'gather',nil,folder)and sent==1 and context.collected[drops[1]]and drops[2].Parent)
+end)
+test('a resource cluster never requests a drop beyond the native pickup range',function()
+ loadBody('    function work.collectResourceCluster(', '    function work.drainTreeDrops(')
+ local near=model('Wood');local far=model('Wood',vec(10,0,0))
+ assert(work.collectResourceCluster({center=vec(0,0,0),wanted={wood=true},before={}},'gather',near,{GetChildren=function()return{near,far}end}))
+ assert(inventory.Wood==1 and far.Parent)
 end)
 test('resource depletion without a loot receipt waits then reports no observed loot honestly',function()
  loadBody('    function work.drainTreeDrops(', '    function work.recoverTreeDrops()')

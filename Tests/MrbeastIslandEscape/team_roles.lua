@@ -77,7 +77,7 @@ local function setup()
   calls[#calls+1]=name..'.'..action
   if name=='PlayerInventory'and action=='dropItem'then
    t.attrs.count=t.attrs.count-1;if t.attrs.count<=0 then t.Parent=nil end
-   local d=object(t.Name,r.Position);d.attrs.ownerName='Builder';d.attrs.protectEndTick=now+10;drops[#drops+1]=d
+   local d=object(t.Name,r.Position);d.attrs.ownerName=player.Name;d.attrs.protectEndTick=now+10;drops[#drops+1]=d
   elseif name=='ItemCollect'then held(t.Name);t.Parent=nil end
  end
  body('    work.automationBundles =', '    function work.makeSuiteUI(p)')
@@ -99,10 +99,75 @@ test('four team presets enable distinct work and retain personal survival',funct
  end
 end)
 test('switching roles clears the previous specialist jobs',function()
- work.applyTeamRole('Explorer');assert(flags.chests and flags.quest and flags.exploreMap and flags.takeTeamGuns and not flags.shareGuns)
- work.applyTeamRole('Builder');assert(flags.greatWall and flags.structureCraft and flags.stormStock and flags.shareGuns and not flags.chests and not flags.takeTeamGuns)
+ work.applyTeamRole('Explorer');assert(flags.chests and flags.quest and flags.exploreMap and not flags.takeTeamGuns and not flags.shareGuns)
+ work.applyTeamRole('Builder');assert(flags.greatWall and flags.structureCraft and flags.stormStock and not flags.shareGuns and not flags.chests and not flags.takeTeamGuns)
  work.applyTeamRole('Gatherer');assert(flags.scavengeAll and flags.mineIron and not flags.greatWall and not flags.buildCamp)
  work.applyTeamRole('Defender');assert(flags.hunt and opts.guardRadius==45 and not flags.scavengeAll and not flags.exploreMap)
+end)
+test('role toggles combine all four jobs without silently donating solo guns',function()
+ for _,name in ipairs({'Explorer','Builder','Gatherer','Defender'})do assert(work.setRole(name,true))end
+ assert(opts.teamRole=='Mixed'and flags.chests and flags.quest and flags.greatWall and flags.mineIron and flags.hunt)
+ assert(flags.roleExplorer and flags.roleBuilder and flags.roleGatherer and flags.roleDefender)
+ assert(not flags.shareGuns and not flags.takeTeamGuns)
+end)
+test('the first role selection clears unrelated specialist defaults',function()
+ flags.quest=true;flags.chests=true;flags.exploreMap=true
+ work.setRole('Builder',true)
+ assert(flags.greatWall and flags.mineIron and not flags.quest and not flags.chests and not flags.exploreMap)
+end)
+test('disabling one role preserves material jobs needed by another role',function()
+ work.setRole('Builder',true);work.setRole('Gatherer',true);work.setRole('Explorer',true)
+ work.setRole('Builder',false)
+ assert(flags.mineIron and flags.chopTrees and flags.scavengeAll and flags.chests and not flags.greatWall)
+ assert(opts.teamRole=='Mixed')
+ work.setRole('Gatherer',false);assert(not flags.mineIron and flags.chests and opts.teamRole=='Explorer')
+end)
+test('gun handoff preference remains independent of role changes',function()
+ flags.shareGuns=true;work.setRole('Builder',true);work.setRole('Explorer',true)
+ assert(flags.shareGuns);flags.shareGuns=false;work.setRole('Defender',true);assert(not flags.shareGuns)
+end)
+test('a starved specialist gets a bounded turn before routine crafting',function()
+ work.rank{key='exploreMap'};now=31
+ assert(work.rank{key='exploreMap'}<work.rank{key='craft'})
+ assert(work.rank{key='evade'}<work.rank{key='exploreMap'})
+ work.criticalMeal=function()return true end
+ assert(work.rank{key='eat'}<work.rank{key='exploreMap'})
+end)
+test('an interrupted trip resumes its committed chunk instead of switching tiles',function()
+ tile('A',40);tile('B',80)
+ travel=function()work.preempted=true;return false end
+ assert(not work.exploreMapTick());local target=work.chunkTarget;assert(target)
+ assert(work.chunkDestination()==target)
+end)
+test('native map snapshot adds unknown frontier cells beyond streamed tiles',function()
+ local snapshot={0,0,0,0,2,0,0,0,0}
+ typeof=function(value)return type(value)=='table'and 'buffer'or type(value)end
+ buffer={len=function(value)return #value end,readu8=function(value,index)return value[index+1]end}
+ local oldRequire=require;require=function()return{client={requestSnapshot=function()return snapshot,3,100 end}}end
+ RS={Engine={World={MapSyncService={}}}};task.spawn=function(fn)fn()end
+ work.boundedRead=function(fn)return fn()end
+ work.requestMapFrontier();require=oldRequire
+ assert(work.mapFrontier and #work.mapFrontier.active==5)
+ local center=work.mapFrontier.rows[4];assert(center.probe.X==175 and center.probe.Z==175)
+ assert(work.mapFrontier.rows[1].frontier and not work.mapFrontier.rows[0])
+ work.insideBorder=function()return true end
+ local target=assert(work.chunkDestination());assert(target.needsStreaming and target.row.probe)
+end)
+test('water and server boundary cells are excluded from the native map frontier',function()
+ local snapshot={4,1,4,1,3,1,4,1,4}
+ typeof=function()return 'buffer'end
+ buffer={len=function(v)return #v end,readu8=function(v,i)return v[i+1]end}
+ local oldRequire=require;require=function()return{client={requestSnapshot=function()return snapshot,3,0 end}}end
+ RS={Engine={World={MapSyncService={}}}};task.spawn=function(fn)fn()end
+ work.boundedRead=function(fn)return fn()end;work.requestMapFrontier();require=oldRequire
+ assert(#work.mapFrontier.active==1 and work.mapFrontier.rows[4]and not work.mapFrontier.rows[0])
+end)
+test('an unstreamed frontier without safe ground is never visited or teleported to',function()
+ work.insideBorder=function()return true end
+ work.chunkDestination=function()return{row={probe=vec(500,0,0),tile={Name='Grid'},blocked={},visited={}},index=1,probe=vec(500,0,0),needsStreaming=true}end
+ motion.floor=function()return nil end
+ travel=function()error('must not move to unverified ground')end
+ assert(not work.exploreMapTick()and not work.chunkVisits and log.exploreMap:find('NO LANDING ATTEMPTED',1,true))
 end)
 test('an invalid role cannot change a running configuration',function()
  flags.quest=true;assert(not work.applyTeamRole('unknown')and flags.quest and opts.teamRole=='Custom')
@@ -133,10 +198,10 @@ test('streamed chunks update the frontier and completed chunks become revisitabl
  for _,row in ipairs(work.chunkRows())do for i=1,5 do row.visited[i]=0 end end
  assert(not work.chunkDestination());now=31;assert(work.chunkDestination())
 end)
-test('role fallback patrols camp when all loaded map points are recently checked',function()
+test('role fallback does not duplicate an enabled explorer trip',function()
  tile('A',0);flags.exploreMap=true
  for _,row in ipairs(work.chunkRows())do for i=1,5 do row.visited[i]=0 end end
- assert(work.roleFallbackTick()and log.roleFallback:find('CAMP PATROL',1,true))
+ assert(not work.roleFallbackTick()and log.roleFallback:find('EXPLORATION QUEUED',1,true))
 end)
 test('lack of a safe patrol is reported and never disables the assigned role',function()
  flags.roleFallback=true;work.safeWorkPoint=function()return false end
@@ -164,6 +229,20 @@ end)
 test('an unconfirmed gun drop remains carried and can be retried',function()
  local gun=held('Pistol');call=function()end
  assert(not work.shareGunsTick()and gun.Parent and log.shareGuns:find('UNCONFIRMED',1,true))
+end)
+test('a late gun drop survives combat preemption and uses the native throw radius',function()
+ held('Pistol');local sent=0
+ work.nativeDropReach=function()return 25 end
+ work.batchDrop=function(tool)sent=sent+1;tool.Parent=nil;work.preempted=true;return 1 end
+ assert(not work.shareGunsTick()and work.gunHandoff and sent==1)
+ work.preempted=nil;local d=object('Pistol',r.Position+vec(25,0,0));d.attrs.ownerName=player.Name;drops={d}
+ assert(work.shareGunsTick()and not work.gunHandoff and sent==1)
+end)
+test('an unresolved gun receipt never issues a second donation',function()
+ held('Pistol');local sent=0
+ work.batchDrop=function(tool)sent=sent+1;tool.Parent=nil;return 1 end
+ assert(not work.shareGunsTick());held('Pistol')
+ assert(not work.shareGunsTick()and sent==1 and count('Pistol')==1)
 end)
 test('donors never reclaim the gun they just shared',function()
  local gun=object('Pistol');flags.shareGuns=true
@@ -281,7 +360,7 @@ end)
 test('a new character created by native revival also resumes without re-executing the script',function()
  work.applyTeamRole('Explorer');h.Health=0;assert(not work.reviveSync())
  player.Character={};h={Health=60,MaxHealth=100,HipHeight=2}
- assert(work.reviveSync()and flags.exploreMap and flags.takeTeamGuns and opts.teamRole=='Explorer')
+ assert(work.reviveSync()and flags.exploreMap and not flags.takeTeamGuns and opts.teamRole=='Explorer')
  assert(not work.lostCached and work.reviveCount==1)
 end)
 test('food-count caching refreshes when native inventory changes within the same frame',function()

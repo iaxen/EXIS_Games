@@ -246,6 +246,62 @@ test('native building station uses its own stock and craft event',function()
  work.net=function(name)assert(name=='BuildingStationCraft');return{FireServer=function(_,id)assert(id=='storage');held('Storage',1)end}end
  assert(work.stationTick(goal,'structures')and count('Storage')==1 and work.stationStock.wood==99)
 end)
+test('an unconfirmed station deposit is not repeated with the next bag of wood',function()
+ body('    function work.stationTick(', '    function work.choiceScore(')
+ local material=held('Wood',8);item('wall','Wooden Wall')
+ local zone={};local goal={id='wall',info=cfg.item.byId.wall,recipe={wood=3},stationKind='building'}
+ work.buildingStock={};work.structureStation=function()return{},zone end;work.insideStation=function()return true end
+ local sent=0;work.batchDrop=function(tool,n)sent=sent+n;tool.attrs.count=tool.attrs.count-n;return n end
+ work.net=function()return{FireServer=function()end}end
+ assert(work.stationTick(goal,'greatWall')and sent==3 and count('Wood')==5)
+ assert(not work.stationTick(goal,'greatWall')and sent==3 and count('Wood')==5)
+ work.buildingStock.wood=3;work.sent=0
+ work.net=function(name)return{FireServer=function()assert(name=='BuildingStationCraft');held('Wooden Wall',1);work.buildingStock.wood=0 end}end
+ assert(work.stationTick(goal,'greatWall')and sent==3 and count('Wooden Wall')==1)
+end)
+test('unsafe native drop geometry never spends station materials',function()
+ body('    function work.stationTick(', '    function work.choiceScore(')
+ held('Wood',3);item('wall','Wooden Wall')
+ work.buildingStock={};work.structureStation=function()return{},{}end;work.insideStation=function()return true end
+ work.prepareStationDrop=function()return false end
+ work.batchDrop=function()error('unsafe deposit must not send')end
+ assert(not work.stationTick({id='wall',info=cfg.item.byId.wall,recipe={wood=3},stationKind='building'},'greatWall'))
+ assert(count('Wood')==3)
+end)
+test('wall materials use building stock instead of unrelated crafting table stock',function()
+ body('    function work.stationGoal(', '    function work.supplyAmounts(')
+ work.buildingStock={wood=1};work.stationStock={wood=99}
+ local goal={kind='structure',stationKind='building',recipe={wood=3}}
+ assert(work.stationGoal(goal)==goal and work.goalAmounts(goal).wood==2)
+end)
+test('station approach accounts for the native forward throw and rejects vertical misses',function()
+ body('    function work.prepareStationDrop(', '    function work.stationTick(')
+ work.nativeDropReach=function()return 5 end
+ work.safeWorkPoint=function()return true end
+ motion.floor=function()return vec(5,0,0)end
+ travel=function(point)r.Position=point;return true end
+ CFrame={lookAt=function()return{}end}
+ local head={Position=vec(5,4,0),CFrame={LookVector=vec(-1,0,0)}}
+ player.Character.FindFirstChild=function()return head end
+ local zone={Position=vec(0,0,0),Size=vec(10,10,10),CFrame={PointToObjectSpace=function(_,v)return v end}}
+ assert(work.prepareStationDrop(zone,cfg.item.byId.wood,'craft'))
+ head.Position=vec(5,20,0)
+ assert(not work.prepareStationDrop(zone,cfg.item.byId.wood,'craft'))
+end)
+test('a destroyed weapon is rejected before EquipTool can reparent it',function()
+ local equip=assert(load(extract('    local function equip(t)','    local function nearest(')..'\nreturn equip'))()
+ local backpack={};player.FindFirstChildOfClass=function()return backpack end
+ h.EquipTool=function()error('must not equip stale weapon')end
+ local tool=held('Wood',1);tool.Parent=nil
+ assert(equip(tool)==false)
+end)
+test('a weapon destroyed during EquipTool is handled without crashing the job',function()
+ local equip=assert(load(extract('    local function equip(t)','    local function nearest(')..'\nreturn equip'))()
+ local backpack={};player.FindFirstChildOfClass=function()return backpack end
+ local tool=held('Wood',1);tool.Parent=backpack
+ h.EquipTool=function()tool.Parent=nil;error('Parent locked')end
+ assert(equip(tool)==false and not work.attackPlanCache)
+end)
 test('an unavailable structure recipe cannot keep interrupting productive work',function()
  item('storage','Storage');work.structureGoal=function()return{id='storage',info=cfg.item.byId.storage}end
  work.structureStation=function()return{}end;work.buildingSynced=true;work.goalRunnable=function()return false end
