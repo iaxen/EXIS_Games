@@ -4077,7 +4077,63 @@ local function runIslandEscape()
         until os.clock()>=deadline
         return acted
     end
+    function work.resourceReach(point,target,stats,padding)
+        local at=pos(target)
+        if not at then return false end
+        local delta=at-point;local range=(tonumber(stats.range)or 6)-(padding or .15)
+        if Vector3.new(delta.X,0,delta.Z).Magnitude>range then return false end
+        -- MeleeClient tests real parts, then traces to resource pivot + 2Y.
+        if workspace.GetPartBoundsInRadius then
+            local params=OverlapParams.new();params.FilterType=Enum.RaycastFilterType.Include
+            params.FilterDescendantsInstances={target}
+            local found=false
+            for _,part in ipairs(workspace:GetPartBoundsInRadius(point,math.max(.1,range),params))do
+                if part:FindFirstAncestorOfClass("Model")==target then found=true break end
+            end
+            if not found then return false end
+        end
+        if workspace.Raycast then
+            local include={};local scene=world()
+            for _,name in ipairs({"Tiles","自由建筑"})do local folder=scene and scene:FindFirstChild(name);if folder then include[#include+1]=folder end end
+            local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include
+            params.FilterDescendantsInstances=include;params.RespectCanCollide=true
+            local aim=at+Vector3.new(0,2,0)
+            if workspace:Raycast(point,aim-point,params)then return false end
+        end
+        return true
+    end
+    function work.harvestPosition(target,stats)
+        local r,human=root();local center=pos(target)
+        if not r or not center then return end
+        if work.resourceReach(r.Position,target,stats)and work.safeWorkPoint(r.Position,3)then return r.Position end
+        local radius=math.max(.5,(tonumber(stats.range)or 6)-.5)
+        local lift=math.max(2,human.HipHeight+r.Size.Y/2)
+        local best,score
+        for ring=1,4 do for i=0,15 do
+            local angle=i*math.pi/8;local distance=radius*(1-(ring-1)*.25)
+            local probe=center+Vector3.new(math.cos(angle)*distance,0,math.sin(angle)*distance)
+            local floor=motion.floor(probe,target,16,12)
+            local point=floor and floor+Vector3.new(0,lift,0)
+            if point and work.safeWorkPoint(point,3)and work.resourceReach(point,target,stats,.4)
+                and(opts.move=="Teleport"or motion.clearSegment(r.Position,point,target))then
+                local value=(point-r.Position).Magnitude
+                if not score or value<score then best,score=point,value end
+            end
+        end end
+        return best
+    end
+    function work.harvestTrace(target,tool,stats)
+        local r=root();local at=pos(target)
+        local info=config().worldResource.byId[target:GetAttribute("resourceId")]or{}
+        return target.Name.." ["..tostring(target:GetAttribute("resourceId")).."] • TOOL "..tool.Name
+            .." / "..tostring(stats.toolType).." • LEVEL "..tostring(stats.lvl).." • USE DAMAGE "..tostring(stats.useDmg).." • RANGE "..tostring(stats.range)
+            .." • WINDUP "..tostring(stats.windup).." / COOLDOWN "..tostring(stats.useCd)
+            .." • HP "..tostring(target:GetAttribute("hp")).." / CONFIG "..tostring(info.hp)
+            .." • DISTANCE "..tostring(r and at and(r.Position-at).Magnitude)
+            .." • TOOL ENABLED "..tostring(tool.Enabled).." • REQUIRED TYPE "..tostring(info.requireToolType)
+    end
     function work.resourceCandidate(key, neededOnly)
+        if os.clock()<(work.harvestRetryAt or 0)then return end
         local preferred = work.preferredTargets and work.preferredTargets[key]
         if preferred and work.resourceEligible(preferred, key, neededOnly) then return preferred end
         if work.preferredTargets then work.preferredTargets[key] = nil end
@@ -4132,7 +4188,9 @@ local function runIslandEscape()
         local noDamage = 0
         while work.running(key, character, serial) and os.clock() < deadline do
             if not work.canCollect() then note(key, "BAG FULL: SUBMITTING BEFORE FURTHER HARVEST") return false end
-            local hp = best:GetAttribute("hp")
+            local hp=tonumber(best:GetAttribute("hp"))
+            local baseline=tonumber(rc.hp)
+            if hp==nil and baseline and baseline>0 then hp=baseline end
             if not best.Parent or (type(hp) == "number" and hp <= 0) then
                 work.lastHarvestKind=work.resourceKind(rc)
                 work.recordCut(best, rc)
@@ -4147,9 +4205,9 @@ local function runIslandEscape()
                 note(key, "TOOL NO LONGER AVAILABLE")
                 return false
             end
-            if not travel(best, key, math.max(1, (tc.range or 6) - 0.5)) then
-                return false
-            end
+            local position=work.harvestPosition(best,tc)
+            if not position then note(key,"NO NATIVE RESOURCE HIT POSITION • "..work.harvestTrace(best,tool,tc));failed[best]=os.clock()+5;return false end
+            if not travel(position,key,.2)then return false end
             equip(tool)
             local r = root()
             if not r then
@@ -4157,19 +4215,29 @@ local function runIslandEscape()
             end
             local p = best:GetPivot().Position
             r.CFrame = CFrame.lookAt(r.Position, Vector3.new(p.X, r.Position.Y, p.Z))
-            if not work.strike(tool, tc, {}, {best}, key) then return false end
+            work.harvestStatus=work.harvestTrace(best,tool,tc)
+            if not work.strike(tool,tc,{}, {best},key)then
+                if not work.preempted then
+                    failed[best]=os.clock()+2;work.harvestRetryAt=os.clock()+1
+                    note(key,"NATIVE HARVEST CYCLE DEFERRED • "..work.harvestStatus)
+                end
+                return false
+            end
             if opts.fastHarvest == false and not work.pause(key, opts.settleTime) then return false end
             local damaged = work.await(key, function()
                 local current = best:GetAttribute("hp")
                 return not best.Parent or (type(current) == "number"
                     and type(hp) == "number" and current < hp)
-            end, math.max(0.15, math.min(0.5, tonumber(tc.useCd) or 0.7)))
+            end,math.max(.75,math.min(tonumber(tc.windup)or 0,tonumber(tc.useCd)or .7)+.75))
             if work.preempted then return damaged end
+            if damaged then work.harvestReceipts=(work.harvestReceipts or 0)+1 end
             noDamage = damaged and 0 or noDamage + 1
             note(key, damaged and "CHOPPING SAME RESOURCE" or "WAITING FOR RESOURCE DAMAGE")
             if noDamage >= 3 then
-                failed[best] = os.clock() + 1
-                note(key, "NO DAMAGE AFTER 3 SWINGS; RETRY LATER")
+                failed[best]=os.clock()+10
+                work.harvestRetryAt=os.clock()+3
+                work.harvestStatus=work.harvestTrace(best,tool,tc)
+                note(key,"NO RESOURCE DAMAGE AFTER 3 NATIVE TOOL CYCLES • "..work.harvestStatus)
                 return false
             end
         end
@@ -5214,7 +5282,7 @@ local function runIslandEscape()
             end
         end
         local req = flags.quest and work.questRequirement
-        if req then
+        if req and not work.questAcquireGoal then
             local requested=c.item.byId[req.itemId]
             if requested and requested.recipeId and next(work.recipeAmounts(requested))and not(c.food and c.food.byId[requested.id])and count(requested.displayName)==0
                 and work.questTotal(req)<req.count then
@@ -5584,7 +5652,7 @@ local function runIslandEscape()
         work.objective = nil
     end
     function work.planProgression()
-        local goal = (work.active == "progression" and work.activeGoal) or work.chooseUpgrade()
+        local goal=((work.active=="progression"or work.active=="questAcquire")and work.activeGoal)or work.chooseUpgrade()
         work.processing = nil
         if not goal then
             note("progression", "NO AVAILABLE UPGRADE / BLUEPRINT")
@@ -5927,7 +5995,7 @@ local function runIslandEscape()
         end
         for _, model in ipairs(resources) do
             if not model.Parent or not work.safeResource(model)
-                or (r.Position - pos(model)).Magnitude > (stats.range or 6) then return false end
+                or(work.resourceReach and not work.resourceReach(r.Position,model,stats))then return false end
         end
         work.nextStrikeAt = os.clock() + math.max(0, tonumber(stats.useCd) or 0.7)
         if #targets > 0 then
@@ -5939,9 +6007,14 @@ local function runIslandEscape()
             if work.activateWeapon then
                 if not work.activateWeapon(tool,stats,targets[1],key)then work.attackCommit=nil return false end
             else tool:Activate() end
-        else
-            RS.Events.meleeHitRemote:FireServer(targets, resources)
-        end
+        elseif #resources>0 then
+            -- Harvesting must run the same bound native cycle as manual use:
+            -- cooldown, windup, overlap selection, recovery and server report.
+            if work.activateWeapon then
+                if not work.activateWeapon(tool,stats,resources[1],key)then return false end
+            else tool:Activate()end
+            work.harvestRequests=(work.harvestRequests or 0)+1
+        else return false end
         work.sent = work.sent + 1
         if #targets>0 then work.attackRequests=(work.attackRequests or 0)+1 end
         return true
@@ -6040,7 +6113,7 @@ local function runIslandEscape()
         local best, stats
         for _, tool in ipairs(tools()) do
             local row = config().tool.byDisplayName[tool.Name]
-            if row and (info.requireToolType == "any" or row.toolType == info.requireToolType)
+            if row and(tonumber(row.useDmg)or 0)>0 and(info.requireToolType=="any"or row.toolType==info.requireToolType)
                 and (not stats or (row.useDmg or 0) > (stats.useDmg or 0)) then best, stats = tool, row end
         end
         work.resourceToolCache[key] = {tool = best, stats = stats}
@@ -7120,6 +7193,9 @@ local function runIslandEscape()
     end
     function work.activateWeapon(tool, stats, target, key)
         if tool.Parent ~= player.Character then return false end
+        if tool.Enabled==false and not work.await(key,function()return tool.Enabled~=false end,.75)then
+            note(key,"NATIVE TOOL REMAINS DISABLED; NO ACTIVATION SENT")return false
+        end
         local ranged = stats.toolType == "gun" or stats.toolType == "infGun" or stats.toolType == "ranged"
         if ranged then
             -- GunClient has no mouse ray argument: its Aim.Adornee must exist.
@@ -7572,7 +7648,7 @@ local function runIslandEscape()
         return pickups(key,true)or gatherResource(key,true)
     end
     function work.automationReport()
-        local c=config();local rows={"AUTOMATION AUDIT v2 • COMBAT HANDOFFS"}
+        local c=config();local rows={"AUTOMATION AUDIT v3 • NATIVE HARVESTING"}
         local torch=work.shadowWeapon()
         rows[#rows+1]="Shadow: "..(not flags.killShadow and"OFF"or torch and"TORCH AVAILABLE; CONFIRMS TorchHits"or"BLOCKED: NO NATIVE LIGHT-SOURCE TOOL")
         rows[#rows+1]="Craft station: "..(work.stationSynced and"SYNCED"or"WAITING FOR SERVER STOCK")
@@ -7583,6 +7659,8 @@ local function runIslandEscape()
         local passive,hostile=0,0
         for _,row in ipairs(work.creatures())do if row.hostile then hostile=hostile+1 else passive=passive+1 end end
         rows[#rows+1]="Loaded living mobs: "..hostile.." hostile / "..passive.." passive; unstreamed mobs unknown"
+        rows[#rows+1]="Harvest cycles: "..tostring(work.harvestRequests or 0).." native activations attempted / "..tostring(work.harvestReceipts or 0).." HP/despawn receipts"
+        rows[#rows+1]="Harvest detail: "..tostring(work.harvestStatus or"NO RESOURCE ATTEMPT YET")
         rows[#rows+1]="Quest acquisition: "..tostring(taskStatus.questAcquire or"WAITING FOR ACTIVE REQUEST")
         rows[#rows+1]="Attack cycles: "..tostring(work.attackRequests or 0).." activations attempted / "..tostring(work.attackReceipts or 0).." damage receipts"
         rows[#rows+1]="Defence urgent: "..tostring(work.combatUrgent()).." | Guard radius "..tostring(opts.guardRadius).." | Evade recovery "..tostring(math.max(0,(work.evadeRecoverUntil or 0)-os.clock()))

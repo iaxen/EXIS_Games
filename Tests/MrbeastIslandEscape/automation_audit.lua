@@ -383,5 +383,114 @@ test('immediate player contact takes targeting priority over a more distant camp
  work.combatPosition=function(m)return m.point,10 end
  assert(work.attackPlan('combat',{range=4,toolType='axe'})==near)
 end)
+test('resource strikes activate the bound native tool and never send a raw hit report',function()
+ body('    function work.strike(', '    local function blueprintReady(')
+ local tree=object('Tree');tree.point=vec(2,0,0);local tool=object('Axe','Tool');tool.Parent=player.Character
+ equip=function()end;work.pause=function()return true end;work.checkpoint=function()return true end
+ work.resourceReach=function()return true end;work.setSprint=function()end
+ local activated=0;work.activateWeapon=function(t,stats,target,key)assert(t==tool and target==tree and key=='questAcquire');activated=activated+1;return true end
+ RS={Events={meleeHitRemote={FireServer=function()error('raw resource hit packet must not be sent')end}}}
+ assert(work.strike(tool,{range=4,useCd=.8},{},{tree},'questAcquire')and activated==1 and work.harvestRequests==1)
+end)
+test('resource tool selection rejects matching tools with zero harvesting damage',function()
+ body('    function work.resourceTool(', '    function work.boatId(')
+ local axe=object('Axe','Tool');local torchTool=object('Torch','Tool');bag={torchTool,axe}
+ cfg.tool.byDisplayName.Torch={toolType='axe',useDmg=0};cfg.tool.byDisplayName.Axe.useDmg=2
+ assert(work.resourceTool{requireToolType='axe'}==axe)
+ bag={torchTool};now=.1;assert(not work.resourceTool{requireToolType='axe'})
+end)
+test('resource reach requires native part overlap rather than model-pivot distance alone',function()
+ body('    function work.resourceReach(', '    function work.harvestPosition(')
+ local tree=object('Tree');tree.point=vec(2,0,0)
+ workspace.GetPartBoundsInRadius=function()return{}end
+ assert(not work.resourceReach(r.Position,tree,{range=4}))
+ workspace.GetPartBoundsInRadius=function()return{{FindFirstAncestorOfClass=function()return tree end}}end
+ assert(work.resourceReach(r.Position,tree,{range=4}))
+end)
+test('native resource line of sight aims two studs above the resource pivot',function()
+ body('    function work.resourceReach(', '    function work.harvestPosition(')
+ local tree=object('Tree');tree.point=vec(2,0,0)
+ workspace.Raycast=function(_,from,delta)assert((from+delta).Y==2);return nil end
+ assert(work.resourceReach(r.Position,tree,{range=4}))
+end)
+test('quest acquisition is the sole quest-material planner instead of racing progression',function()
+ body('    function work.upgradeCandidates()', '    function work.stationGoal(')
+ item('feather','Chicken Feather');work.questRequirement={itemId='feather',count=1}
+ work.questAcquireGoal=function()error('candidate planning must not recursively invoke acquisition')end
+ work.questDrops=function()return{}end;work.questTotal=function()return 0 end
+ work.bagGoal=function()end;work.campfireGoal=function()end;work.maintenanceGoal=function()end
+ selected={craft={}};itemLabel=function(_,id)return id end
+ for _,goal in ipairs(work.upgradeCandidates())do assert(goal.kind~='quest'and not goal.questFor)end
+end)
+test('failed native harvesting backs off the resource candidate search',function()
+ body('    function work.resourceCandidate(', '    local function gatherResource(')
+ work.harvestRetryAt=3;work.models=function()error('must not rescan during harvest backoff')end
+ assert(not work.resourceCandidate('questAcquire',true))
+end)
+test('a disabled native tool is awaited without pretending an activation was sent',function()
+ body('    function work.activateWeapon(', '    function work.setSprint(')
+ local tool=object('Axe','Tool');tool.Parent=player.Character;tool.Enabled=false
+ work.await=function()return false end;tool.Activate=function()error('disabled tool must not activate')end
+ assert(not work.activateWeapon(tool,{toolType='axe'},{},'questAcquire'))
+end)
+local function harvestSimulation(damage,baseline)
+ body('    function work.resourceReach(', '    local function gatherResource(')
+ body('    function work.strike(', '    local function blueprintReady(')
+ body('    function work.activateWeapon(', '    function work.setSprint(')
+ local gather=assert(load(extract('    local function gatherResource(', '    function work.chestState(')..'\nreturn gatherResource'))()
+ local tree=object('Tree');tree.point=vec(6,0,0);tree.attrs.resourceId='Tree'
+ function tree:GetPivot()return CFrame.new(self.point)end
+ cfg.worldResource.byId.Tree={hp=baseline==nil and 6 or baseline,requireToolType='axe',dropId='tree'}
+ local stats={toolType='axe',range=4,useDmg=2,useCd=.8,windup=.4}
+ local tool=object('Axe','Tool');tool.Parent=player.Character;tool.Enabled=true
+ scene.Static={};opts.move='Teleport';opts.jobTimeout=90
+ local scheduled,times={},{};local cut=0
+ local function advance(dt)
+  now=now+dt
+  for _,e in ipairs(scheduled)do if not e.done and now>=e.at then e.done=true;tree.attrs.hp=math.max(0,(tree.attrs.hp or 6)-2)end end
+ end
+ function tool:Activate()
+  if #times>0 then assert(now-times[#times]>=.799,'native cooldown was bypassed')end
+  times[#times+1]=now
+  if damage then scheduled[#scheduled+1]={at=now+.4+.0667+.2}end
+ end
+ work.models=function(kind)return kind=='resources'and{tree}or{}end
+ work.resourceEligible=function(m)return m.Parent and not(failed[m]and failed[m]>now)end
+ nearest=function(list,predicate)for _,m in ipairs(list)do if predicate(m)then return m end end end
+ work.resourceTool=function()return tool,stats end;work.resourceKind=function()return'tree'end
+ work.treeDropContext=function()return{center=tree.point,wanted={wood=1}}end
+ work.running=function()return now<90 end;work.checkpoint=function()return true end
+ work.pause=function(_,dt)advance(dt);return true end;work.setSprint=function()end
+ work.await=function(_,predicate,seconds)
+  local deadline=now+seconds
+  repeat if predicate()then return true end;advance(.05)until now>=deadline
+  return predicate()
+ end
+ work.recordCut=function()cut=cut+1 end;work.setRecovery=function(c)work.treeDrops=c end
+ work.recoverTreeDrops=function()stock.Wood=1;work.treeDrops=nil;return true end
+ equip=function()end;travel=function(p)r.Position=p;return true end;CFrame.lookAt=function(p)return CFrame.new(p)end
+ RS={Engine={FindFirstChild=function()return nil end},Events={meleeHitRemote={FireServer=function()error('native cycle required')end}}}
+ workspace.GetPartBoundsInRadius=function(_,p,range)
+  return Vector3.new(p.X-tree.point.X,0,p.Z-tree.point.Z).Magnitude<=range and{{FindFirstAncestorOfClass=function()return tree end}}or{}
+ end
+ local result=gather('questAcquire',true)
+ return result,times,cut,tree
+end
+test('wood harvesting waits for delayed native hits and collects only after confirmed resource depletion',function()
+ local result,times,cut,tree=harvestSimulation(true)
+ assert(result and #times==3 and cut==1 and tree.attrs.hp==0 and stock.Wood==1)
+ assert(work.harvestRequests==3 and work.harvestReceipts==3)
+end)
+test('three unconfirmed native harvest cycles back off without inventing a cut or collected wood',function()
+ local result,times,cut,tree=harvestSimulation(false)
+ assert(not result and #times==3 and cut==0 and not stock.Wood)
+ assert(failed[tree]>=now+9.9 and work.harvestRetryAt>=now+2.9)
+ assert(work.harvestStatus:find('USE DAMAGE 2',1,true)and work.harvestStatus:find('CONFIG 6',1,true))
+ assert(not work.resourceCandidate('questAcquire',true))
+end)
+test('zero configuration health without a replicated HP value is not proof of a cut',function()
+ local result,times,cut=harvestSimulation(false,0)
+ assert(not result and #times==3 and cut==0 and not stock.Wood)
+end)
 assert(loadfile('Games/MrbeastIslandEscape.lua'))
 print(n..' automation, native geometry, bulk collection, gear, Shadow and wall checks passed; module compiles')
