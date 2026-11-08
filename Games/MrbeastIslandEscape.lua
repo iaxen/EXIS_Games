@@ -3369,6 +3369,7 @@ local function runIslandEscape()
         work.lateDropsDirty = true
     end
     function work.contextEnabled(key)
+        if key=="questAcquire"then return flags.quest end
         if key == "gather" then return flags.gather or flags.chopTrees or flags.mineStone or flags.mineIron end
         if key == "progression" then return work.progressionEnabled() end
         return flags[key]
@@ -3668,7 +3669,7 @@ local function runIslandEscape()
             local r = root()
             return r and risk <= work.danger(r.Position, opts.dangerRadius)
         end
-        if owner == "combat" or owner == "hunt" or owner=="foodHunt"or owner=="shadowHunt"then return work.combatClear(point) end
+        if owner == "combat" or owner == "hunt" or owner=="foodHunt"or owner=="shadowHunt"or work.huntingNeeds~=nil then return work.combatClear(point) end
         return work.safeWorkPoint(point, 0)
     end
     function work.combatClear(point)
@@ -3701,7 +3702,7 @@ local function runIslandEscape()
                 if owner == "evade" or work.escapeMove then
                     local initial = (a - row.point).Magnitude
                     if radius > 0 and ((initial < radius and distance + 0.1 < initial) or (initial >= radius and distance < radius)) then return false end
-                elseif owner == "combat" or owner == "hunt" or owner=="foodHunt"or owner=="shadowHunt"then
+                elseif owner == "combat" or owner == "hunt" or owner=="foodHunt"or owner=="shadowHunt"or work.huntingNeeds~=nil then
                     local elevated = false
                     local clearance = row.model == work.attackTarget and work.meleeClearance(row.model, work.attackStats) or work.enemyReach(row.model) + opts.combatMargin
                     if not elevated and distance < clearance then
@@ -5755,6 +5756,7 @@ local function runIslandEscape()
         if key=="shadowHunt"then return 1.4 end
         if key=="greatWall"then return 6.8 end
         if key=="equipArmour"then return 2.9 end
+        if key=="questAcquire"then return 3.012 end
         if key=="combat"then
             if work.combatUrgent then return work.combatUrgent()and 1.5 or 6.5 end
             return(flags.combat and work.baseThreat())and 1 or 1.5
@@ -5859,6 +5861,10 @@ local function runIslandEscape()
         if work.nightPaused(work.currentJob)and not validHold then
             work.preempted = {from = work.active, to = "nightHold", rank = 10}
             motion.cancel("NIGHT HOLD • ROUTINE WORK PAUSED")
+            return false
+        end
+        if key=="questAcquire"and work.questWork and not work.questPlanCurrent(work.questWork)then
+            motion.cancel("MRBEAST REQUEST CHANGED • REPLANNING ACQUISITION")
             return false
         end
         if os.clock() < (work.nextPriorityCheck or 0) then return true end
@@ -6019,7 +6025,7 @@ local function runIslandEscape()
         return kind or(info.requireToolType=="axe"and"tree"or"other")
     end
     function work.resourceAllowed(info, key)
-        if key == "progression" or key == "stockpile" or key == "structures" or key=="greatWall"then return true end
+        if key == "progression" or key == "stockpile" or key == "structures" or key=="greatWall"or key=="questAcquire"then return true end
         local kind = work.resourceKind(info)
         return flags.gather or (kind == "tree" and flags.chopTrees)
             or (kind == "stone" and flags.mineStone) or (kind == "iron" and flags.mineIron)
@@ -6213,13 +6219,14 @@ local function runIslandEscape()
         return (not work.huntingNeeds and flags.hunt) or work.mobYields(model, work.huntWanted())
     end
     function work.huntCandidate(wanted)
-        local r = root()
-        if not r or not work.canCollect() or not work.meleeWeapon("foodHunt") then return end
+        local r=root();local tool,stats=work.meleeWeapon("hunt")
+        if not r or not work.canCollect()or not tool then return end
         if flags.killFoodOnSight and os.clock()<(work.foodHuntAt or 0) then return end
         for _, row in ipairs(work.creatures()) do
             if row.attackable and row.human.Health > 0 and row.model.Parent
                 and (row.point - r.Position).Magnitude <= opts.huntRadius
-                and work.insideBorder(row.point) and work.safeResource(row.model)
+                and work.insideBorder(row.point)
+                and(work.safeResource(row.model)or stats and work.combatPosition and work.combatPosition(row.model,stats))
                 and not (failed[row.model] and failed[row.model] > os.clock())
                 and work.mobYields(row.model, wanted) then return row.model end
         end
@@ -7576,6 +7583,7 @@ local function runIslandEscape()
         local passive,hostile=0,0
         for _,row in ipairs(work.creatures())do if row.hostile then hostile=hostile+1 else passive=passive+1 end end
         rows[#rows+1]="Loaded living mobs: "..hostile.." hostile / "..passive.." passive; unstreamed mobs unknown"
+        rows[#rows+1]="Quest acquisition: "..tostring(taskStatus.questAcquire or"WAITING FOR ACTIVE REQUEST")
         rows[#rows+1]="Attack cycles: "..tostring(work.attackRequests or 0).." activations attempted / "..tostring(work.attackReceipts or 0).." damage receipts"
         rows[#rows+1]="Defence urgent: "..tostring(work.combatUrgent()).." | Guard radius "..tostring(opts.guardRadius).." | Evade recovery "..tostring(math.max(0,(work.evadeRecoverUntil or 0)-os.clock()))
         rows[#rows+1]="Bulk collection: "..tostring(flags.bulkCollect).." | Recipe fire level: "..tostring((work.fireState()or{}).level or"UNKNOWN")
@@ -7598,6 +7606,141 @@ local function runIslandEscape()
             state.trailIndex=i
         end
         return work.openChest()
+    end
+    function work.questAcquireGoal()
+        local req=flags.quest and work.questRequirement
+        if work.questSubmission or not req or work.questTotal(req)>=req.count then return end
+        local c=config();local item=c.item.byId[req.itemId]
+        if not item then return end
+        local needed=math.max(0,req.count-work.questTotal(req))
+        local goal={key="questAcquire:"..req.itemId,kind="questSupply",itemId=req.itemId,
+            questFor=req.itemId,name="MRBEAST: "..item.displayName,mode="direct",amounts={[req.itemId]=req.count},
+            requested=req.itemId,required=req.count,revision=work.questCache and work.questCache.revision,scene=world(),needed=needed}
+        -- Existing exact outputs take precedence over producing another batch.
+        if work.storageCount(req.itemId)>0 then return goal end
+        for _,drop in ipairs(work.models("drops"))do
+            if drop.Name==item.displayName and work.dropAllowed(drop)and work.safeResource(drop)then return goal end
+        end
+        for raw,food in pairs(c.food and c.food.byId or{})do
+            if food.canCook and food.cookTargetId==req.itemId then
+                goal.mode,goal.raw="cook",raw
+                local pending=campData.currentFoodId==raw and(campData.pendingCookCount or 0)or 0
+                goal.amounts={[raw]=math.max(0,needed-pending)}
+                break
+            end
+        end
+        if req.itemId==c.misc.furnaceResultId then goal.mode="smelt"end
+        local prerequisite=goal.mode=="cook"and"Campfire"or goal.mode=="smelt"and"Furnace"
+        if prerequisite and not built(prerequisite)then
+            local folder=world()and world():FindFirstChild("Buildings")
+            for id,info in pairs(c.build and c.build.byId or{})do
+                if info.assetId==prerequisite and folder and folder:FindFirstChild(info.assetId.."_Construct")then
+                    goal.mode,goal.kind,goal.id,goal.info="build","build",id,info
+                    goal.amounts=work.recipeAmounts(info,true)
+                    goal.name=goal.name.." • BUILD "..prerequisite.." FIRST"
+                    return goal
+                end
+            end
+            goal.blocked="REQUIRED "..prerequisite:upper().." BLUEPRINT NOT LOADED"
+        elseif goal.mode=="direct"and item.recipeId and next(work.recipeAmounts(item))and not(c.food and c.food.byId[item.id])then
+            goal.mode,goal.kind,goal.id,goal.info="craft","craft",item.id,item
+            goal.amounts=work.goalAmounts(goal)
+        end
+        return goal
+    end
+    function work.questPlanCurrent(goal)
+        local req=flags.quest and work.questRequirement
+        return req and world()==goal.scene and req.itemId==goal.requested and req.count==goal.required
+            and(not goal.revision or work.questCache and work.questCache.revision==goal.revision)or false
+    end
+    function work.questAcquireReady()
+        local goal=work.questAcquireGoal()
+        if not goal then return false end
+        if goal.blocked then note("questAcquire",goal.blocked)return false end
+        if goal.mode=="cook"then
+            if campData.readyFoodId==goal.requested and(campData.readyCount or 0)>0 then return work.canCollect()end
+            local raw=config().item.byId[goal.raw]
+            if(campData.readyCount or 0)>0 and work.isCookedFood(campData.readyFoodId)and work.canCollect()then return true end
+            if raw and(goal.amounts[goal.raw]or 0)>0 and count(raw.displayName)>0 and work.cookCompatible(goal.raw)and not work.stormActive()then return true end
+            if not next(work.missing(goal.amounts))then note("questAcquire","WAITING FOR REQUESTED FOOD TO FINISH COOKING")return false end
+        elseif goal.mode=="smelt"then
+            if(furnaceData.readyCount or 0)>0 and work.canCollect()then return true end
+            if math.min(furnaceData.matter1Count or 0,furnaceData.matter2Count or 0)>=goal.needed then
+                note("questAcquire","WAITING FOR REQUESTED IRON TO FINISH SMELTING")return false
+            end
+            local supply=work.supplyAmounts(goal)
+            for _,id in ipairs({config().misc.furnaceMatter1Id,config().misc.furnaceMatter2Id})do
+                local item=config().item.byId[id]
+                if item and(supply[id]or 0)>0 and count(item.displayName)>0 then return true end
+            end
+        end
+        local ready=work.goalRunnable(goal)
+        if not ready then note("questAcquire",goal.name.." • NO SAFE LOADED SOURCE / TOOL / STATION YET")end
+        return ready
+    end
+    function work.questAcquireStep(goal)
+        local key="questAcquire"
+        if not work.questPlanCurrent(goal)then return false end
+        work.activeGoal,work.needs,work.amounts,work.resourceNeeds,work.needTotals=goal,{},{},{},{}
+        local supply=work.supplyAmounts(goal)
+        for id,n in pairs(supply)do
+            if n>0 and not(goal.mode=="smelt"and id==goal.requested)then work.needItem(id,n,100)end
+        end
+        for id,resource in pairs(config().worldResource.byId)do
+            for _,drop in pairs(config().itemDrop and config().itemDrop.byId[resource.dropId]or{})do
+                local item=type(drop)=="table"and config().item.byName[drop.itemCN]
+                if item and work.needs[item.id]then work.resourceNeeds[id]=100 end
+            end
+        end
+        note(key,goal.name.." • ACQUIRING REQUESTED SUPPLIES")
+        -- Reclaim the exact output before spending ingredients on another one.
+        if work.reclaimStorage({amounts={[goal.requested]=goal.required}},key)then return true end
+        if goal.mode=="cook"then
+            if campData.readyFoodId==goal.requested and(campData.readyCount or 0)>0 then
+                if not travel(built("Campfire"),key)or not work.questPlanCurrent(goal)then return false end
+                return work.collectCookedUnit(key)
+            end
+            local raw=config().item.byId[goal.raw]
+            if(campData.readyCount or 0)>0 and work.isCookedFood(campData.readyFoodId)and work.canCollect()then
+                if not travel(built("Campfire"),key)or not work.questPlanCurrent(goal)then return false end
+                note(key,"CLEARING PREVIOUS COOKED BATCH FOR MRBEAST")
+                return work.collectCookedUnit(key)
+            end
+            if raw and(goal.amounts[goal.raw]or 0)>0 and count(raw.displayName)>0 and work.cookCompatible(goal.raw)and not work.stormActive()then
+                if not travel(built("Campfire"),key)or not work.questPlanCurrent(goal)then return false end
+                return work.submitUnits(key,"MakeFire","addFood",{[goal.raw]=math.min(goal.amounts[goal.raw]or 0,count(raw.displayName))},goal.raw)
+            end
+        elseif goal.mode=="smelt"then
+            if(furnaceData.readyCount or 0)>0 and work.canCollect()then
+                if not travel(built("Furnace"),key)or not work.questPlanCurrent(goal)then return false end
+                return work.request(key,"Furnace","collectResult")
+            end
+            local supplied=false
+            for _,id in ipairs({config().misc.furnaceMatter1Id,config().misc.furnaceMatter2Id})do
+                local item=config().item.byId[id]
+                if item and(supply[id]or 0)>0 and count(item.displayName)>0 then supplied=true end
+            end
+            if supplied then return work.smeltBag(key,supply)end
+        elseif goal.mode=="build"or goal.mode=="craft"then
+            if work.batchReady(goal,key)and work.submitGoal(key,goal)then return true end
+        end
+        if not work.questPlanCurrent(goal)or work.preempted then return false end
+        if not work.canCollect()then return work.unloadBag()end
+        if work.reclaimStorage({amounts=supply},key)then return true end
+        if pickups(key,true)or gatherResource(key,true)then return true end
+        if work.huntForMaterials(key)then return true end
+        note(key,goal.name.." • SOURCE BLOCKED / UNLOADED; REQUEST REMAINS ACTIVE")
+        return false
+    end
+    function work.questAcquireTick()
+        local goal=work.questAcquireGoal()
+        if not goal or goal.blocked then return false end
+        work.questWork=goal
+        local ok,result=pcall(work.questAcquireStep,goal)
+        work.questWork,work.huntingNeeds,work.attackPlanCache=nil,nil,nil
+        work.refreshAt=0
+        if not ok then error(result)end
+        return result
     end
     function work.criticalMeal()
         local _,human=root()
@@ -7669,6 +7812,7 @@ local function runIslandEscape()
         end)
     end
     local jobsList = {
+        {key="questAcquire",enabled=function()return flags.quest end,ready=work.questAcquireReady,run=work.questAcquireTick},
         {key="equipArmour",enabled=function()return flags.progression end,ready=function()return work.armourCandidate()~=nil end,run=work.equipArmour},
         {key="greatWall",enabled=function()return flags.greatWall end,ready=work.wallReady,run=work.wallTick},
         {key="shadowHunt",enabled=function()return flags.killShadow end,ready=function()return work.shadowCandidate()~=nil end,
