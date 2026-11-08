@@ -30,7 +30,7 @@ local function held(name,n)
  local t=model(name);t.Parent=player.Character;t.attrs.count=n;t.Activate=function()shots=shots+1 end;bag[#bag+1]=t;return t
 end
 local function setup()
- now=0;bag={};models={drops={},entities={},stations={},artifacts={}};events={};schedule={};shots=0
+ workspace={};now=0;bag={};models={drops={},entities={},stations={},artifacts={}};events={};schedule={};shots=0
  os.clock=function()return now end
  cfg={item={byId={},byDisplayName={},byName={}},food={byId={raw={canCook=true,cookTargetId='cooked'},cooked={canCook=false},fruit={canCook=false}}},
   tool={byId={},byDisplayName={}},mob={byId={Chicken={dropId='chicken'},Crab={dropId='crab'},Spider={}}},itemDrop={byId={chicken={{itemCN='Raw'}},crab={{itemCN='Raw'}}}},
@@ -122,6 +122,25 @@ test('a short passive animal is approached inside the native three-dimensional o
  assert(math.sqrt(point.X^2+point.Z^2+gap^2)<2.75)
  assert(not work.stanceScore(vec(2.8,3,0),chicken,{range=3,toolType='axe'}))
 end)
+test('crab approach moves inward until actual native parts overlap the attack sphere',function()
+ body('    function work.hitVerticalGap(', '    function work.stanceScore(')
+ body('    function work.combatPosition(', '    function work.attackPlan(')
+ local crab=model('Crab',vec(0,0,0))
+ crab.GetBoundingBox=function()return{Position=vec(0,1,0)},vec(8,2,8)end
+ OverlapParams={new=function()return{}end};Enum={RaycastFilterType={Include=1}}
+ local part={FindFirstAncestorOfClass=function()return crab end}
+ workspace.GetPartBoundsInRadius=function(_,point,range,params)
+  assert(params.FilterDescendantsInstances[1]==crab)
+  return math.sqrt(point.X^2+point.Z^2)<=.8 and{part}or{}
+ end
+ motion.floor=function(point)return vec(point.X,0,point.Z)end;motion.clearSegment=function()return true end
+ assert(not work.stanceScore(vec(2,3,0),crab,{range=3,toolType='axe'}))
+ local point=work.combatPosition(crab,{range=3,toolType='axe'})
+ assert(point and work.stanceScore(point,crab,{range=3,toolType='axe'}))
+ r.Position=point
+ local heldPoint=work.combatPosition(crab,{range=3,toolType='axe'})
+ assert(heldPoint==point,'already hittable passive targets must not cause another reposition')
+end)
 test('passive hunting prefers a working melee tool even when low health would favor a gun in combat',function()
  cfg.tool.byDisplayName.Axe={atkDmg=20,useCd=.5,range=3,toolType='axe'}
  cfg.tool.byDisplayName.Gun={atkDmg=10,useCd=1,range=40,toolType='gun'}
@@ -154,12 +173,13 @@ test('native ranged lock must match the target before firing',function()
  pg.FindFirstChild=function()return{Name='Aim',Parent=true,Enabled=true,Adornee=target,IsA=function(_,k)return k=='BillboardGui'end}end
  assert(work.activateWeapon(t,{toolType='gun'},target,'combat')and shots==1)
 end)
-test('auto-attack button dispatch does not double-activate the tool',function()
- local t=held('Axe',1);local signal={};local clicks=0
- pg.FindFirstChild=function()return{FindFirstChild=function()return{Visible=true,Activated=signal}end}end
- firesignal=function(s)assert(s==signal);clicks=clicks+1 end
- assert(work.activateWeapon(t,{toolType='axe'},model('Chicken'),'hunt')and clicks==1 and shots==0)
- flags.autoAttack=false;assert(work.activateWeapon(t,{toolType='axe'},model('Chicken'),'hunt')and clicks==1 and shots==1);firesignal=nil
+test('an unbound mobile button cannot swallow the equipped tool activation',function()
+ local t=held('Axe',1);local clicks=0
+ pg.FindFirstChild=function()return{FindFirstChild=function()return{Visible=true,Activated={}}end}end
+ firesignal=function()clicks=clicks+1 end
+ assert(work.activateWeapon(t,{toolType='axe'},model('Chicken'),'foodHunt')and shots==1 and clicks==0)
+ flags.autoAttack=false
+ assert(work.activateWeapon(t,{toolType='axe'},model('Chicken'),'hunt')and shots==2 and clicks==0);firesignal=nil
 end)
 test('chest padding holds through the extra one and a half seconds',function()
  local m=model('Box');local receipt,released
