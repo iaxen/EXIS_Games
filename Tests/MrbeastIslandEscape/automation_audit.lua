@@ -555,7 +555,9 @@ test('Long Run restores disabled essentials in one action including walls while 
  local saved,cancelled,rendered=false,false,false
  save=function()saved=true end;say=function()end;motion.cancel=function()cancelled=true end
  toggles={test=function()rendered=true end}
+ opts.chestHoldPadding=4;work.chestHoldField={Text='4'}
  work.applyLongRun()
+ assert(opts.chestHoldPadding==.15 and work.chestHoldField.Text=='0.15')
  assert(flags.autoFarm and flags.quest and flags.choiceRewards and flags.chests and flags.antiAfk)
  assert(flags.craft and flags.progression and flags.buildCurrent and flags.mineIron and flags.smelt and flags.killShadow)
  assert(flags.bulkCollect and flags.tidyTools and flags.unloadBag and flags.cook and flags.eat)
@@ -616,6 +618,34 @@ test('station construction diagnostics distinguish built unfinished and unavaila
  scene.Buildings={FindFirstChild=function(_,name)if name=='Furnace_Construct'then return{}end end}
  local report=work.beachStationReport()
  assert(report:find('Campfire: BUILT',1,true)and report:find('Furnace: NEEDS CONSTRUCTION',1,true)and report:find('Water Maker: NOT LOADED / NOT OFFERED',1,true))
+end)
+test('a six-hundred-slot blocked wall plan checks at most twelve sites per batch and advances',function()
+ local asset=wall();local plan={slots={},regionTiles=60,stationCount=2,uncoveredStations=0}
+ for i=1,600 do plan.slots[i]={box=CFrame.new(i*10,0,0),layer=1}end
+ work.wallPlan=function()return plan end;module=function()return{checkOverlap=function()return true end}end
+ local rays=0;work.wallGround=function(p)rays=rays+1;return vec(p.X,0,p.Z)end
+ work.wallFooting=function()return true end
+ assert(not work.wallSite(work.wallRecipe())and rays==12 and work.wallScan.index==13)
+ assert(not work.wallSite(work.wallRecipe())and rays==24 and work.wallScan.index==25)
+ assert(work.wallStatus:find('LAST BATCH 12 CHECKED',1,true))
+end)
+test('readiness and execution reuse a checked wall site without repeating its ground rays',function()
+ local asset=wall();beach(0).Name='Basic Block'
+ local plan=assert(work.wallPlan(asset));work.wallPlan=function()return plan end
+ local rays=0;work.wallGround=function(p)rays=rays+1;return vec(p.X,0,p.Z)end
+ local recipe=work.wallRecipe();local site=assert(work.wallSite(recipe));local initial=rays
+ assert(work.wallSite(recipe)==site and rays==initial and work.wallSiteHits==1)
+end)
+test('unchanged base geometry reuses region results while newly streamed tiles invalidate them',function()
+ wall();beach(0).Name='Basic Block';local first=work.wallRegion();assert(work.wallRegion()==first)
+ beach(48);local second=work.wallRegion();assert(second~=first and #second==2)
+end)
+test('performance diagnostics retain slow elapsed work and label remote waits honestly',function()
+ body('    function work.recordCost(', '    function work.boundedRead(')
+ work.recordCost('wallSite',.08);work.recordCost('wallSite',.02);work.recordCost('RPC ChestService.isOpened',6.5)
+ assert(work.costs.wallSite.calls==2 and work.costs.wallSite.slow==1 and work.costs.wallSite.max==.08)
+ local report=work.performanceReport()
+ assert(report:find('REMOTE WAITS INCLUDED',1,true)and report:find('6500',1,true)and report:find('not CPU attribution',1,true))
 end)
 assert(loadfile('Games/MrbeastIslandEscape.lua'))
 print(n..' automation, native geometry, bulk collection, gear, Shadow and wall checks passed; module compiles')

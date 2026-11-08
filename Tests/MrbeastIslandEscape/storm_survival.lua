@@ -371,14 +371,14 @@ test('stopping automation always releases its owned hover anchor',function()
  assert(work.releaseHover(true)and not r.Anchored and not work.hover)
 end)
 test('a stalled native read yields the queue within seven seconds',function()
- body('    function work.boundedRead(', '    local function module(')
+ body('    function work.recordCost(', '    local function module(')
  local cancelled=false
  task.spawn=function()return'pending'end;task.cancel=function(t)assert(t=='pending');cancelled=true end
  local ok,err=pcall(work.boundedRead,function()end,'chest')
  assert(not ok and tostring(err):find('timed out')and cancelled and now>=6.5 and now<7)
 end)
 test('bounded native reads preserve false and multiple return values',function()
- body('    function work.boundedRead(', '    local function module(')
+ body('    function work.recordCost(', '    local function module(')
  task.spawn=function(fn)fn();return'finished'end
  local first,second=work.boundedRead(function()return false,'locked'end,'chest')
  assert(first==false and second=='locked')
