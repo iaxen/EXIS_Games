@@ -1,3 +1,5 @@
+> The latest controls, harvesting, station construction and whole-beach wall behavior are documented in [Mrbeast_Long_Run_v4.md](Mrbeast_Long_Run_v4.md).
+
 # MrBeast automation audit — 8 November 2026
 
 This update responds to a live run that reached day 4, bag capacity 15, and then died. It uses the supplied diagnostics, extracted client/shared game sources, and the live MrBeast quest configuration supplied by the user. It does not certify live gameplay or server acceptance.

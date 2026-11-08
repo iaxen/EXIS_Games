@@ -173,6 +173,43 @@ end)
 test('adjacent beach tiles do not build a wall across their shared interior edge',function()
  local asset=wall();beach(0);beach(48);assert(#work.wallPlan(asset).slots==108)
 end)
+test('the Basic Block station beach is enclosed even without any Beach-named tiles',function()
+ local asset=wall();local t=beach(0);t.Name='Basic Block'
+ local plan=assert(work.wallPlan(asset));assert(plan.regionTiles==1 and #plan.slots==72)
+end)
+test('the wall perimeter covers the connected base beach and every adjacent station tile',function()
+ local asset=wall();beach(0).Name='Basic Block';beach(48);beach(96).Name='Station Ground'
+ local station=object('Crafting Station');station.point=vec(96,3,0)
+ work.models=function(key)return key=='stations'and{station}or{}end
+ local plan=assert(work.wallPlan(asset))
+ assert(plan.regionTiles==3 and plan.stationCount==1 and plan.uncoveredStations==0 and #plan.slots==144)
+ for _,slot in ipairs(plan.slots)do
+  local p=slot.box.Position
+  assert(not(math.abs(p.X-24)<7 and math.abs(p.Z)<16),'internal walls must not split camp from its stations')
+ end
+end)
+test('remote beach patches do not divert the base wall project',function()
+ local asset=wall();beach(0).Name='Basic Block';beach(1000)
+ local plan=assert(work.wallPlan(asset));assert(plan.regionTiles==1 and #plan.slots==72)
+ for _,slot in ipairs(plan.slots)do assert(math.abs(slot.box.Position.X)<24)end
+end)
+test('streamed base-beach expansion invalidates the perimeter cache',function()
+ local asset=wall();beach(0).Name='Basic Block'
+ local first=assert(work.wallPlan(asset));assert(work.wallPlan(asset)==first)
+ beach(48);local nextPlan=assert(work.wallPlan(asset))
+ assert(first~=nextPlan and nextPlan.regionTiles==2 and #nextPlan.slots==108)
+end)
+test('the wall entrance prefers a dry land exit over the water-facing side',function()
+ local asset=wall();beach(0).Name='Basic Block'
+ work.wallGround=function(p)if p.X>20 then return vec(p.X,0,p.Z)end end
+ local plan=assert(work.wallPlan(asset));assert(plan.gate.X>20)
+end)
+test('stations outside the loaded connected base region are reported as uncovered',function()
+ local asset=wall();beach(0).Name='Basic Block';beach(1000)
+ local station=object('Station');station.point=vec(1000,3,0)
+ work.models=function(key)return key=='stations'and{station}or{}end
+ local plan=assert(work.wallPlan(asset));assert(plan.uncoveredStations==1)
+end)
 test('a wall site has supported corners and applies the model pivot offset',function()
  local asset=wall();beach(0);local site=assert(work.wallSite(work.wallRecipe()))
  assert((site.frame*asset.offset).Position.X==site.box.Position.X)
@@ -433,7 +470,7 @@ test('a disabled native tool is awaited without pretending an activation was sen
  work.await=function()return false end;tool.Activate=function()error('disabled tool must not activate')end
  assert(not work.activateWeapon(tool,{toolType='axe'},{},'questAcquire'))
 end)
-local function harvestSimulation(damage,baseline)
+local function harvestSimulation(damage,baseline,timeSlice)
  body('    function work.resourceReach(', '    local function gatherResource(')
  body('    function work.strike(', '    local function blueprintReady(')
  body('    function work.activateWeapon(', '    function work.setSprint(')
@@ -441,9 +478,10 @@ local function harvestSimulation(damage,baseline)
  local tree=object('Tree');tree.point=vec(6,0,0);tree.attrs.resourceId='Tree'
  function tree:GetPivot()return CFrame.new(self.point)end
  cfg.worldResource.byId.Tree={hp=baseline==nil and 6 or baseline,requireToolType='axe',dropId='tree'}
+ if baseline and baseline>0 then tree.attrs.hp=baseline end
  local stats={toolType='axe',range=4,useDmg=2,useCd=.8,windup=.4}
  local tool=object('Axe','Tool');tool.Parent=player.Character;tool.Enabled=true
- scene.Static={};opts.move='Teleport';opts.jobTimeout=90
+ scene.Static={};opts.move='Teleport';opts.jobTimeout=timeSlice or 90
  local scheduled,times={},{};local cut=0
  local function advance(dt)
   now=now+dt
@@ -491,6 +529,93 @@ end)
 test('zero configuration health without a replicated HP value is not proof of a cut',function()
  local result,times,cut=harvestSimulation(false,0)
  assert(not result and #times==3 and cut==0 and not stock.Wood)
+end)
+test('productive harvesting completes one resource even beyond the configured task slice',function()
+ local result,times,cut,tree=harvestSimulation(true,40,15)
+ assert(result and #times==20 and cut==1 and tree.attrs.hp==0 and now>15)
+end)
+test('native cooldown expiry does not activate during frame-rounded recovery',function()
+ body('    function work.activateWeapon(', '    function work.setSprint(')
+ local t=object('Axe','Tool');t.Parent=player.Character;t.Enabled=true
+ work.frameDuration=.03;work.pause=function(_,seconds)now=now+seconds;return true end
+ local idleAt,cdUntil,attempts,accepted=0,0,0,0
+ function t:Activate()
+  attempts=attempts+1
+  if now>=idleAt then accepted=accepted+1;idleAt=now+.63;cdUntil=now+.57 end
+ end
+ local oldRequire=require;require=function()return{getCooldownState=function()return math.max(0,cdUntil-now)end}end
+ RS={Engine={FindFirstChild=function()return{FindFirstChild=function()return{FindFirstChild=function()return{}end}end}end}}
+ for i=1,3 do assert(work.activateWeapon(t,{toolType='axe',useCd=.57},{},'questAcquire'))end
+ require=oldRequire
+ assert(attempts==3 and accepted==3 and now>=1.31 and now<1.4 and work.nextStrikeAt>=now+.65)
+end)
+test('Long Run restores disabled essentials in one action including walls while retaining fishing and replay choices',function()
+ body('    work.automationBundles =', '    function work.makeSuiteUI(p)')
+ flags={autoFarm=false,greatWall=false,fish=true,autoRound=false,escape=true,craft=false,progression=false,bulkCollect=false,tidyTools=false}
+ local saved,cancelled,rendered=false,false,false
+ save=function()saved=true end;say=function()end;motion.cancel=function()cancelled=true end
+ toggles={test=function()rendered=true end}
+ work.applyLongRun()
+ assert(flags.autoFarm and flags.quest and flags.choiceRewards and flags.chests and flags.antiAfk)
+ assert(flags.craft and flags.progression and flags.buildCurrent and flags.mineIron and flags.smelt and flags.killShadow)
+ assert(flags.bulkCollect and flags.tidyTools and flags.unloadBag and flags.cook and flags.eat)
+ assert(not flags.escape and flags.greatWall and flags.fish and not flags.autoRound)
+ assert(opts.onlyNeeded and opts.fastHarvest and opts.safeCombat and opts.interval==0 and saved and cancelled and rendered)
+end)
+test('quick controls reflect partial settings and change only their own group',function()
+ body('    work.automationBundles =', '    function work.makeSuiteUI(p)')
+ body('    function work.makeSuiteUI(p)', '    local main=page(')
+ local controls,buttons={},{}
+ group=function(_,name,open)return{name=name,open=open}end
+ switch=function(_,label,get,set)controls[label]={get=get,set=set};return function()end end
+ toggle=function()end;number=function()end;work.slider=function()end;text=function()return{}end
+ button=function(_,label,fn)buttons[label]=fn;return{}end
+ make=function()return{Text='',FocusLost={Connect=function()end}}end;corner=function()end
+ Color3={fromRGB=function()return{}end};UDim2={new=function()return{}end};Enum.Font={BuilderSans=1}
+ save=function()end;say=function()end;motion.cancel=function()end;toggles={}
+ opts.evadeMove='Teleport';opts.codes='';flags={autoFarm=false,eat=true,fish=true}
+ work.makeSuiteUI({main={},combat={},gather={},survival={},food={},inventory={},craft={},camp={},explore={},quests={},rounds={},rewards={},esp={},status={},settings={}})
+ assert(not flags.autoFarm and not flags.quest,'building the menu must preserve saved settings')
+ local survival=controls['Survival and food'];assert(survival.get()==nil)
+ survival.set(true);assert(survival.get()==true and flags.eat and flags.killShadow and not flags.quest and flags.fish)
+ survival.set(false);assert(survival.get()==false and not flags.eat and not flags.killShadow and flags.fish)
+ assert(buttons['START LONG RUN • ENABLE ESSENTIALS']==work.applyLongRun)
+ local wallControl=assert(controls['AUTO CRAFT & PLACE BEACH WALLS']);wallControl.set(true);assert(flags.greatWall and wallControl.get())
+ buttons['ENABLE ALL BEACH STATIONS']();assert(flags.buildCamp and flags.buildCurrent and flags.structureCraft and flags.progression)
+ local count=0;for _ in pairs(controls)do count=count+1 end;assert(count>=7)
+end)
+test('station footprints stay wholly on the base beach including shared tile seams',function()
+ wall();beach(0).Name='Basic Block';beach(48)
+ assert(work.inBaseBeach(vec(24,2,0),vec(8,4,8)))
+ assert(not work.inBaseBeach(vec(70,2,0),vec(8,4,8)))
+ work.wallGround=function()return nil end
+ assert(not work.inBaseBeach(vec(0,2,0),vec(8,4,8)))
+end)
+test('every live camp blueprint is available for material acquisition rather than only the campfire',function()
+ body('    function work.upgradeCandidates()', '    function work.stationGoal(')
+ cfg.build={byId={}}
+ for _,name in ipairs({'Campfire','Furnace','Water Maker','Crafting Station'})do cfg.build.byId[name]={assetId=name}end
+ local folder={FindFirstChild=function()return{}end};scene.Buildings=folder
+ flags.buildCamp=true;work.boatId=function()return'boat'end;work.buildRank=function()return 2 end
+ itemLabel=function(_,id)return id end;work.bagGoal=function()end;work.campfireGoal=function()end
+ selected={craft={}};work.questAcquireGoal=function()end
+ local found={}
+ for _,goal in ipairs(work.upgradeCandidates())do if goal.kind=='build'then found[goal.info.assetId]=true end end
+ assert(found.Campfire and found.Furnace and found['Water Maker'] and found['Crafting Station'])
+end)
+test('utility stations are recognized without treating decorative walls as stations',function()
+ body('    function work.structureRole(', '    function work.findStructure(')
+ assert(work.structureRole('建筑制作台')=='buildingStation')
+ assert(work.structureRole('制作台')=='craftingStation')
+ assert(work.structureRole('Water Maker')=='water' and work.structureRole('Cooking Station')=='cooking')
+ assert(work.structureRole('Wood Wall')=='other')
+end)
+test('station construction diagnostics distinguish built unfinished and unavailable models',function()
+ cfg.build={byId={fire={assetId='Campfire'},furnace={assetId='Furnace'},water={assetId='Water Maker'}}}
+ built=function(name)if name=='Campfire'then return{}end end;work.boatId=function()return'boat'end
+ scene.Buildings={FindFirstChild=function(_,name)if name=='Furnace_Construct'then return{}end end}
+ local report=work.beachStationReport()
+ assert(report:find('Campfire: BUILT',1,true)and report:find('Furnace: NEEDS CONSTRUCTION',1,true)and report:find('Water Maker: NOT LOADED / NOT OFFERED',1,true))
 end)
 assert(loadfile('Games/MrbeastIslandEscape.lua'))
 print(n..' automation, native geometry, bulk collection, gear, Shadow and wall checks passed; module compiles')

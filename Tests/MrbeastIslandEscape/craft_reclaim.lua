@@ -105,8 +105,9 @@ test('ready crafting follows survival and equipment rewards before ordinary unlo
  assert(work.rank{key='craft'}>work.rank{key='fuel'})
  work.foodHuntReady=function()return true end
  assert(work.rank{key='craft'}<work.rank{key='hunt'})
- assert(work.rank{key='mrbeastReward'}<work.rank{key='craft'})
- for _,key in ipairs({'unloadBag','gather','chests'})do assert(work.rank{key='craft'}<work.rank{key=key})end
+ assert(work.rank{key='mrbeastReward'}<work.rank{key='chests'})
+ assert(work.rank{key='chests'}<work.rank{key='craft'})
+ for _,key in ipairs({'unloadBag','gather'})do assert(work.rank{key='craft'}<work.rank{key=key})end
 end)
 test('craft execution uses the station/direct submission adapter and the correct job key',function()
  stock.Wood=4;goals={craftGoal()}

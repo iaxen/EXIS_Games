@@ -554,6 +554,83 @@ test('a disabled queued successor cannot lock the scheduler',function()
  end
  assert(work.nextQueuedJob({fallback},now)==fallback and not work.pendingHandoff)
 end)
+test('resource recovery waits for delayed drops and retries one rejected pickup before completing',function()
+ loadBody('    function work.drainTreeDrops(', '    function work.recoverTreeDrops()')
+ local drops={};world=function()return{FindFirstChild=function()return{GetChildren=function()return drops end}end}end
+ work.needsDrop=function()return true end;work.watchLateDrops=function()end
+ local collect=work.collectModel;local attempts=0
+ work.collectModel=function(...)
+  attempts=attempts+1;if attempts==1 then return false end;return collect(...)
+ end
+ later(1.2,function()drops[#drops+1]=model('Wood')end)
+ later(1.8,function()drops[#drops+1]=model('Wood')end)
+ local context={center=vec(0,0,0),wanted={wood=true},before={}}
+ assert(work.drainTreeDrops(context,'questAcquire'))
+ assert(attempts==3 and inventory.Wood==2 and now>=2.55 and context.seen and not context.noLoot)
+end)
+test('resource depletion without a loot receipt waits then reports no observed loot honestly',function()
+ loadBody('    function work.drainTreeDrops(', '    function work.recoverTreeDrops()')
+ world=function()return{FindFirstChild=function()return{GetChildren=function()return{}end}end}end
+ local watched=false;work.watchLateDrops=function()watched=true end
+ local context={center=vec(0,0,0),wanted={wood=true},before={}}
+ assert(work.drainTreeDrops(context,'questAcquire')and now>=4 and context.noLoot and watched)
+ assert(status.questAcquire:find('NO ELIGIBLE LOOT OBSERVED',1,true))
+end)
+test('missing dropped-item replication retains resource recovery rather than completing',function()
+ loadBody('    function work.drainTreeDrops(', '    function work.recoverTreeDrops()')
+ world=function()return nil end
+ assert(not work.drainTreeDrops({center=vec(0,0,0)},'questAcquire'))
+end)
+test('a full resource bag retains its loot batch for an unloading handoff',function()
+ loadBody('    function work.drainTreeDrops(', '    function work.recoverTreeDrops()')
+ inventory.Stone=5;local drop=model('Wood');work.needsDrop=function()return true end
+ world=function()return{FindFirstChild=function()return{GetChildren=function()return{drop}end}end}end
+ assert(not work.drainTreeDrops({center=vec(0,0,0),wanted={wood=true},before={}},'questAcquire')and drop.Parent)
+end)
+test('chest loot rejects equal or weaker equipped and carried armour but accepts upgrades',function()
+ cfg.armour={byId={old={typeCN='body',lvl=1},best={typeCN='body',lvl=3}}}
+ cfg.item.byDisplayName.Stone.id='old';work.equippedArmour={body='best'}
+ tools=function()return{}end
+ assert(not work.pickupEligible(model('Stone')))
+ work.equippedArmour={};cfg.item.byDisplayName.Best={id='best'}
+ tools=function()return{{Name='Best'}}end
+ assert(not work.pickupEligible(model('Stone')))
+ cfg.armour.byId.old.lvl=4;assert(work.pickupEligible(model('Stone')))
+end)
+test('non-bag gear can be collected with a full material bag and needs an inventory receipt',function()
+ inventory.Wood=5;cfg.item.byDisplayName.Stone.isBagItem=false
+ local d=model('Stone');assert(work.collectModel(d,'chests',false,true)and inventory.Stone==1)
+ local other=model('Stone');call=function()other.Parent=false end
+ assert(not work.collectModel(other,'chests',false,true))
+end)
+test('new safe chests outrank routine acquisition while resumed full-bag chests yield to unloading',function()
+ loadBody('    function work.rank(job)', '    function work.pick(')
+ assert(work.rank{key='mrbeastReward'}<work.rank{key='chests'})
+ assert(work.rank{key='chests'}<work.rank{key='questAcquire'})
+ work.chestResume=model('Box');inventory.Wood=5
+ assert(work.rank{key='unloadBag'}<work.rank{key='chests'})
+end)
+test('chest completion waits for a second delayed drop after the first receipt',function()
+ local m=chest();local accepted=false;work.chestDuration=function()return .1 end
+ call=function(service,op,arg)
+  if op=='isLocked'then return false elseif op=='isOpened'then return accepted
+  elseif op=='requestOpen'then
+   accepted=true;work.chestState(m).acceptedAt=now
+   later(.2,function()local d=model('Stone');d.attrs.ownerName=player.Name;sceneRows.drops[#sceneRows.drops+1]=d end)
+   later(.9,function()local d=model('Wood');d.attrs.ownerName=player.Name;sceneRows.drops[#sceneRows.drops+1]=d end)
+  elseif service=='ItemCollect'then inventory[arg.Name]=inventory[arg.Name]+1;arg.Parent=false end
+ end
+ assert(work.openChest()and inventory.Stone==1 and inventory.Wood==1 and now>=1.9)
+end)
+test('a disappearing resource drop without an inventory receipt is never reported collected',function()
+ loadBody('    function work.drainTreeDrops(', '    function work.recoverTreeDrops()')
+ local drop=model('Wood');work.needsDrop=function()return true end;work.watchLateDrops=function()end
+ world=function()return{FindFirstChild=function()return{GetChildren=function()return{drop}end}end}end
+ work.collectModel=function()drop.Parent=false;return false end
+ local context={center=vec(0,0,0),wanted={wood=true},before={}}
+ assert(work.drainTreeDrops(context,'questAcquire')and context.noLoot and not context.seen and now>=4)
+ assert(status.questAcquire:find('LOOT RECEIPT UNCONFIRMED',1,true))
+end)
 os.clock=realClock
 assert(loadfile(path))
 print(passed..' AFK transaction checks passed; complete module compiles')

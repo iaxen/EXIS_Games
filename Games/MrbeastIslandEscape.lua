@@ -1322,7 +1322,7 @@ local function runIslandEscape()
             TextYAlignment = Enum.TextYAlignment.Top,
         }, container)
     end
-    local function group(container, name)
+    local function group(container, name, initiallyOpen)
         local frame = make("Frame", {
             Size = UDim2.new(1, -4, 0, 0),
             AutomaticSize = Enum.AutomaticSize.Y,
@@ -1420,6 +1420,7 @@ local function runIslandEscape()
             end
             entry.setOpen(open)
         end)
+        if initiallyOpen then entry.setOpen(true) end
         return body
     end
     local function switch(p, label, get, set)
@@ -1452,8 +1453,9 @@ local function runIslandEscape()
         }, track)
         round(knob)
         local function render()
-            track.BackgroundColor3 = get() and blue or Color3.fromRGB(47, 59, 75)
-            knob.Position = UDim2.fromOffset(get() and 15 or 2, 2)
+            local state = get()
+            track.BackgroundColor3 = state == nil and Color3.fromRGB(183, 128, 49) or (state and blue or Color3.fromRGB(47, 59, 75))
+            knob.Position = UDim2.fromOffset(state == nil and 8 or (state and 15 or 2), 2)
         end
         b.Activated:Connect(render)
         render()
@@ -1466,6 +1468,8 @@ local function runIslandEscape()
             flags[key] = value
             note(key, value and "ENABLED" or "OFF")
             toggles[key]()
+            for name, render in pairs(toggles) do if name:sub(1, 7) == "bundle_" then render() end end
+            if key == "greatWall" and toggles.wallMain then toggles.wallMain() end
         end)
         if description then
             text(p, description)
@@ -1533,24 +1537,72 @@ local function runIslandEscape()
         value.FocusLost:Connect(function() set(tonumber(value.Text) or opts[key], true) end)
         set(opts[key], false)
     end
+    -- Shared flag sets keep quick controls and the preset consistent. Individual
+    -- switches remain available in the collapsed detail sections.
+    work.automationBundles = {
+        {id="survival", label="Survival and food", keys={"eat","fuel","cook","cooked","water","stormStock","runShadow","killShadow","holdNight","nightExplore","nightHover"}},
+        {id="combat", label="Defend and hunt food", keys={"combat","autoAttack","hunt","huntFood","killFoodOnSight"}},
+        {id="gather", label="Gather and batch loot", keys={"gather","chopTrees","mineStone","mineIron","drops","scavengeAll","bulkCollect"}},
+        {id="gear", label="All beach stations and gear", keys={"progression","toolLadder","craft","bagUpgrade","buildCamp","build","buildCurrent","structureCraft","smelt","smeltCollect"}},
+        {id="inventory", label="Sort and store at camp", keys={"tidyBag","tidyTools","unloadBag","useStorage"}},
+        {id="quests", label="MrBeast quests and gear chests", keys={"quest","choiceRewards","chests","followFootprints"}},
+        {id="walls", label="Craft and place beach walls", keys={"greatWall"}},
+    }
+    function work.applyLongRun()
+        for _, bundle in ipairs(work.automationBundles) do
+            for _, key in ipairs(bundle.keys) do flags[key] = true end
+        end
+        for _, key in ipairs({"autoFarm","antiAfk","autoSprint","liveStatus","artifacts","puzzles","buildBoat","redeemCodes"}) do flags[key] = true end
+        flags.escape, flags.emergencyHover = false, false
+        opts.onlyNeeded, opts.fastHarvest, opts.avoidEnemies, opts.safeCombat = true, true, true, true
+        opts.interval = 0
+        for _, render in pairs(toggles) do render() end
+        motion.cancel("LONG RUN PRESET APPLIED")
+        if work.releaseHover then work.releaseHover(true) end
+        save()
+        say("LONG RUN READY • ESSENTIALS ENABLED • OPTIONAL PROJECTS KEEP YOUR SETTINGS")
+    end
     function work.makeSuiteUI(p)
-        local master = group(p.main, "AUTO FARM")
+        local master = group(p.main, "RUN CONTROLS", true)
         toggles.autoFarm = switch(master, "AUTO FARM • MASTER SWITCH", function() return flags.autoFarm end, function(v)
             flags.autoFarm = v
             motion.cancel(v and "AUTO FARM STARTED" or "AUTO FARM PAUSED")
             if work.releaseHover then work.releaseHover(true) end
         end)
         text(master, "Controls grind loops, survival, combat and round automation. Your individual selections remain saved.")
-        button(master, "APPLY LONG-RUN PRESET", function()
-            for _, key in ipairs({"autoFarm", "eat", "fuel", "cook", "cooked", "huntFood", "buildCamp", "toolLadder",
-                "smelt", "smeltCollect", "tidyBag", "choiceRewards", "quest", "bagUpgrade", "combat", "runShadow",
-                "drops", "chopTrees", "mineStone", "mineIron", "liveStatus", "unloadBag", "autoAttack", "killFoodOnSight",
-                "stormStock", "useStorage", "structureCraft", "scavengeAll", "followFootprints", "artifacts", "chests", "puzzles", "autoSprint"}) do flags[key] = true end
-            flags.escape = false flags.buildBoat = true
-            flags.nightHover,flags.holdNight,flags.emergencyHover,flags.redeemCodes=true,true,false,true
+        button(master, "START LONG RUN • ENABLE ESSENTIALS", work.applyLongRun)
+        text(master, "Enables quests, gear chests, combat, gathering, food, crafting, smelting, camp and batch sorting. Includes three-layer walls around the station beach. Auto escape stays off; fishing and replay keep your settings.")
+        toggles.wallMain = switch(master, "AUTO CRAFT & PLACE BEACH WALLS", function() return flags.greatWall == true end, function(value)
+            flags.greatWall = value
+            note("greatWall", value and "ENABLED • WHOLE STATION BEACH" or "OFF")
+            work.wallCheckAt = 0
+            motion.cancel("BEACH WALL AUTOMATION CHANGED")
+            for _, render in pairs(toggles) do render() end
+        end)
+        button(master, "ENABLE ALL BEACH STATIONS", function()
+            flags.buildCamp, flags.buildCurrent, flags.structureCraft, flags.progression = true, true, true, true
+            note("buildCamp", "ENABLED • ALL BEACH STATIONS")
+            work.refreshAt = 0
+            motion.cancel("BEACH STATION AUTOMATION ENABLED")
             for _, render in pairs(toggles) do render() end
             save()
         end)
+        local quick = group(p.main, "QUICK CONTROLS")
+        text(quick, "Each switch controls a complete group. Amber means some parts are enabled; tap to enable them all. Fine tuning stays in the other tabs.")
+        for _, bundle in ipairs(work.automationBundles) do
+            toggles["bundle_" .. bundle.id] = switch(quick, bundle.label, function()
+                local enabled = 0
+                for _, key in ipairs(bundle.keys) do if flags[key] == true then enabled = enabled + 1 end end
+                if enabled == #bundle.keys then return true end
+                if enabled > 0 then return nil end
+                return false
+            end, function(value)
+                for _, key in ipairs(bundle.keys) do flags[key] = value note(key, value and "ENABLED" or "OFF") end
+                motion.cancel("AUTOMATION GROUP CHANGED")
+                if work.releaseHover then work.releaseHover(true) end
+                for _, render in pairs(toggles) do render() end
+            end)
+        end
         toggle(group(p.combat,"ATTACK INPUT"), "autoAttack", "Auto click attack button", "Uses native Attack input and respects weapon cooldown / hit timing.")
         local mining = group(p.gather, "RESOURCE LOOPS")
         toggle(mining, "chopTrees", "Chop trees")
@@ -1559,7 +1611,7 @@ local function runIslandEscape()
         switch(mining, "ONLY MATERIALS STILL NEEDED", function() return opts.onlyNeeded end, function(v) opts.onlyNeeded = v end)
         text(mining, "Needed-only follows enabled quests, recipes and fuel goals. Turn it off to stockpile freely.")
         switch(mining, "FAST HARVEST", function() return opts.fastHarvest end, function(v) opts.fastHarvest = v end)
-        work.slider(mining, "settleTime", "DROP SETTLE TIME (0 = BACKGROUND WATCH)", 0, 2, 0.05)
+        work.slider(mining, "settleTime", "EXTRA DROP QUIET TIME (SECONDS)", 0, 2, 0.05)
         local near = group(p.combat, "AURA / NEARBY DEFENCE")
         toggle(near, "aura", "Kill aura • nearby NPCs", "Uses an equipped melee weapon, checked positions and its native cooldown / target cap.")
         work.evadeButton = button(near, "EVADE MODE: " .. opts.evadeMove:upper(), function()
@@ -1590,8 +1642,8 @@ local function runIslandEscape()
         local projects = group(p.craft, "PROGRESSION GOALS")
         toggle(projects, "toolLadder", "Craft tool ladder")
         local campProjects=group(p.camp,"CAMP PROGRESSION")
-        toggle(campProjects, "buildCamp", "Build camp")
-        toggle(campProjects,"greatWall","Great Wall of EXI • three beach layers", "Uses the live wall recipe, dry beach edges and an entrance. Prioritizes survival, gear and utility buildings.")
+        toggle(campProjects, "buildCamp", "Build every beach station", "Gathers missing supplies and finishes all live camp blueprints, including crafting, cooking, water and furnace stations. Completed models confirm construction.")
+        toggle(campProjects,"greatWall","Great Wall of EXI • three beach layers", "Auto gathers wood, crafts the native wall and places three layers around the whole connected station beach, including Basic Block. Keeps an entrance and replaces destroyed walls. Survival and gear come first.")
         toggle(group(p.explore,"BOAT PREPARATION"), "buildBoat", "Build the boat", "Uses live recipe / contribution requirements. Building does not trigger escape.")
         toggle(group(p.quests, "CHOICE REWARDS"), "choiceRewards", "Take MrBeast choice rewards", "Selects useful rewards automatically, including an already-open menu.")
         toggle(group(p.explore, "ARTIFACTS"), "artifacts", "Fetch the four artifacts", "Compass, Map, Plastic Bucket and Radio. Locked or unsafe locations are skipped.")
@@ -1645,26 +1697,25 @@ local function runIslandEscape()
         local live = group(status, "LIVE RUN")
         toggle(live,"liveStatus","Live status outside panel")
         work.statusLabel = text(live, "WAITING FOR RUN DATA")
-        local shield = group(status, "COSMETIC SHIELD")
+        local shield = group(p.settings, "ADVANCED / COSMETIC DISPLAY")
         toggle(shield, "cosmeticShield", "No damage • cosmetic display", "Shows a shield label only. Health, incoming damage and server hit validation are unchanged.")
         work.shieldLabel = text(shield, "COSMETIC SHIELD: OFF")
     end
     local main=page("Main")
     local survivalPage=page("Survival")
-    local combatPage=page("Combat")
-    local foodPage=page("Food")
-    local inventoryPage=page("Inventory")
-    local resources=page("Gather")
-    local camp=page("Camp")
-    local craft=page("Craft")
+    local combatPage, foodPage = survivalPage, survivalPage
+    local resources=page("Gather & Bag")
+    local inventoryPage=resources
+    local camp=page("Camp & Gear")
+    local craft=camp
     local questPage=page("Quests")
-    local rewardsPage=page("Rewards")
+    local rewardsPage=questPage
     local explore=page("Explore")
-    local fishingPage=page("Fishing")
-    local roundsPage=page("Rounds")
-    local espPage=page("ESP")
-    local statusPage=page("Status")
+    local fishingPage=explore
     local settings=page("Settings")
+    local roundsPage=settings
+    local espPage=page("ESP")
+    local statusPage=main
     work.diagnosticsPage=page("Diagnostics")
     local survival = group(foodPage, "MEALS / THRESHOLDS")
     toggle(survival, "eat", "Auto eat", "Uses selected food when health or hunger is low. No selection uses food listed in the game config.")
@@ -1691,7 +1742,7 @@ local function runIslandEscape()
     local gather = group(resources, "RESOURCE FARMING")
     toggle(gather, "gather", "Auto gather selected resources", "Cuts one resource fully, then collects all its loaded drops before another tree. Full bags retain a recovery job. No selection = all resource types.")
     local drops = group(resources, "DROPPED ITEMS")
-    toggle(drops, "drops", "Auto collect drops", "All unprotected drops when no items are selected below. Respects owner protection.")
+    toggle(drops, "drops", "Auto collect drops", "Collects eligible drops and respects owner protection. Use Main for the complete gathering group.")
     local fire = group(camp, "CAMPFIRE")
     toggle(fire, "fuel", "Auto add wood", "Adds wood only below the fuel target.")
     number(fire, "fuel", "FUEL TARGET (WOOD)", 1, 100)
@@ -2888,7 +2939,7 @@ local function runIslandEscape()
         local autoEquip = item and config().misc.useArmourCollectEquip and item.type == "armour"
         local taskPickup = key == "progression" or key == "gather" or key == "drops" or key == "chests"
         if not bag and not chestLoot and taskPickup and item and not work.needsDrop(item.id, key) then return false end
-        if not bag and not autoEquip and not work.canCollect() then return false end
+        if not bag and not autoEquip and item.isBagItem == true and not work.canCollect() then return false end
         local radius = math.max(0.5, (tonumber(config().misc.collectRadius) or 3) * 1.5)
         local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
         if prompt and prompt.Enabled then radius = math.min(radius, math.max(0.5, prompt.MaxActivationDistance - 1)) end
@@ -2931,6 +2982,19 @@ local function runIslandEscape()
                     and (owned.lvl or 0) > 0 and (owned.lvl or 0) >= (row.lvl or 0) then return false end
             end
         end
+        local armour = c.armour and c.armour.byId[item.id]
+        if armour then
+            local kind = armour.typeCN or armour.armourType or "armour"
+            local equipped = work.equippedArmour and work.equippedArmour[kind]
+            local current = equipped and c.armour.byId[equipped]
+            if current and (tonumber(current.lvl) or 1) >= (tonumber(armour.lvl) or 1) then return false end
+            for _, tool in ipairs(tools()) do
+                local held = c.item.byDisplayName[tool.Name]
+                local owned = held and c.armour.byId[held.id]
+                if owned and (owned.typeCN or owned.armourType or "armour") == kind
+                    and (tonumber(owned.lvl) or 1) >= (tonumber(armour.lvl) or 1) then return false end
+            end
+        end
         return true
     end
     function work.treeDropContext(resource)
@@ -2952,32 +3016,54 @@ local function runIslandEscape()
     function work.drainTreeDrops(context, key)
         local scene = world()
         local folder = scene and scene:FindFirstChild("DroppedItems")
-        if not folder or not context.center then return true end
+        if not folder or not context.center then note(key, "RESOURCE LOOT NOT LOADED; RECOVERY SAVED") return false end
         local c, quietSince, started = config(), os.clock(), os.clock()
+        context.waitStarted = context.waitStarted or started
         local deadline = started + math.clamp(opts.jobTimeout, 15, 600)
         local character, serial = player.Character, motion.serial
         while work.running(key, character, serial) and os.clock() < deadline do
             local target = nearest(folder:GetChildren(), function(model)
                 local info, point = c.item.byDisplayName[model.Name], pos(model)
                 return info and point and context.wanted[info.id] and not context.before[model]
+                    and not (context.collected and context.collected[model])
                     and (key == "stockpile" or work.needsDrop(info.id, key)) and work.dropAllowed(model) and (point - context.center).Magnitude <= 12
             end)
             if target then
-                context.seen = true
+                context.observed = true
                 if not work.canCollect() then
                     note(key, "BAG FULL • TREE DROPS SAVED FOR RECOVERY")
                     return false
                 end
                 if not work.collectModel(target, key) then
+                    context.rejected = context.rejected or {}
+                    context.rejected[target] = true
                     note(key, "TREE DROP UNCONFIRMED • RETRY BEFORE NEXT TREE")
-                    return false
+                    -- A delayed receipt or a short-lived prompt failure must
+                    -- not discard the resource's loot batch after one attempt.
+                    if not work.pause(key, .15) then return false end
+                else
+                    context.seen = true
+                    context.collected = context.collected or {} context.collected[target] = true
+                    if context.rejected then context.rejected[target] = nil end
+                    quietSince = os.clock()
                 end
-                context.collected = context.collected or {} context.collected[target] = true
-                quietSince = os.clock()
             else
-                if opts.settleTime == 0 then work.watchLateDrops(context) return true end
-                local settle = context.seen and (opts.settleTime or 0.12) or math.max(0.5, opts.settleTime or 0.12)
-                if os.clock() - quietSince >= settle then return true end
+                local missingReceipt = false
+                for model in pairs(context.rejected or {}) do
+                    if not model.Parent then missingReceipt = true break end
+                end
+                local settle = math.max(.75, opts.settleTime or 0)
+                if context.seen and not missingReceipt and os.clock() - quietSince >= settle then
+                    work.watchLateDrops(context)
+                    return true
+                end
+                if (not context.seen or missingReceipt) and os.clock() - context.waitStarted >= 4 then
+                    context.noLoot = true
+                    work.watchLateDrops(context)
+                    note(key, context.observed and "RESOURCE DEPLETED; LOOT RECEIPT UNCONFIRMED • BACKGROUND WATCH ACTIVE"
+                        or "RESOURCE DEPLETED; NO ELIGIBLE LOOT OBSERVED • BACKGROUND WATCH ACTIVE")
+                    return true
+                end
                 task.wait()
             end
         end
@@ -4198,8 +4284,8 @@ local function runIslandEscape()
                 work.resourcePlans[best] = nil
                 work.setRecovery(dropContext)
                 work.recoverTreeDrops()
-                note(key, work.treeDrops and "RESOURCE CUT • DROPS PENDING" or "RESOURCE CUT • ALL LOADED DROPS COLLECTED")
-                return true
+                note(key, work.treeDrops and "RESOURCE CUT • DROPS PENDING" or (dropContext.noLoot and (dropContext.observed and "RESOURCE CUT • LOOT RECEIPT UNCONFIRMED" or "RESOURCE CUT • NO ELIGIBLE LOOT OBSERVED") or "RESOURCE CUT • OBSERVED DROPS COLLECTED"))
+                return work.treeDrops == nil
             end
             if not tool.Parent then
                 note(key, "TOOL NO LONGER AVAILABLE")
@@ -4230,7 +4316,12 @@ local function runIslandEscape()
                     and type(hp) == "number" and current < hp)
             end,math.max(.75,math.min(tonumber(tc.windup)or 0,tonumber(tc.useCd)or .7)+.75))
             if work.preempted then return damaged end
-            if damaged then work.harvestReceipts=(work.harvestReceipts or 0)+1 end
+            if damaged then
+                work.harvestReceipts=(work.harvestReceipts or 0)+1
+                -- Productive harvesting keeps the same resource beyond a task
+                -- slice; failures and survival still end or interrupt it.
+                deadline = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
+            end
             noDamage = damaged and 0 or noDamage + 1
             note(key, damaged and "CHOPPING SAME RESOURCE" or "WAITING FOR RESOURCE DAMAGE")
             if noDamage >= 3 then
@@ -4359,7 +4450,7 @@ local function runIslandEscape()
                 if sawNew then state.sawLoot = true end
                 local targetItem = target and config().item.byDisplayName[target.Name]
                 local autoEquip = targetItem and config().misc.useArmourCollectEquip and targetItem.type == "armour"
-                if target and not work.canCollect() and not autoEquip and not work.bagRank(targetItem.id) then
+                if target and targetItem.isBagItem == true and not work.canCollect() and not autoEquip and not work.bagRank(targetItem.id) then
                     work.chestResume = model
                     work.interaction = nil
                     note(key, "CHEST LOOT SAVED; UNLOADING BAG AT CAMP")
@@ -4372,7 +4463,7 @@ local function runIslandEscape()
                     else failed[target] = os.clock() + 1 end
                 else
                     local durationDone = now >= state.acceptedAt + (state.duration or 0.5)
-                    local quiet = not state.lastLootAt or now - state.lastLootAt >= 0.25
+                    local quiet = now - (state.lastLootAt or state.acceptedAt) >= 1
                     local emptyAnimationDone = state.duration and now >= state.acceptedAt + state.duration + 1
                     if durationDone and (state.sawLoot or emptyAnimationDone
                         or (state.recoveredOpen and now - state.acceptedAt >= 1 and not duration))
@@ -5163,7 +5254,8 @@ local function runIslandEscape()
                     work.refreshAt = 0
                 end
                 anySubmitted = submitted or anySubmitted
-                note(key, not blueprint.Parent and "CONSTRUCTION FINISHED"
+                note(key, built(info.assetId) and "CONSTRUCTION FINISHED • BUILT STATION CONFIRMED"
+                    or not blueprint.Parent and "BLUEPRINT GONE • BUILT STATION NOT CONFIRMED"
                     or "AVAILABLE MATERIALS SUBMITTED; NEED MORE MATERIALS")
             end
         end
@@ -5856,7 +5948,11 @@ local function runIslandEscape()
             local used, cap = work.bagState()
             return used >= cap and 3.08 or 4.05
         end
-        if key == "chests" and work.chestResume then return 4.2 end
+        if key == "recoverDrops" then return 3.006 end
+        if key == "chests" then
+            local used, cap = work.bagState()
+            return work.chestResume and used >= cap and 4.2 or 3.007
+        end
         if key == "tidyBag" then
             if work.active == "tidyBag" and work.bagSweepRank then return work.bagSweepRank end
             local used, cap = work.bagState()
@@ -5997,7 +6093,6 @@ local function runIslandEscape()
             if not model.Parent or not work.safeResource(model)
                 or(work.resourceReach and not work.resourceReach(r.Position,model,stats))then return false end
         end
-        work.nextStrikeAt = os.clock() + math.max(0, tonumber(stats.useCd) or 0.7)
         if #targets > 0 then
             -- Bound the commitment to this native windup/hit window. Survival
             -- checks still cancel on new damage, known strikes or unsafe health.
@@ -6015,6 +6110,7 @@ local function runIslandEscape()
             else tool:Activate()end
             work.harvestRequests=(work.harvestRequests or 0)+1
         else return false end
+        work.nextStrikeAt = math.max(work.nextStrikeAt or 0, os.clock() + math.max(0, tonumber(stats.useCd) or .7))
         work.sent = work.sent + 1
         if #targets>0 then work.attackRequests=(work.attackRequests or 0)+1 end
         return true
@@ -7052,9 +7148,17 @@ local function runIslandEscape()
         local text = (tostring(id) .. " " .. tostring(info and (info.displayName or info.assetId or info.name) or "")):lower()
         if text:find("storage", 1, true) or text:find("储", 1, true) or text:find("仓", 1, true) then return "storage" end
         if text:find("furnace", 1, true) or text:find("smelt", 1, true) or text:find("熔炉", 1, true) then return "furnace" end
+        if text:find("building station",1,true) or text:find("建筑制作台",1,true) then return "buildingStation" end
+        if text:find("craft",1,true) or text:find("workbench",1,true) or text:find("制作台",1,true) then return "craftingStation" end
+        if text:find("water",1,true) or text:find("净水",1,true) or text:find("集水",1,true) then return "water" end
+        if text:find("cook",1,true) or text:find("灶",1,true) or text:find("烹饪",1,true) then return "cooking" end
+        if text:find("campfire",1,true) or text:find("篝火",1,true) then return "campfire" end
+        if text:find("repair",1,true) or text:find("修理台",1,true) then return "repair" end
         return "other"
     end
     function work.findStructure(role, id)
+        if not id and role == "buildingStation" then return work.structureStation() end
+        if not id and role == "craftingStation" then return work.station() end
         local scene, c = world(), config()
         if not scene then return end
         for _, name in ipairs({"Buildings", "自由建筑"}) do
@@ -7217,9 +7321,16 @@ local function runIslandEscape()
                 if remaining and remaining > 0 and not work.pause(key, remaining) then return false end
             end
         end
+        if not work.pause(key, math.max(0, (work.nativeCycleUntil or 0) - os.clock())) then return false end
+        if tool.Parent ~= player.Character or tool.Enabled == false then return false end
         -- Invoke the equipped Tool directly, just as MobileBtnsClient does.
         -- A fired GUI signal can exist without a live native button listener.
         tool:Activate()
+        -- The native cycle has several frame-rounded waits. Its global cooldown
+        -- can expire before _phase returns to idle; allow three observed frames.
+        local slack = math.clamp((work.frameDuration or 1/60) * 3, .035, .3)
+        work.nativeCycleUntil = os.clock() + math.max(0, tonumber(stats.useCd) or .7) + slack
+        work.nextStrikeAt = work.nativeCycleUntil
         return true
     end
     function work.setSprint(enabled)
@@ -7338,9 +7449,9 @@ local function runIslandEscape()
                 if role ~= "other" and not work.findStructure(role) then
                     local recipe, amounts = work.recipeAmounts(item), {}
                     for id, n in pairs(recipe) do amounts[id] = math.max(0, n - ((work.buildingStock or {})[id] or 0)) end
-                    candidates[#candidates + 1] = {id=item.id, key="structure:"..item.id, kind="structure", info=item,
+                    if next(recipe) then candidates[#candidates + 1] = {id=item.id, key="structure:"..item.id, kind="structure", info=item,
                         free=free, stationKind="building", recipe=recipe, amounts=amounts,
-                        role=role, rank=role=="storage" and 0 or role=="furnace" and 1 or 2}
+                        role=role, rank=role=="buildingStation" and -2 or role=="craftingStation" and -1 or role=="storage" and 0 or role=="furnace" and 1 or 2} end
                 end
             end
         end
@@ -7352,7 +7463,7 @@ local function runIslandEscape()
         local cached=work.structureSites[goal.id]
         local api=module("FreeBuild")
         if not api then return end
-        if cached and work.safeWorkPoint(cached.frame.Position,5)
+        if cached and work.inBaseBeach(cached.frame.Position,cached.size) and work.safeWorkPoint(cached.frame.Position,5)
             and not api.checkOverlap(cached.frame,cached.size,{},0.1) then return cached.frame,cached.size end
         local anchor=work.findStructure("storage") or built("Campfire") or work.campDropAnchor()
         if not anchor then return end
@@ -7369,14 +7480,14 @@ local function runIslandEscape()
         params.FilterType=Enum.RaycastFilterType.Include
         params.FilterDescendantsInstances={scene:FindFirstChild("Buildings")}
         params.RespectCanCollide=true
-        for _,radius in ipairs(goal.role=="storage" and {32,40,48,56} or {12,20,32,44}) do
+        for _,radius in ipairs(goal.role=="storage" and {32,40,48,56,24,20,16,12,8} or {12,20,32,44,8,16,24,28,36,48}) do
             for i=0,11 do
                 local angle=i*math.pi/6
                 local point=center+Vector3.new(math.cos(angle)*radius,0,math.sin(angle)*radius)
                 local ground=motion.floor(point,nil,20,10)
                 if ground and work.safeWorkPoint(ground,5) then
                     local probe=CFrame.new(ground+Vector3.new(0,size.Y/2,0))
-                    if probe.Position.Y<=200 and not api.checkOverlap(probe,size,{},0.1)
+                    if probe.Position.Y<=200 and work.inBaseBeach(probe.Position,size) and not api.checkOverlap(probe,size,{},0.1)
                         and #workspace:GetPartBoundsInBox(probe,size,params)==0 then frame=probe break end
                 end
             end
@@ -7392,8 +7503,9 @@ local function runIslandEscape()
         if count(goal.info.displayName)==0 then return false end
         local frame,size=work.structurePlacement(goal)
         if not frame or not travel(frame.Position,key,math.max(5,size.Magnitude/2)) then return false end
+        local before=count(goal.info.displayName)
         call("FreeBuild","requestPlace",goal.id,frame)
-        return work.await(key,function()return work.findStructure(nil,goal.id)~=nil end,4)
+        return work.await(key,function()return work.findStructure(nil,goal.id)~=nil and count(goal.info.displayName)<before end,4)
     end
     function work.structureReady()
         local goal=work.structureGoal()
@@ -7479,19 +7591,122 @@ local function runIslandEscape()
         template:Destroy();work.wallAsset=result
         return result
     end
+    function work.wallRegion()
+        local scene=world()
+        local tiles=scene and scene:FindFirstChild("Tiles")
+        if not tiles then return {} end
+        local anchor=work.campDropAnchor()
+        local center=anchor and pos(anchor)
+        local stations,seenStations={},{}
+        for _,kind in ipairs({"stations","buildings"})do
+            for _,station in ipairs(work.models and work.models(kind) or {})do
+                local point=pos(station)
+                if point and not seenStations[station]then stations[#stations+1]=point;seenStations[station]=true end
+            end
+        end
+        local free=scene:FindFirstChild("自由建筑")
+        for _,model in ipairs(free and free:GetChildren() or {})do
+            local id=model:GetAttribute("cnId") or model.Name
+            if work.structureRole and work.structureRole(id,config().item.byId[id])~="other" then
+                local point=pos(model)
+                if point and not seenStations[model] then stations[#stations+1]=point;seenStations[model]=true end
+            end
+        end
+        local rows={}
+        local function contains(row,point)
+            local q=row.frame:PointToObjectSpace(point)
+            return math.abs(q.X)<=row.size.X/2+.5 and math.abs(q.Z)<=row.size.Z/2+.5
+                and math.abs(q.Y)<=math.max(30,row.size.Y/2+10)
+        end
+        for _,tile in ipairs(tiles:GetChildren())do
+            local box=tile:FindFirstChild("BoundingBox")
+            if box and box:IsA("BasePart")then
+                local name=tile.Name:lower()
+                local row={frame=box.CFrame,size=box.Size,base=tile.Name=="Basic Block",
+                    beach=name:find("beach",1,true)~=nil or name:find("沙滩",1,true)~=nil}
+                for _,point in ipairs(stations)do if contains(row,point)then row.station=true break end end
+                -- The starting beach is named Basic Block, not Beach Block.
+                -- Include station-bearing tiles as well as the surrounding sand.
+                if row.beach or row.base or row.station then
+                    row.minX,row.maxX,row.minZ,row.maxZ=math.huge,-math.huge,math.huge,-math.huge
+                    for _,x in ipairs({-.5,.5})do for _,z in ipairs({-.5,.5})do
+                        local p=row.frame:PointToWorldSpace(Vector3.new(row.size.X*x,0,row.size.Z*z))
+                        row.minX,row.maxX=math.min(row.minX,p.X),math.max(row.maxX,p.X)
+                        row.minZ,row.maxZ=math.min(row.minZ,p.Z),math.max(row.maxZ,p.Z)
+                    end end
+                    rows[#rows+1]=row
+                end
+            end
+        end
+        local seed,best
+        for _,row in ipairs(rows)do
+            local p=row.frame.Position
+            local d=center and Vector3.new(p.X-center.X,0,p.Z-center.Z).Magnitude or 0
+            local score=(row.base and -100000 or 0)+(center and contains(row,center)and -10000 or 0)+d
+            if not best or score<best then seed,best=row,score end
+        end
+        if not seed then return {} end
+        local region,seen={seed},{[seed]=true}
+        local i=1
+        while i<=#region do
+            local own=region[i];i=i+1
+            for _,row in ipairs(rows)do
+                local overlapX=math.min(own.maxX,row.maxX)-math.max(own.minX,row.minX)
+                local overlapZ=math.min(own.maxZ,row.maxZ)-math.max(own.minZ,row.minZ)
+                if not seen[row] and ((overlapX>.1 and overlapZ>=-.5)or(overlapZ>.1 and overlapX>=-.5))
+                    and math.abs(row.frame.Position.Y-own.frame.Position.Y)<=12 then
+                    seen[row]=true;region[#region+1]=row
+                end
+            end
+        end
+        local uncovered=0
+        for _,point in ipairs(stations)do
+            local covered=false
+            for _,row in ipairs(region)do if contains(row,point)then covered=true break end end
+            if not covered then uncovered=uncovered+1 end
+        end
+        return region,stations,uncovered
+    end
+    function work.inBaseBeach(point,size)
+        local region=work.wallRegion()
+        local half=size and Vector3.new(size.X/2,0,size.Z/2) or Vector3.new(0,0,0)
+        for _,x in ipairs({-1,1})do for _,z in ipairs({-1,1})do
+            local corner=point+Vector3.new(half.X*x,0,half.Z*z)
+            local covered=false
+            for _,row in ipairs(region)do
+                local q=row.frame:PointToObjectSpace(corner)
+                if math.abs(q.X)<=row.size.X/2+.05 and math.abs(q.Z)<=row.size.Z/2+.05 then covered=true break end
+            end
+            if not covered or not work.insideBorder(corner) then return false end
+            if size then
+                local floor=work.wallGround(corner)
+                if not floor or math.abs(floor.Y-(point.Y-size.Y/2))>1.5 then return false end
+            end
+        end end
+        return true
+    end
+    function work.beachStationReport()
+        local c,rows=config(),{}
+        local folder=world() and world():FindFirstChild("Buildings")
+        for id,info in pairs(c.build and c.build.byId or {})do
+            if id~=work.boatId() then
+                local model=built(info.assetId)
+                local blueprint=folder and folder:FindFirstChild(info.assetId.."_Construct")
+                local state=model and "BUILT" or blueprint and "NEEDS CONSTRUCTION" or "NOT LOADED / NOT OFFERED"
+                rows[#rows+1]=tostring(info.displayName or info.assetId)..": "..state
+            end
+        end
+        table.sort(rows)
+        return #rows>0 and table.concat(rows,"; ") or "WAITING FOR LIVE BUILDING CATALOGUE"
+    end
     function work.wallPlan(asset)
         local scene=world()
         local tiles=scene and scene:FindFirstChild("Tiles")
         if not tiles then return end
-        local beaches={}
-        for _,tile in ipairs(tiles:GetChildren())do
-            if tile.Name:lower():find("beach",1,true)then
-                local box=tile:FindFirstChild("BoundingBox")
-                if box and box:IsA("BasePart")then beaches[#beaches+1]={frame=box.CFrame,size=box.Size}end
-            end
-        end
+        local beaches,stations,uncovered=work.wallRegion()
         local signature={}
         for _,row in ipairs(beaches)do signature[#signature+1]=tostring(row.frame)..tostring(row.size)end
+        for _,point in ipairs(stations or {})do signature[#signature+1]="station:"..tostring(point)end
         table.sort(signature);signature=table.concat(signature,"|")
         local cached=work.wallPlanCache
         if cached and cached.scene==scene and cached.signature==signature and cached.id==asset.id then return cached end
@@ -7525,7 +7740,7 @@ local function runIslandEscape()
                             local localPoint=edge.axis=="X"and Vector3.new(cross,0,along)or Vector3.new(along,0,cross)
                             local yaw=(edge.axis=="X"and math.pi/2 or 0)+(longX and 0 or math.pi/2)
                             local boxFrame=beach.frame*CFrame.new(localPoint)*CFrame.Angles(0,yaw,0)
-                            candidates[#candidates+1]={box=boxFrame,layer=layer}
+                            candidates[#candidates+1]={box=boxFrame,layer=layer,outside=boundary}
                         end
                     end
                 end
@@ -7536,10 +7751,14 @@ local function runIslandEscape()
         local gate,distance
         for _,slot in ipairs(candidates)do
             local p=slot.box.Position
-            local d=center and Vector3.new(p.X-center.X,0,p.Z-center.Z).Magnitude or math.huge
+            local d=center and Vector3.new(p.X-center.X,0,p.Z-center.Z).Magnitude or 0
+            local outward=slot.outside-p
+            local exit=outward.Magnitude>.01 and work.wallGround(slot.outside+outward.Unit*6)
+            if not exit then d=d+1000000 end
             if slot.layer==1 and(not distance or d<distance)then gate,distance=p,d end
         end
-        local plan={scene=scene,signature=signature,id=asset.id,slots=candidates,gate=gate,gateWidth=math.max(10,length*1.5)}
+        local plan={scene=scene,signature=signature,id=asset.id,slots=candidates,gate=gate,gateWidth=math.max(10,length*1.5),
+            regionTiles=#beaches,stationCount=#(stations or {}),uncoveredStations=uncovered or 0}
         work.wallPlanCache=plan
         return plan
     end
@@ -7588,20 +7807,24 @@ local function runIslandEscape()
         work.wallRetry=work.wallRetry or{}
         local r=root()
         local best,score
+        local total,occupied,blocked=0,0,0
         for index,slot in ipairs(plan.slots)do
             local p=slot.box.Position
             local gateGap=plan.gate and Vector3.new(p.X-plan.gate.X,0,p.Z-plan.gate.Z).Magnitude<plan.gateWidth
+            if not gateGap then total=total+1 end
             if not gateGap and os.clock()>=(work.wallRetry[index]or 0)and work.insideBorder(p)then
                 local ground=work.wallGround(p)
                 if ground and work.safeWorkPoint(ground,3)then
                     local frame=CFrame.new(0,ground.Y+asset.size.Y/2-p.Y,0)*slot.box
-                    if work.wallFooting(frame,asset)and not work.wallOccupied(frame,asset)and not api.checkOverlap(frame,asset.size,{},.1)then
+                    if work.wallOccupied(frame,asset)then occupied=occupied+1
+                    elseif work.wallFooting(frame,asset)and not api.checkOverlap(frame,asset.size,{},.1)then
                         local value=slot.layer*100000+(r and(frame.Position-r.Position).Magnitude or 0)
                         if not score or value<score then best,score={index=index,box=frame,frame=frame*asset.offset:Inverse(),asset=asset,plan=plan},value end
-                    end
-                end
-            end
+                    else blocked=blocked+1 end
+                else blocked=blocked+1 end
+            elseif not gateGap then blocked=blocked+1 end
         end
+        work.wallStatus="BASE BEACH "..tostring(plan.regionTiles).." TILES / "..tostring(plan.stationCount).." STATIONS • "..occupied.." WALLS PRESENT / "..total.." PLANNED SLOTS • "..blocked.." BLOCKED • "..tostring(plan.uncoveredStations).." STATIONS OUTSIDE LOADED REGION"
         return best
     end
     function work.wallGoal()
@@ -7648,16 +7871,18 @@ local function runIslandEscape()
         return pickups(key,true)or gatherResource(key,true)
     end
     function work.automationReport()
-        local c=config();local rows={"AUTOMATION AUDIT v3 • NATIVE HARVESTING"}
+        local c=config();local rows={"AUTOMATION AUDIT v4 • LONG RUN / CONFIRMED LOOT"}
         local torch=work.shadowWeapon()
         rows[#rows+1]="Shadow: "..(not flags.killShadow and"OFF"or torch and"TORCH AVAILABLE; CONFIRMS TorchHits"or"BLOCKED: NO NATIVE LIGHT-SOURCE TOOL")
         rows[#rows+1]="Craft station: "..(work.stationSynced and"SYNCED"or"WAITING FOR SERVER STOCK")
+        rows[#rows+1]="Beach stations: "..work.beachStationReport()
         rows[#rows+1]="Building station: "..(work.buildingSynced and"SYNCED"or"WAITING FOR SERVER STOCK")
         rows[#rows+1]="Smelting: "..(built("Furnace")and("READY OUTPUT "..tostring(furnaceData.readyCount or 0))or"BLOCKED: FURNACE NOT BUILT")
         local wall=flags.greatWall and work.wallRecipe()
         rows[#rows+1]="EXI wall: "..(not flags.greatWall and"OFF"or wall and("NATIVE RECIPE "..wall.id.."; THREE LAYERS; OPEN ENTRANCE")or"BLOCKED: WALL MISSING FROM LIVE CATALOGUE")
         local passive,hostile=0,0
         for _,row in ipairs(work.creatures())do if row.hostile then hostile=hostile+1 else passive=passive+1 end end
+        rows[#rows+1]="Wall coverage: "..tostring(work.wallStatus or "WAITING FOR LOADED BASE BEACH / WALL CATALOGUE")
         rows[#rows+1]="Loaded living mobs: "..hostile.." hostile / "..passive.." passive; unstreamed mobs unknown"
         rows[#rows+1]="Harvest cycles: "..tostring(work.harvestRequests or 0).." native activations attempted / "..tostring(work.harvestReceipts or 0).." HP/despawn receipts"
         rows[#rows+1]="Harvest detail: "..tostring(work.harvestStatus or"NO RESOURCE ATTEMPT YET")
@@ -8408,6 +8633,7 @@ local function runIslandEscape()
     end)
     local hoverElapsed=0
     connections[#connections+1]=game:GetService("RunService").Heartbeat:Connect(function(dt)
+        work.frameDuration = dt
         hoverElapsed=hoverElapsed+dt
         if hoverElapsed>=.15 then
             hoverElapsed=0
