@@ -128,5 +128,12 @@ end)
 test('a pending submission does not start another acquisition of the old request',function()
  work.questSubmission={at=now};assert(not work.questAcquireGoal()and not work.questAcquireReady())
 end)
+test('background progression planning preserves the active quest ingredient demand',function()
+ body('    function work.planProgression()', '    function work.progressionTick()')
+ work.questRequirement={itemId='cookedCrab',count=1};work.active='questAcquire';work.activeGoal=work.questAcquireGoal()
+ work.chooseUpgrade=function()error('active quest acquisition must not be replaced by a camp upgrade')end
+ work.needs={};work.amounts={};itemLabel=function(_,id)return id end
+ work.planProgression();assert(work.needs.crab==100 and not work.needs.wood)
+end)
 assert(loadfile('Games/MrbeastIslandEscape.lua'))
 print(n..' quest acquisition, exact hunt, cooking, furnace prerequisite and stale-request checks passed; module compiles')
