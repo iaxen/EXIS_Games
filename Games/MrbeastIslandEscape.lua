@@ -3650,6 +3650,18 @@ local function runIslandEscape()
         if not ranged and work.isPassiveFood and work.isPassiveFood(target)then
             local gap=work.hitVerticalGap and work.hitVerticalGap(point,target)or math.max(0,math.abs(delta.Y)-1)
             if math.sqrt(distance^2+gap^2)>(stats.range or 6)-.25 then return end
+            -- Match MeleeClient's real part overlap. A model bounding box can
+            -- include empty space above a crab and falsely report it in range.
+            if workspace.GetPartBoundsInRadius then
+                local params=OverlapParams.new()
+                params.FilterType=Enum.RaycastFilterType.Include
+                params.FilterDescendantsInstances={target}
+                local touching=false
+                for _,part in ipairs(workspace:GetPartBoundsInRadius(point,math.max(.1,(stats.range or 6)-.25),params))do
+                    if part:FindFirstAncestorOfClass("Model")==target then touching=true break end
+                end
+                if not touching then return end
+            end
         end
         if math.abs(delta.Y) > math.max(6, tonumber(stats.range) or 6) or distance > (stats.range or 6) - 0.1 or not work.lineOfSight(point, target) then return end
         if retaliation then return distance end
@@ -3691,22 +3703,28 @@ local function runIslandEscape()
         local best, score = r.Position, work.stanceScore(r.Position, target, stats)
         if not score then best = nil end
         local ranged = stats.toolType == "gun" or stats.toolType == "infGun" or stats.toolType == "ranged"
-        if ranged and score then return best, score end
+        local passive=not ranged and work.isPassiveFood and work.isPassiveFood(target)
+        if score and (ranged or passive) then return best, score end
         local radius = math.max(.6,ranged and math.min((stats.range or 20)-1,20)or(stats.range or 6)-.75)
         if not ranged and work.isPassiveFood and work.isPassiveFood(target)then
             local vertical=work.hitVerticalGap and work.hitVerticalGap(r.Position,target)or math.max(0,math.abs(r.Position.Y-point.Y)-1)
             radius=math.max(.6,math.min(radius,math.sqrt(math.max(0,(stats.range or 6)^2-vertical^2))-.6))
         end
         local lift = math.max(2, human.HipHeight + r.Size.Y / 2)
-        for index = 0, 15 do
-            local angle = index * math.pi / 8
-            local probe = point + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
-            local ground = motion.floor(probe, target, 12, radius + 4)
-            if ground then
-                local candidate = ground + Vector3.new(0, lift, 0)
-                local rank = work.stanceScore(candidate, target, stats)
-                if rank and (opts.move == "Teleport" or motion.clearSegment(r.Position, candidate, target))
-                    and (not score or rank > score) then best, score = candidate, rank end
+        -- Recheck inner rings at the destination's floor height. Small animals
+        -- on slopes may be unreachable from the outer ring even on level ground.
+        for ring = 1, passive and 4 or 1 do
+            local approachRadius=radius*(1-(ring-1)*.25)
+            for index = 0, 15 do
+                local angle = index * math.pi / 8
+                local probe = point + Vector3.new(math.cos(angle) * approachRadius, 0, math.sin(angle) * approachRadius)
+                local ground = motion.floor(probe, target, 12, radius + 4)
+                if ground then
+                    local candidate = ground + Vector3.new(0, lift, 0)
+                    local rank = work.stanceScore(candidate, target, stats)
+                    if rank and (opts.move == "Teleport" or motion.clearSegment(r.Position, candidate, target))
+                        and (not score or rank > score) then best, score = candidate, rank end
+                end
             end
         end
         return best, score
@@ -5962,7 +5980,7 @@ local function runIslandEscape()
     end
     function work.huntCandidate(wanted)
         local r = root()
-        if not r or not work.canCollect() or not work.meleeWeapon() then return end
+        if not r or not work.canCollect() or not work.meleeWeapon("foodHunt") then return end
         if flags.killFoodOnSight and os.clock()<(work.foodHuntAt or 0) then return end
         for _, row in ipairs(work.creatures()) do
             if row.attackable and row.human.Health > 0 and row.model.Parent
@@ -6699,7 +6717,7 @@ local function runIslandEscape()
         return info and not work.isHostile(model, info) and work.mobDropsFood(model) or false
     end
     function work.foodHuntCandidate()
-        if os.clock() < (work.foodHuntAt or 0) or not work.canCollect() or not work.meleeWeapon() then return end
+        if os.clock() < (work.foodHuntAt or 0) or not work.canCollect() or not work.meleeWeapon("foodHunt") then return end
         local r = root()
         if not r then return end
         return nearest(work.models("entities"), function(model)
@@ -6867,12 +6885,8 @@ local function runIslandEscape()
                 if remaining and remaining > 0 and not work.pause(key, remaining) then return false end
             end
         end
-        if flags.autoAttack and type(firesignal) == "function" then
-            local touch = pg:FindFirstChild("TouchGui")
-            local attack = touch and touch:FindFirstChild("useToolBtn", true)
-            if attack and attack.Visible then firesignal(attack.Activated) return true end
-            if tool.Activated then firesignal(tool.Activated) return true end
-        end
+        -- Invoke the equipped Tool directly, just as MobileBtnsClient does.
+        -- A fired GUI signal can exist without a live native button listener.
         tool:Activate()
         return true
     end
