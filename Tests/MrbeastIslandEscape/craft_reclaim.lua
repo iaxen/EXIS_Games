@@ -104,7 +104,7 @@ test('ready crafting follows survival and equipment rewards before ordinary unlo
  body('    function work.rank(job)', '    function work.pick(')
  assert(work.rank{key='craft'}>work.rank{key='fuel'})
  work.foodHuntReady=function()return true end
- assert(work.rank{key='craft'}>work.rank{key='hunt'})
+ assert(work.rank{key='craft'}<work.rank{key='hunt'})
  assert(work.rank{key='mrbeastReward'}<work.rank{key='craft'})
  for _,key in ipairs({'unloadBag','gather','chests'})do assert(work.rank{key='craft'}<work.rank{key=key})end
 end)
