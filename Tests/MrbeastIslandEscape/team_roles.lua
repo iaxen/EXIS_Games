@@ -147,7 +147,7 @@ test('native map snapshot adds unknown frontier cells beyond streamed tiles',fun
  RS={Engine={World={MapSyncService={}}}};task.spawn=function(fn)fn()end
  work.boundedRead=function(fn)return fn()end
  work.requestMapFrontier();require=oldRequire
- assert(work.mapFrontier and #work.mapFrontier.active==5)
+ assert(work.mapFrontier and #work.mapFrontier.active==4)
  local center=work.mapFrontier.rows[4];assert(center.probe.X==175 and center.probe.Z==175)
  assert(work.mapFrontier.rows[1].frontier and not work.mapFrontier.rows[0])
  work.insideBorder=function()return true end
@@ -160,7 +160,7 @@ test('water and server boundary cells are excluded from the native map frontier'
  local oldRequire=require;require=function()return{client={requestSnapshot=function()return snapshot,3,0 end}}end
  RS={Engine={World={MapSyncService={}}}};task.spawn=function(fn)fn()end
  work.boundedRead=function(fn)return fn()end;work.requestMapFrontier();require=oldRequire
- assert(#work.mapFrontier.active==1 and work.mapFrontier.rows[4]and not work.mapFrontier.rows[0])
+ assert(#work.mapFrontier.active==0 and work.mapFrontier.rows[4]and not work.mapFrontier.rows[0])
 end)
 test('an unstreamed frontier without safe ground is never visited or teleported to',function()
  work.insideBorder=function()return true end
@@ -168,6 +168,34 @@ test('an unstreamed frontier without safe ground is never visited or teleported 
  motion.floor=function()return nil end
  travel=function()error('must not move to unverified ground')end
  assert(not work.exploreMapTick()and not work.chunkVisits and log.exploreMap:find('NO LANDING ATTEMPTED',1,true))
+end)
+test('shared-map exploration makes one explicit teleport landing per loaded chunk',function()
+ local a=tile('A',0);local b=tile('B',80);local original=travel;local modeSeen
+ travel=function(point,key,radius,mode)modeSeen=mode;return original(point,key,radius)end
+ assert(work.exploreMapTick()and modeSeen=='Teleport')
+ local nextTarget=assert(work.chunkDestination());assert(nextTarget.row.tile==b and nextTarget.index==1)
+end)
+test('native-visible chunk centers are skipped instead of being swept again',function()
+ tile('A',0);buffer={readu8=function(v,i)return v[i+1]end}
+ work.mapScene=scene;work.mapFrontier={scene=scene,size=1,origin=-20,snapshot={2}}
+ work.requestMapFrontier=function()end
+ assert(not work.chunkDestination())
+end)
+test('chunk registration is confirmed from the native map snapshot after landing',function()
+ tile('A',0);buffer={readu8=function(v,i)return v[i+1]end}
+ local snapshot={0};work.mapScene=scene;work.mapFrontier={scene=scene,size=1,origin=-20,snapshot=snapshot}
+ local arrived=false;local original=travel
+ travel=function(...)arrived=true;return original(...)end
+ work.requestMapFrontier=function()if arrived then snapshot[1]=2 end end
+ assert(work.exploreMapTick()and work.mapVerifiedVisits==1)
+ assert(log.exploreMap:find('SERVER MAP VISIBILITY CONFIRMED',1,true))
+end)
+test('an arrival without a map receipt remains unconfirmed and backs off for another attempt',function()
+ tile('A',0);buffer={readu8=function(v,i)return v[i+1]end}
+ work.mapScene=scene;work.mapFrontier={scene=scene,size=1,origin=-20,snapshot={0}}
+ work.requestMapFrontier=function()end
+ assert(work.exploreMapTick()and not work.mapVerifiedVisits)
+ assert(log.exploreMap:find('REVEAL UNCONFIRMED',1,true)and not work.chunkDestination())
 end)
 test('an invalid role cannot change a running configuration',function()
  flags.quest=true;assert(not work.applyTeamRole('unknown')and flags.quest and opts.teamRole=='Custom')
@@ -198,10 +226,10 @@ test('streamed chunks update the frontier and completed chunks become revisitabl
  for _,row in ipairs(work.chunkRows())do for i=1,5 do row.visited[i]=0 end end
  assert(not work.chunkDestination());now=31;assert(work.chunkDestination())
 end)
-test('role fallback does not duplicate an enabled explorer trip',function()
+test('role fallback patrols camp when every loaded chunk center was already checked',function()
  tile('A',0);flags.exploreMap=true
  for _,row in ipairs(work.chunkRows())do for i=1,5 do row.visited[i]=0 end end
- assert(not work.roleFallbackTick()and log.roleFallback:find('EXPLORATION QUEUED',1,true))
+ assert(work.roleFallbackTick()and log.roleFallback:find('CAMP PATROL',1,true))
 end)
 test('lack of a safe patrol is reported and never disables the assigned role',function()
  flags.roleFallback=true;work.safeWorkPoint=function()return false end
