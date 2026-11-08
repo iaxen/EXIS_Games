@@ -210,6 +210,11 @@ test('stations outside the loaded connected base region are reported as uncovere
  work.models=function(key)return key=='stations'and{station}or{}end
  local plan=assert(work.wallPlan(asset));assert(plan.uncoveredStations==1)
 end)
+test('a connected coast cannot expand camp walls across the entire island',function()
+ local asset=wall();beach(0).Name='Basic Block'
+ for i=1,20 do beach(i*48)end
+ local plan=assert(work.wallPlan(asset));assert(plan.regionTiles==2 and #plan.slots==108)
+end)
 test('a wall site has supported corners and applies the model pivot offset',function()
  local asset=wall();beach(0);local site=assert(work.wallSite(work.wallRecipe()))
  assert((site.frame*asset.offset).Position.X==site.box.Position.X)

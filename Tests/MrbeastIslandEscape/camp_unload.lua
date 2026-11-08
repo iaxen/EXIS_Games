@@ -143,7 +143,7 @@ test('bulk overflow is dropped in separate material categories during one base t
  flags.bulkCollect=true
  tool('wood','Wood',2);tool('stone','Stone',2)
  local groups={};work.campDropPoint=function(_,category)groups[#groups+1]=category;return rootPart.Position end
- assert(work.unloadBag()and #groups==2 and groups[1]=='wood'and groups[2]=='mining')
+ assert(work.unloadBag()and #groups==2 and groups[1]=='wood'and groups[2]=='stone')
  assert(eventCount('drop:Wood')==2 and eventCount('drop:Stone')==2)
 end)
 test('an unload stores every accepted stack before using ground overflow',function()

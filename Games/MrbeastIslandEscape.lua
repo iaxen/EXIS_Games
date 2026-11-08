@@ -195,7 +195,7 @@ local function runIslandEscape()
     local recentErrors = {}
     local opts = {
         move = "Walk",
-        useRefuge=false,keepRefugeLocked=false,unlockObjectives=true,
+        useRefuge=false,keepRefugeLocked=false,unlockObjectives=true,expeditionTribal=true,expeditionPirates=true,
         teamRole = "Custom", chunkRevisit = 30, campWorkRadius = 120, travelRation = 0,
         interval = 0,
         schedulerVersion = 4,
@@ -551,7 +551,7 @@ local function runIslandEscape()
                     opts.taskMaterialsVersionLoaded = d.options.taskMaterialsVersion == 1
                     if d.options.evadeMove == "Walk" or d.options.evadeMove == "Tween" or d.options.evadeMove == "Teleport" then opts.evadeMove = d.options.evadeMove end
                     if type(d.options.espLabelsOnly) == "boolean" then opts.espLabelsOnly = d.options.espLabelsOnly end
-                    for _, name in ipairs({"onlyNeeded", "fastHarvest", "emergencyEscape", "avoidEnemies", "exploreOutsideBorder","useRefuge","keepRefugeLocked","unlockObjectives"}) do
+                    for _, name in ipairs({"onlyNeeded", "fastHarvest", "emergencyEscape", "avoidEnemies", "exploreOutsideBorder","useRefuge","keepRefugeLocked","unlockObjectives","expeditionTribal","expeditionPirates"}) do
                         if type(d.options[name]) == "boolean" then opts[name] = d.options[name] end
                     end
                     local refuge=d.options.refuge
@@ -1695,7 +1695,7 @@ local function runIslandEscape()
             local roleName=name
             toggles["role"..name]=switch(roles,work.teamRoles[name].label,function()return flags["role"..roleName]==true end,function(value)work.setRole(roleName,value)end)
         end
-        toggle(roles,"exploreMap","Explore native map frontier, then revisit completed chunks")
+        toggle(roles,"exploreMap","Teleport to chunk centers to register the shared map")
         toggle(roles,"shareGuns","Leave all guns at camp for the explorer")
         toggle(roles,"takeTeamGuns","Collect useful guns left at camp")
         toggle(roles,"roleFallback","Continue role patrol / exploration when regular tasks are blocked")
@@ -2012,6 +2012,10 @@ local function runIslandEscape()
     local explorationSafety=group(explore,"EXPLORATION BORDER")
     switch(explorationSafety,"ALLOW EXPLORATION OUTSIDE UNLOCKED BORDER",function()return opts.exploreOutsideBorder end,function(v)opts.exploreOutsideBorder=v end)
     text(explorationSafety,"Applies only to chests, puzzles, artifacts and selected travel. It does not remove server walls or change combat/camp safety.")
+    local expeditions=group(explore,"EXPLORER • TRIBAL / PIRATE EXPEDITIONS")
+    switch(expeditions,"TRIBAL SKULL AND CHEST",function()return opts.expeditionTribal end,function(v)opts.expeditionTribal=v;save()end)
+    switch(expeditions,"PIRATE SHIP CHESTS",function()return opts.expeditionPirates end,function(v)opts.expeditionPirates=v;save()end)
+    text(expeditions,"Uses native skull/puzzle and chest receipts. Protected refuge locks stay protected; pirate fights wait for suitable gear and health.")
     local refugeUI=group(explore,"EMERGENCY REFUGE / UNLOCK TASKS")
     button(refugeUI,"SET REFUGE HERE • STAND INSIDE FIRST",function()work.setRefuge()end)
     toggles.refugeUse=switch(refugeUI,"USE SAVED EMERGENCY REFUGE",function()return opts.useRefuge end,function(v)opts.useRefuge=v;save()end)
@@ -2862,7 +2866,10 @@ local function runIslandEscape()
         local total=item and count(item.displayName)or 0
         -- Critical fire maintenance can use the last fuel; routine processing cannot consume quest stock.
         local urgent=(key=="fuel"or work.activeGoal and work.activeGoal.kind=="fuel"and work.activeGoal.maintenance)and campData.isOnFire==false
-        return math.max(0,total-(urgent and 0 or work.questReserved(id)))
+        local reserve=work.questReserved(id)
+        if work.campMaterialReserve and not urgent then reserve=math.max(reserve,work.campMaterialReserve(id,key))end
+        if key=="campInfrastructure"then reserve=0 end
+        return math.max(0,total-(urgent and 0 or reserve))
     end
     function work.toolKeepCount(tool)
         local c=config();local item=c.item.byDisplayName[tool.Name]
@@ -2919,7 +2926,8 @@ local function runIslandEscape()
         local total=math.max(0,tonumber(tool:GetAttribute("count"))or 1)
         local goal=work.probingGoal or work.activeGoal or work.objective or work.selectedCraftMaterialGoal()
         local keep=0
-        if goal and goal.kind=="craft"and not work.stationGoal(goal)then
+        if goal and goal.kind=="craft"and not work.stationGoal(goal)
+            and not(work.campMaterialReserve and work.campMaterialReserve(item.id,"unloadBag")>0)then
             keep=math.max(0,(work.goalAmounts(goal)[item.id]or 0))
             for _,other in ipairs(tools())do
                 if other==tool then break end
@@ -2961,12 +2969,21 @@ local function runIslandEscape()
         if c.tool and c.tool.byId and c.tool.byId[item.id]or item.type=="tool"then return "tools"end
         if item.type=="armour"or item.type=="bag"then return "gear"end
         local name=(tostring(item.id).." "..tool.Name):lower()
-        if name:find("iron",1,true)or name:find("铁",1,true)or name:find("stone",1,true)or name:find("石",1,true)then return "mining"end
+        if name:find("iron",1,true)or name:find("铁",1,true)then return "iron"end
+        if name:find("stone",1,true)or name:find("石",1,true)then return "stone"end
         if name:find("wood",1,true)or name:find("木",1,true)then return "wood"end
         return "other"
     end
-    function work.unloadCandidate()
-        for _, tool in ipairs(tools()) do if work.unloadCount(tool) > 0 then return tool end end
+    function work.unloadCandidate(preferredGroup)
+        local best,bestRank
+        local order={wood=1,stone=2,iron=3,mining=2,food=4,tools=5,gear=6,other=7}
+        for _,tool in ipairs(tools())do if work.unloadCount(tool)>0 then
+            local group=work.itemGroup(tool)
+            if group==preferredGroup then return tool end
+            local rank=order[group]or 7
+            if not bestRank or rank<bestRank then best,bestRank=tool,rank end
+        end end
+        return best
     end
     function work.campDropAnchor()
         local fire=built("Campfire")
@@ -3009,7 +3026,7 @@ local function runIslandEscape()
         local center = pos(camp)
         if not r or not center then return end
         local best, score
-        local sector=({wood=0,mining=2,food=4,tools=6,gear=8,other=10})[category]
+        local sector=({wood=0,stone=2,iron=4,mining=2,food=6,tools=8,gear=10,other=12})[category]
         local store = flags.useStorage and work.findStructure and work.findStructure("storage")
         local planned=flags.useStorage and not store and work.storagePlannedFrame
         if planned then center=planned.Position end
@@ -3067,7 +3084,7 @@ local function runIslandEscape()
         local character, serial = player.Character, motion.serial
         local deadline = os.clock() + math.clamp(opts.jobTimeout, 15, 600)
         while work.running(key, character, serial) and os.clock() < deadline do
-            local tool = work.unloadCandidate()
+            local tool = work.unloadCandidate(category)
             if not tool then break end
             local group=flags.bulkCollect and work.itemGroup(tool)
             if group and group~=category then
@@ -3742,6 +3759,8 @@ local function runIslandEscape()
     end
     function work.contextEnabled(key)
         if key=="questAcquire"then return flags.quest end
+        if key=="campInfrastructure"then return flags.buildCamp or flags.buildCurrent or flags.build end
+        if key=="campUpgrade"then return flags.fuel or flags.buildCamp end
         if key == "gather" then return flags.gather or flags.chopTrees or flags.mineStone or flags.mineIron end
         if key == "progression" then return work.progressionEnabled() end
         return flags[key]
@@ -4472,6 +4491,7 @@ local function runIslandEscape()
         local c = config()
         local goal = work.probingGoal or work.activeGoal or work.objective or work.selectedCraftMaterialGoal()
         local function eligible(model)
+            if (key=="stockpile"or key=="gather"or key=="drops")and work.campStageReserved and work.campStageReserved(model)then return false end
             if work.weatherWorkAllowed and not work.weatherWorkAllowed(pos(model))then return false end
             if not model.Parent or not work.dropAllowed(model) then return false end
             local info = c.item.byDisplayName[model.Name]
@@ -4484,6 +4504,14 @@ local function runIslandEscape()
         end
         local loaded, stash = folder:GetChildren(), {}
         for _, model in ipairs(loaded) do if work.markCampDrop(model) then stash[#stash + 1] = model end end
+        if not neededOnly and(key=="stockpile"or key=="gather"or key=="drops")and work.campPriorityNeeds then
+            local needs=work.campPriorityNeeds()
+            local priority=nearest(loaded,function(model)
+                local item=c.item.byDisplayName[model.Name]
+                return item and needs[item.id]and eligible(model)
+            end)
+            if priority then return priority end
+        end
         return nearest(stash, eligible) or nearest(loaded, eligible, function(model)
             local info = c.item.byDisplayName[model.Name]
             return info and work.needs[info.id] or 0
@@ -4537,19 +4565,19 @@ local function runIslandEscape()
         if work.resourceReach(r.Position,target,stats)and work.safeWorkPoint(r.Position,3)then return r.Position end
         local radius=math.max(.5,(tonumber(stats.range)or 6)-.5)
         local lift=math.max(2,human.HipHeight+r.Size.Y/2)
-        local best,score
+        local approach=r.Position-center
+        local firstAngle=math.atan2 and math.atan2(approach.Z,approach.X)or math.atan(approach.Z,approach.X)
         for ring=1,4 do for i=0,15 do
-            local angle=i*math.pi/8;local distance=radius*(1-(ring-1)*.25)
+            local offset=i==0 and 0 or(i%2==1 and math.ceil(i/2)or -math.ceil(i/2))
+            local angle=firstAngle+offset*math.pi/8;local distance=radius*(1-(ring-1)*.25)
             local probe=center+Vector3.new(math.cos(angle)*distance,0,math.sin(angle)*distance)
             local floor=motion.floor(probe,target,16,12)
             local point=floor and floor+Vector3.new(0,lift,0)
             if point and work.safeWorkPoint(point,3)and work.resourceReach(point,target,stats,.4)
                 and(opts.move=="Teleport"or motion.clearSegment(r.Position,point,target))then
-                local value=(point-r.Position).Magnitude
-                if not score or value<score then best,score=point,value end
+                return point -- nearest-side valid ring first; do not cast 64 rays per approach
             end
         end end
-        return best
     end
     function work.harvestTrace(target,tool,stats)
         local r=root();local at=pos(target)
@@ -4566,6 +4594,15 @@ local function runIslandEscape()
         local preferred = work.preferredTargets and work.preferredTargets[key]
         if preferred and work.resourceEligible(preferred, key, neededOnly) then return preferred end
         if work.preferredTargets then work.preferredTargets[key] = nil end
+        if not neededOnly and(key=="stockpile"or key=="gather")and work.campPriorityNeeds then
+            local needs=work.campPriorityNeeds()
+            if next(needs)then
+                local priority=nearest(work.models("resources"),function(model)
+                    return work.campResourceNeeded(model,needs)and work.resourceEligible(model,key,neededOnly)
+                end)
+                if priority then return priority end
+            end
+        end
         return nearest(work.models("resources"), function(model) return work.resourceEligible(model, key, neededOnly) end,
             function(model)
                 local id=model:GetAttribute("resourceId")
@@ -4794,8 +4831,9 @@ local function runIslandEscape()
         end
         return nil
     end
-    function work.openChest()
-        local key, model = "chests", work.chestCandidate()
+    function work.openChest(preferred)
+        local key, model = "chests", preferred or work.chestCandidate()
+        if preferred and(not preferred.Parent or not config().chest.byId[preferred.Name])then return false end
         if not model then return false end
         local state = work.chestState(model)
         if not state.requestedAt then
@@ -5208,7 +5246,11 @@ local function runIslandEscape()
             local row=work.chestKnowledgeFor(model)
             row.locked=value==true;row.lockedUntil=os.clock()+3
             work.unlockPlan=nil;work.unlockCheckAt=0
-            if not value then failed[model]=nil;due.chests=0 end
+            if not value then
+                failed[model]=nil;due.chests=0
+                if work.expeditionBlocked then work.expeditionBlocked[model]=nil end
+                if work.expeditionFocus==model then work.expeditionFocus=nil end
+            end
         end)end
         local opened = chestService and chestService:FindFirstChild("RemoteEvent")
         if opened then
@@ -5690,13 +5732,12 @@ local function runIslandEscape()
         return safely(key, fn)
     end
     function work.buildRank(info)
-        local name = tostring(info.assetId):lower()
-        if name == "campfire" then
-            return 0
-        end
-        if name:find("craft") or name:find("workbench") or name == "制作台" then
-            return 1
-        end
+        local name=tostring(info.assetId):lower()
+        if name=="campfire"then return 0 end
+        if name:find("craft",1,true)or name:find("workbench",1,true)or name=="制作台"or name=="建筑制作台"then return 1 end
+        if name:find("furnace",1,true)then return 1.1 end
+        if name:find("storage",1,true)then return 1.2 end
+        if name:find("tent",1,true)then return 1.3 end
         return 2
     end
     function work.contribute(key, onlySelected, targetId)
@@ -5881,7 +5922,7 @@ local function runIslandEscape()
                     and ((id == work.boatId() and flags.buildBoat) or (id ~= work.boatId() and (flags.buildCamp or (flags.progression and (not opts.teamRole or opts.teamRole=="Custom"))))) then
                     local rank = work.buildRank(info)
                     result[#result + 1] = {key = "build:" .. id, id = id, kind = "build", info = info,
-                        rank = rank == 0 and 0 or (rank == 1 and 2.2 or 4.5),
+                        rank = rank == 0 and 0 or(rank<2 and .4+rank*.1 or 4.5),campEssential=rank<2,
                         name = itemLabel("building", id, info), amounts = work.recipeAmounts(info, true)}
                 end
             end
@@ -6381,6 +6422,9 @@ local function runIslandEscape()
                 if goal then work.needRecipe(goal.info, 60) end
             end
         end
+        if work.campPriorityNeeds and(flags.roleGatherer or flags.roleBuilder or flags.buildCamp)then
+            for id,n in pairs(work.campPriorityNeeds())do work.needItem(id,count(config().item.byId[id].displayName)+n,140)end
+        end
         local w = world()
         if flags.quest and work.questRequirement then
             local req = work.questRequirement
@@ -6434,22 +6478,25 @@ local function runIslandEscape()
     end
     function work.rank(job)
         local key = job.key
-        if key=="exploreMap"or key=="greatWall"or key=="structures"or key=="stockpile"or key=="artifacts"or key=="unlockObjective"then
+        if key=="exploreMap"or key=="greatWall"or key=="structures"or key=="stockpile"or key=="artifacts"or key=="unlockObjective"or key=="campUpgrade"then
             work.roleLastServed=work.roleLastServed or{}
             work.roleLastServed[key]=work.roleLastServed[key]or os.clock()
             if os.clock()-work.roleLastServed[key]>=30 or work.active==key and os.clock()<(work.roleTurnUntil or 0)then return 2.99 end
         end
         if key == "evade" then return 0 end
+        if key=="campInfrastructure"then return 3.0065 end
+        if key=="expedition"then return 3.0069 end
+        if key=="campUpgrade"then return 3.015 end
         if key=="recovery"then return .65 end
         if key=="artifacts"then return 3.009 end
         if key=="unlockObjective"then return 3.04 end
         if key=="shareGuns" then return 3.035 end
         if key=="travelFood" then return 3.045 end
         if key=="takeTeamGuns" then return 3.008 end
-        if key=="exploreMap" then return 8.3 end
+        if key=="exploreMap"then return flags.roleExplorer and not(flags.roleBuilder or flags.roleGatherer)and 3.011 or 8.3 end
         if key=="roleFallback" then return 20 end
         if key=="shadowHunt"then return 1.4 end
-        if key=="greatWall"then return work.wallHaveItem and 3.016 or work.wallSupplied and 3.017 or 3.5 end
+        if key=="greatWall"then return work.wallHaveItem and 3.0067 or work.wallSupplied and 3.017 or 3.5 end
         if key=="equipArmour"then return 2.9 end
         if key=="questAcquire"then return 3.012 end
         if key=="combat"then
@@ -6474,7 +6521,9 @@ local function runIslandEscape()
         if key == "foodSupply" then return work.mealNeeded()and 2.01 or 3.12 end
         if key == "foodCache" then return work.mealNeeded()and work.noFood()and 1.99 or 3.04 end
         if key == "autoAttack" then return 1.6 end
-        if key == "structures" then return 3.55 end
+        if key=="structures"then
+            return({buildingStation=true,craftingStation=true,furnace=true,storage=true})[work.structurePriorityRole]and 3.0066 or 3.55
+        end
         if key == "stockpile" then return (flags.roleGatherer or opts.teamRole=="Gatherer") and 3.6 or 7.8 end
         if key == "quest" then return 3.01 end
         if key == "bagUpgrade" then return 4 end
@@ -6562,6 +6611,12 @@ local function runIslandEscape()
             work.preempted = {from = work.active, to = "nightHold", rank = 10}
             motion.cancel("NIGHT HOLD • ROUTINE WORK PAUSED")
             return false
+        end
+        local expedition=work.expeditionActive
+        if expedition and work.active=="expedition"and((expedition.region=="tribal"and not opts.expeditionTribal)
+            or(expedition.region=="pirates"and not opts.expeditionPirates)
+            or(expedition.kind=="skull"and work.protectedObjective(expedition.model)))then
+            motion.cancel("EXPEDITION DISABLED / REFUGE SKULL PROTECTED")return false
         end
         if key=="unlockObjective"and work.unlockWork and(not flags[work.unlockWork.kind]or work.protectedObjective(work.unlockWork.model))then
             motion.cancel("UNLOCK OBJECTIVE DISABLED / REFUGE LOCK PROTECTED")return false
@@ -6826,9 +6881,13 @@ local function runIslandEscape()
                 if point and not done and(blocked or guarded) and work.insideBorder(point)and not work.protectedObjective(model)
                     and os.clock()>=(work.unlockBackoff and work.unlockBackoff[model]or 0)then
                     local rule=work.unlockRule(model);local tileId=model:GetAttribute("MapLockTileId")
-                    if guarded and not blocked then rule={kind="guard_area",description="CLEAR LOCAL THREATS FOR NATIVE HOLD"}end
+                    if guarded and not blocked then
+                        rule={kind="guard_area",description="CLEAR LOCAL THREATS FOR NATIVE HOLD"}
+                        if not tileId then local tile=work.tileForPoint(point);tileId=tile and tile.Name end
+                    end
                     if rule and tileId then
                         local value=(point-r.Position).Magnitude+(entry[2]=="artifacts"and -300 or 0)
+                        if model==work.expeditionFocus then value=value-10000 end
                         if not score or value<score then
                             best,score={model=model,tileId=tileId,rule=rule,kind=entry[2]},value
                         end
@@ -6886,7 +6945,11 @@ local function runIslandEscape()
         work.unlockWork,work.attackPlanCache=nil,nil
         work.unlockCheckAt=0
         if not ok then error(result)end
-        if not work.preempted and not result then work.unlockBackoff[model]=os.clock()+3;work.unlockPlan=nil end
+        if not work.preempted and not result then
+            work.unlockFailures=work.unlockFailures or setmetatable({}, {__mode="k"})
+            local n=(work.unlockFailures[model]or 0)+1;work.unlockFailures[model]=n
+            work.unlockBackoff[model]=os.clock()+math.min(60,3*2^math.min(4,n-1));work.unlockPlan=nil
+        elseif result and work.unlockFailures then work.unlockFailures[model]=nil end
         -- A real kill is progress, not proof of unlock. Recheck native state next time.
         note(key,result and "REQUIRED KILL CONFIRMED • SERVER UNLOCK STILL CHECKED"or "REQUIRED FIGHT DEFERRED • GEAR / SAFE STANCE / HEALTH")
         return result
@@ -6909,8 +6972,8 @@ local function runIslandEscape()
         return owned.." / 4 collected • "..loaded.." loaded remaining / "..locked.." locked or prompt unavailable / "..unsafe.." guarded"
     end
     function work.routineBlocked(key)
-        if work.recoveryNeeded()and({unlockObjective=true,artifacts=true,chests=true,exploreMap=true,puzzles=true,stockpile=true,hunt=true,foodHunt=true,greatWall=true,structures=true,questAcquire=true,progression=true,combat=true,autoAttack=true})[key]then return true end
-        if work.stormActive()and({unlockObjective=true,artifacts=true,chests=true,exploreMap=true,puzzles=true,hunt=true,foodHunt=true,questAcquire=true,travel=true})[key]then return true end
+        if work.recoveryNeeded()and({campInfrastructure=true,campUpgrade=true,expedition=true,unlockObjective=true,artifacts=true,chests=true,exploreMap=true,puzzles=true,stockpile=true,hunt=true,foodHunt=true,greatWall=true,structures=true,questAcquire=true,progression=true,combat=true,autoAttack=true})[key]then return true end
+        if work.stormActive()and({expedition=true,unlockObjective=true,artifacts=true,chests=true,exploreMap=true,puzzles=true,hunt=true,foodHunt=true,questAcquire=true,travel=true})[key]then return true end
         return false
     end
     function work.recoveryNeeded()
@@ -7031,7 +7094,7 @@ local function runIslandEscape()
             local prompt = part and part:FindFirstChildOfClass("ProximityPrompt")
             return prompt and prompt.Enabled and not work.artifacts[model.Name] and work.safeResource(model)
                 and not (failed[model] and failed[model] > os.clock())
-        end)
+        end,function(model)return model.Name=="Map"and 10000 or 0 end)
     end
     function work.exploreAvailable(kind)
         local c, scene = config(), world()
@@ -8317,6 +8380,7 @@ local function runIslandEscape()
             end
         end
         table.sort(candidates, function(a,b) return a.rank < b.rank or a.rank==b.rank and tostring(a.id)<tostring(b.id) end)
+        work.structurePriorityRole=candidates[1]and candidates[1].role or nil
         return candidates[1]
     end
     function work.structurePlacement(goal)
@@ -8470,7 +8534,7 @@ local function runIslandEscape()
             local id=model:GetAttribute("cnId") or model.Name
             if work.structureRole and work.structureRole(id,config().item.byId[id])~="other" then
                 local point=pos(model)
-                if point and not seenStations[model] then stations[#stations+1]=point;seenStations[model]=true end
+                if point and not seenStations[model]then stations[#stations+1]=point;seenStations[model]=true end
             end
         end
         local tileRows=tiles:GetChildren()
@@ -8490,7 +8554,7 @@ local function runIslandEscape()
         end
         for _,tile in ipairs(tileRows)do
             local box=tile:FindFirstChild("BoundingBox")
-            if box and box:IsA("BasePart")then
+            if box and box:IsA("BasePart")and(not center or Vector3.new(box.CFrame.Position.X-center.X,0,box.CFrame.Position.Z-center.Z).Magnitude<=600+math.max(box.Size.X,box.Size.Z)/2)then
                 local name=tile.Name:lower()
                 local row={frame=box.CFrame,size=box.Size,base=tile.Name=="Basic Block",
                     beach=name:find("beach",1,true)~=nil or name:find("沙滩",1,true)~=nil}
@@ -8516,6 +8580,20 @@ local function runIslandEscape()
             if not best or score<best then seed,best=row,score end
         end
         if not seed then return {} end
+        -- Connected ocean coast is not the station beach. Bound the flood fill to
+        -- the starting tile and camp-station footprint, with a full tile of margin.
+        local minX,maxX,minZ,maxZ=seed.minX,seed.maxX,seed.minZ,seed.maxZ
+        for _,point in ipairs(stations)do
+            if not center or(point-center).Magnitude<=500 then
+                minX,maxX=math.min(minX,point.X),math.max(maxX,point.X)
+                minZ,maxZ=math.min(minZ,point.Z),math.max(maxZ,point.Z)
+            end
+        end
+        local padding=48
+        for _,row in ipairs(rows)do
+            local p=row.frame.Position
+            row.inCamp=row.base or row.station or(p.X>=minX-padding and p.X<=maxX+padding and p.Z>=minZ-padding and p.Z<=maxZ+padding)
+        end
         local region,seen={seed},{[seed]=true}
         local i=1
         while i<=#region do
@@ -8523,7 +8601,7 @@ local function runIslandEscape()
             for _,row in ipairs(rows)do
                 local overlapX=math.min(own.maxX,row.maxX)-math.max(own.minX,row.minX)
                 local overlapZ=math.min(own.maxZ,row.maxZ)-math.max(own.minZ,row.minZ)
-                if not seen[row] and ((overlapX>.1 and overlapZ>=-.5)or(overlapZ>.1 and overlapX>=-.5))
+                if row.inCamp and not seen[row] and ((overlapX>.1 and overlapZ>=-.5)or(overlapZ>.1 and overlapX>=-.5))
                     and math.abs(row.frame.Position.Y-own.frame.Position.Y)<=12 then
                     seen[row]=true;region[#region+1]=row
                 end
@@ -8535,7 +8613,7 @@ local function runIslandEscape()
             for _,row in ipairs(region)do if contains(row,point)then covered=true break end end
             if not covered then uncovered=uncovered+1 end
         end
-        work.wallRegionCache={scene=scene,signature=signature,region=region,stations=stations,uncovered=uncovered,expires=os.clock()+1}
+        work.wallRegionCache={scene=scene,signature=signature,region=region,stations=stations,uncovered=uncovered,expires=os.clock()+3}
         return region,stations,uncovered
     end
     function work.inBaseBeach(point,size)
@@ -8760,9 +8838,12 @@ local function runIslandEscape()
         return pickups(key,true)or gatherResource(key,true)
     end
     function work.automationReport()
-        local c=config();local rows={"AUTOMATION AUDIT v8 • OBJECTIVE COMBAT / REFUGE"}
+        local c=config();local rows={"AUTOMATION AUDIT v9 • EXPEDITIONS / CAMP INFRASTRUCTURE"}
         rows[#rows+1]="Active jobs: "..table.concat(select(2,work.roleUnion())," + ").." | chunk visits "..tostring(work.chunkVisits or 0).." | revivals resumed "..tostring(work.reviveCount or 0)
         local pending=work.unlockWork or work.unlockPlan
+        local campGoal=work.campInfrastructureGoal()
+        rows[#rows+1]="Camp priority: "..(campGoal and campGoal.name or "ESSENTIAL STATIONS BUILT / BLUEPRINTS NOT LOADED")
+        rows[#rows+1]="Expeditions: tribal "..tostring(opts.expeditionTribal).." / pirates "..tostring(opts.expeditionPirates).." • sorted material piles enabled"
         rows[#rows+1]="Artifacts: "..work.artifactProgress()
         rows[#rows+1]="Unlock objective: "..(pending and(pending.model.Name.." • "..pending.rule.description.." • TILE "..tostring(pending.tileId))or "NONE / SEARCHING LOADED LOCK METADATA")
         rows[#rows+1]="Combat decision: "..tostring(work.lastFightDecision or "WAITING").." • recovering "..tostring(work.recovering==true).." • recent damage "..tostring(work.damageBurst or 0)
@@ -8816,6 +8897,191 @@ local function runIslandEscape()
         end
         return work.openChest()
     end
+    function work.campInfrastructureGoal()
+        local scene=world();local folder=scene and scene:FindFirstChild("Buildings")
+        if not folder then return end
+        local cached=work.campInfrastructureCache
+        if cached and cached.scene==scene and os.clock()<cached.expires and cached.blueprint.Parent then return cached.goal end
+        local best,rank,blueprint
+        for id,info in pairs(config().build.byId or{})do
+            local priority=work.buildRank(info)
+            local model=folder:FindFirstChild(info.assetId.."_Construct")
+            if priority<2 and model and not built(info.assetId)then
+                if not rank or priority<rank then
+                    rank,blueprint=priority,model
+                    best={key="camp:"..id,id=id,kind="build",info=info,campEssential=true,
+                        name="CAMP STATION: "..tostring(info.displayName or info.assetId),amounts=work.recipeAmounts(info,true)}
+                end
+            end
+        end
+        if best then work.campInfrastructureCache={scene=scene,expires=os.clock()+.75,goal=best,blueprint=blueprint}
+        else work.campInfrastructureCache=nil end
+        return best
+    end
+    function work.campMaterialReserve(id,key)
+        if key=="campInfrastructure"then return 0 end
+        local active=work.activeGoal
+        if active and active.kind=="build"and active.campEssential then return 0 end
+        if not(flags.buildCamp or flags.roleBuilder or flags.roleGatherer)then return 0 end
+        local goal=work.campInfrastructureGoal()
+        return goal and(work.goalAmounts(goal)[id]or 0)or 0
+    end
+    function work.campSupplyCount(id)
+        local item=config().item.byId[id];if not item then return 0 end
+        local total=count(item.displayName)+(work.storageCount and work.storageCount(id)or 0)
+        local camp=work.campDropAnchor();local center=camp and pos(camp)
+        if not center then return total end
+        for _,drop in ipairs(work.models("drops"))do
+            local point=pos(drop)
+            if drop.Parent and drop.Name==item.displayName and point and(point-center).Magnitude<=90
+                and not drop:GetAttribute("collecting")then total=total+(tonumber(drop:GetAttribute("count"))or 1)end
+        end
+        return total
+    end
+    function work.campStageReserved(model)
+        if not(flags.roleGatherer or flags.roleBuilder or flags.buildCamp)then return false end
+        local item=config().item.byDisplayName[model.Name]
+        local goal=item and work.campInfrastructureGoal()
+        if not goal or(work.goalAmounts(goal)[item.id]or 0)<=0 then return false end
+        local camp=work.campDropAnchor();local center=camp and pos(camp);local point=pos(model)
+        return point and center and(point-center).Magnitude<=90
+            and(model:GetAttribute("ownerName")~=nil or model:GetAttribute("EXISCampStockpile")==true)or false
+    end
+    function work.campPriorityNeeds()
+        local goal=work.campInfrastructureGoal();local result={}
+        if goal then
+            for id,n in pairs(work.goalAmounts(goal))do
+                local supplied=work.campSupplyCount(id)
+                if n>supplied then result[id]=n-supplied end
+            end
+        end
+        return result
+    end
+    function work.campResourceNeeded(model,needs)
+        local info=config().worldResource.byId[model:GetAttribute("resourceId")]
+        for _,drop in pairs(info and config().itemDrop and config().itemDrop.byId[info.dropId]or{})do
+            local item=type(drop)=="table"and config().item.byName[drop.itemCN]
+            if item and needs[item.id]then return true end
+        end
+        return false
+    end
+    function work.campInfrastructureReady()
+        local goal=work.campInfrastructureGoal()
+        return goal and work.goalRunnable(goal)or false
+    end
+    function work.campWorkTick(key,goal)
+        if not goal then return false end
+        local previous=work.activeGoal
+        work.activeGoal=goal
+        local ok,result=pcall(function()
+            note(key,goal.name.." • MATERIALS / CONSTRUCTION FIRST")
+            -- Submit every useful carried batch to the priority station before unloading it.
+            if work.submitGoal(key,goal)then return true end
+            if work.preempted then return false end
+            if work.reclaimStorage(goal,key)then return true end
+            work.needs,work.amounts,work.resourceNeeds,work.needTotals={},{},{},{}
+            for id,n in pairs(work.goalAmounts(goal))do if n>0 then work.needItem(id,n,150)end end
+            for id,resource in pairs(config().worldResource.byId)do
+                for _,entry in pairs(config().itemDrop and config().itemDrop.byId[resource.dropId]or{})do
+                    local item=type(entry)=="table"and config().item.byName[entry.itemCN]
+                    if item and work.needs[item.id]then work.resourceNeeds[id]=150 end
+                end
+            end
+            if not work.canCollect()then return work.unloadBag()end
+            return pickups(key,true)or gatherResource(key,true)
+        end)
+        work.activeGoal=previous;work.campInfrastructureCache=nil;work.refreshAt=0
+        if not ok then error(result)end
+        return result
+    end
+    function work.campInfrastructureTick()
+        return work.campWorkTick("campInfrastructure",work.campInfrastructureGoal())
+    end
+    function work.campUpgradeReady()
+        local goal=work.campfireGoal()
+        return goal and work.goalRunnable(goal)or false
+    end
+    function work.campUpgradeTick()
+        return work.campWorkTick("campUpgrade",work.campfireGoal())
+    end
+    function work.expeditionRegion(model)
+        local tile=model:GetAttribute("MapLockTileId")
+        if model.Name=="原始部落宝箱"or model.Name=="原始部落头骨"or tile=="原始部落"then return "tribal"end
+        if tile=="章鱼海盗船"then return "pirates"end
+        local point=pos(model);local owner=point and work.tileForPoint(point)
+        if owner and owner.Name=="原始部落"then return "tribal"end
+        if owner and owner.Name=="章鱼海盗船"then return "pirates"end
+    end
+    function work.expeditionTarget()
+        local r=root();if not r then return end
+        local best,score
+        if opts.expeditionTribal and flags.puzzles and opts.unlockObjectives then
+            for _,model in ipairs(work.models("explore"))do
+                if model.Name=="原始部落头骨"and not work.protectedObjective(model)
+                    and not(work.expeditionSolved and work.expeditionSolved[model])and pos(model)and work.insideBorder(pos(model))
+                    and os.clock()>=(failed[model]or 0)then
+                    local prompt=model:FindFirstChildWhichIsA("ProximityPrompt",true)
+                    if prompt and prompt.Enabled then return{model=model,region="tribal",kind="skull"}end
+                end
+            end
+        end
+        for _,model in ipairs(work.models("chests"))do
+            local region=work.expeditionRegion(model)
+            local state=work.chestStates and work.chestStates[model]
+            local point=pos(model)
+            if region and(region=="tribal"and opts.expeditionTribal or region=="pirates"and opts.expeditionPirates)
+                and point and work.insideBorder(point)and not(state and state.complete)
+                and os.clock()>=(failed[model]or 0)and os.clock()>=(work.expeditionBlocked and work.expeditionBlocked[model]or 0)then
+                local value=(point-r.Position).Magnitude+(region=="tribal"and -1000 or 0)
+                if not score or value<score then best,score={model=model,region=region,kind="chest"},value end
+            end
+        end
+        return best
+    end
+    function work.expeditionStep(target)
+        local key="expedition";local model=target.model
+        note(key,target.region:upper().." • "..(target.kind=="skull"and "ACTIVATE NATIVE SKULL"or "OPEN CHEST / CONFIRM LOOT"))
+        if target.kind=="skull"then
+            if call("PuzzlePropService","isSolved",model)then
+                work.expeditionSolved=work.expeditionSolved or setmetatable({}, {__mode="k"});work.expeditionSolved[model]=true;return true
+            end
+            local prompt=model:FindFirstChildWhichIsA("ProximityPrompt",true)
+            if not prompt or not prompt.Enabled or not work.safeResource(model)then failed[model]=os.clock()+5;return false end
+            if not travel(prompt.Parent,key,math.max(.5,prompt.MaxActivationDistance-1))then return false end
+            local sent,held=work.interactPrompt(model,key)
+            if sent==false and not held then return false end
+            if sent~=true then call("PuzzlePropService","requestSolve",model)end
+            local solved=work.await(key,function()return call("PuzzlePropService","isSolved",model)==true end,3)
+            if solved then work.expeditionSolved=work.expeditionSolved or setmetatable({}, {__mode="k"});work.expeditionSolved[model]=true end
+            if not work.preempted then failed[model]=os.clock()+(solved and 0 or 5)end
+            note(key,solved and "TRIBAL SKULL ACTIVATED • SERVER SOLVE CONFIRMED"or "TRIBAL SKULL SOLVE UNCONFIRMED")
+            return solved
+        end
+        if not work.readChestField(model,"opened")and work.readChestField(model,"locked")then
+            if not work.unlockRule(model)then
+                failed[model]=os.clock()+10
+                note(key,"LOCKED CHEST • NATIVE RULE NOT EXPOSED; CHECK SKULL / SERVER STATE")return false
+            end
+            work.expeditionFocus=model;work.unlockPlan=nil;work.unlockCheckAt=0
+            work.expeditionBlocked=work.expeditionBlocked or setmetatable({}, {__mode="k"})
+            work.expeditionBlocked[model]=math.max(os.clock()+6,work.unlockBackoff and work.unlockBackoff[model]or 0)
+            failed[model]=work.expeditionBlocked[model];due.unlockObjective=0
+            note(key,"NATIVE CHEST LOCK • REQUIRED PIRATE / TILE TASK QUEUED")
+            return false
+        end
+        if not work.safeResource(model)then work.expeditionFocus=model;work.unlockPlan=nil;work.unlockCheckAt=0 end
+        local result=work.openChest(model)
+        note(key,result and "EXPEDITION CHEST / ELIGIBLE LOOT CONFIRMED"or "EXPEDITION CHEST / LOOT STILL PENDING")
+        return result
+    end
+    function work.expeditionTick()
+        local target=work.expeditionTarget();if not target then return false end
+        work.expeditionActive=target
+        local ok,result=pcall(work.expeditionStep,target)
+        work.expeditionActive=nil
+        if not ok then error(result)end
+        return result
+    end
     function work.questAcquireGoal()
         local req=flags.quest and work.questRequirement
         if work.questSubmission or not req or work.questTotal(req)>=req.count then return end
@@ -8850,7 +9116,7 @@ local function runIslandEscape()
                     return goal
                 end
             end
-            goal.blocked="REQUIRED "..prerequisite:upper().." BLUEPRINT NOT LOADED"
+            goal.blocked="REQUIRED "..prerequisite:upper().." BLUEPRINT NOT LOADED • CAMP INFRASTRUCTURE / MAP REQUIRED"
         elseif goal.mode=="direct"and item.recipeId and next(work.recipeAmounts(item))and not(c.food and c.food.byId[item.id])then
             goal.mode,goal.kind,goal.id,goal.info="craft","craft",item.id,item
             goal.amounts=work.goalAmounts(goal)
@@ -9126,12 +9392,13 @@ local function runIslandEscape()
             if not state or state.scene~=scene or state.size~=size or state.origin~=origin then
                 state={scene=scene,size=size,origin=origin,rows={}};work.mapFrontier=state
             end
-            state.snapshot=snapshot
-            local rows,visited,unknown={},0,0
+            state.snapshot=snapshot;work.mapSnapshotAt=os.clock()
+            local rows,revealed,unknown={},0,0
             for index=0,size*size-1 do
                 local palette=buffer.readu8(snapshot,index)
                 local x,z=index%size,math.floor(index/size)
                 local land=palette==2 or palette==3
+                if palette>=2 then revealed=revealed+1 end
                 local frontier=false
                 if palette==0 then
                     unknown=unknown+1
@@ -9145,13 +9412,20 @@ local function runIslandEscape()
                 if land or frontier then
                     local row=state.rows[index]or{tile={Name="GRID "..x..","..z},visited={},blocked={}}
                     row.probe=Vector3.new(origin+(x+.5)*50,0,origin+(z+.5)*50)
-                    row.frontier=frontier;state.rows[index]=row;rows[#rows+1]=row
-                    if row.visited[1]then visited=visited+1 end
+                    row.frontier=frontier;state.rows[index]=row
+                    if frontier then rows[#rows+1]=row end -- already visible land needs no registration trip
                 end
             end
             state.active=rows
-            work.mapCoverageStatus=visited.." / "..#rows.." native land/frontier cells reached • "..unknown.." unrevealed cells (water / locks / unloaded possible)"
+            work.mapCoverageStatus=revealed.." server-visible cells • "..#rows.." unrevealed frontier targets • "..unknown.." unknown cells • arrivals confirmed visible "..tostring(work.mapVerifiedVisits or 0)
         end)
+    end
+    function work.mapCellVisible(point)
+        local state=work.mapFrontier
+        if not state or state.scene~=world()or not state.snapshot then return false end
+        local x,z=math.floor((point.X-state.origin)/50),math.floor((point.Z-state.origin)/50)
+        if x<0 or z<0 or x>=state.size or z>=state.size then return false end
+        return buffer.readu8(state.snapshot,z*state.size+x)>=2
     end
     function work.chunkRows()
         work.requestMapFrontier()
@@ -9181,10 +9455,11 @@ local function runIslandEscape()
         local rows=work.chunkRows();local candidates={}
         local now=os.clock();local revisit=tonumber(opts.chunkRevisit)or 30
         local committed=work.chunkTarget
-        if committed and committed.scene==world()and now>=(committed.row.blocked[committed.index]or 0)and not committed.row.visited[committed.index]then return committed end
+        if committed and committed.scene==world()and now>=(committed.row.blocked[committed.index]or 0)and not committed.row.visited[committed.index]and not work.mapCellVisible(committed.probe)then return committed end
         for _,row in ipairs(rows)do
-            for index,offset in ipairs(row.probe and{{0,0}}or{{0,0},{-.3,-.3},{.3,-.3},{.3,.3},{-.3,.3}})do
-                if (not row.visited[index] or now-row.visited[index]>=revisit) and now>=(row.blocked[index]or 0)then
+            for index,offset in ipairs({{0,0}})do
+                local center=row.probe or row.box.CFrame.Position
+                if not work.mapCellVisible(center)and(not row.visited[index] or now-row.visited[index]>=revisit) and now>=(row.blocked[index]or 0)then
                     local point=row.probe or row.box.CFrame:PointToWorldSpace(Vector3.new(row.box.Size.X*offset[1],0,row.box.Size.Z*offset[2]))
                     candidates[#candidates+1]={row=row,index=index,probe=point,age=row.visited[index]or -math.huge,
                         distance=(point-r.Position).Magnitude}
@@ -9204,14 +9479,21 @@ local function runIslandEscape()
             candidate.row.blocked[candidate.index]=now+8
         end
     end
+    function work.explorationReady()
+        if os.clock()<(work.nextChunkAt or 0)then return false end
+        if os.clock()<(work.chunkReadyUntil or 0)then return work.chunkReadyValue==true end
+        work.chunkReadyValue=work.chunkDestination()~=nil
+        work.chunkReadyUntil=os.clock()+(work.chunkReadyValue and .3 or 1)
+        return work.chunkReadyValue
+    end
     function work.exploreMapTick(key)
         key=key or "exploreMap"
         if work.criticalMeal()then note(key,"RECOVER HEALTH / FOOD BEFORE EXPLORING")return false end
         local target=work.chunkDestination()
-        if not target then note(key,"NO SAFE LOADED CHUNK • RETRYING / CHECKING CAMP")return false end
+        if not target then note(key,"NO SAFE UNREGISTERED CHUNK • WAITING FOR STREAMING / CAMPFIRE UNLOCKS")return false end
         target.scene=world();work.chunkTarget=target
         work.exploreLegUntil=os.clock()+4 -- urgent survival may still interrupt
-        note(key,"CHUNK "..target.row.tile.Name.." • SWEEP "..target.index..(target.row.probe and " / 1"or " / 5"))
+        note(key,"CHUNK "..target.row.tile.Name.." • SWEEP "..target.index.." / 1 • REGISTER SHARED MAP")
         if target.needsStreaming then
             if not work.insideBorder(target.probe,4)then target.row.blocked[target.index]=os.clock()+15;work.chunkTarget=nil;return false end
             local requested,done=false,false
@@ -9228,15 +9510,26 @@ local function runIslandEscape()
                 note(key,"FRONTIER NOT SAFE / NOT STREAMED • NO LANDING ATTEMPTED")return false
             end
         end
-        if not travel(target.point,key,2)then
+        if not travel(target.point,key,2,"Teleport")then
             if not work.preempted then target.row.blocked[target.index]=os.clock()+8 end
             return false
         end
         if not work.pause(key,.15)then return false end
         target.row.visited[target.index]=os.clock()
         work.chunkTarget=nil
-        if target.row.probe then work.mapRequestAt=math.min(work.mapRequestAt or 0,os.clock()+3)end
         work.chunkVisits=(work.chunkVisits or 0)+1
+        work.chunkReadyUntil=0
+        if work.mapFrontier and work.mapFrontier.snapshot then
+            work.mapRequestAt=0;work.requestMapFrontier()
+            local visible=work.await(key,function()return work.mapCellVisible(target.probe)end,1.5)
+            if visible then
+                work.mapVerifiedVisits=(work.mapVerifiedVisits or 0)+1
+                note(key,"CHUNK ARRIVAL • SERVER MAP VISIBILITY CONFIRMED")
+            else
+                target.row.visited[target.index]=nil;target.row.blocked[target.index]=os.clock()+10
+                note(key,"CHUNK ARRIVAL • SHARED MAP REVEAL UNCONFIRMED; RETRY LATER")
+            end
+        else note(key,"CHUNK ARRIVAL • NATIVE MAP SNAPSHOT UNAVAILABLE; REVEAL UNCONFIRMED")end
         work.refreshAt=0
         return true
     end
@@ -9262,7 +9555,7 @@ local function runIslandEscape()
         local key="roleFallback"
         work.nextRoleAt=os.clock()+1
         -- Exploration has its own committed job; fallback must not run a duplicate trip.
-        if flags.exploreMap then note(key,"EXPLORATION QUEUED • CONTINUING OTHER READY WORK")return false end
+        if flags.exploreMap and(not work.explorationReady or work.explorationReady())then note(key,"EXPLORATION QUEUED • CONTINUING OTHER READY WORK")return false end
         if work.preempted then return false end
         return work.campPatrol(key)
     end
@@ -9367,13 +9660,19 @@ local function runIslandEscape()
         return result
     end
     local jobsList = {
+        {key="campInfrastructure",enabled=function()return flags.buildCamp or flags.buildCurrent or flags.build end,
+            ready=function()return work.campInfrastructureReady and work.campInfrastructureReady()or false end,run=work.campInfrastructureTick},
+        {key="campUpgrade",enabled=function()return flags.fuel or flags.buildCamp end,
+            ready=function()return work.campUpgradeReady and work.campUpgradeReady()or false end,run=work.campUpgradeTick},
+        {key="expedition",enabled=function()return flags.chests and(opts.expeditionTribal or opts.expeditionPirates)end,
+            ready=function()return work.expeditionTarget and work.expeditionTarget()~=nil or false end,run=work.expeditionTick},
         {key="recovery",enabled=function()return flags.combat or flags.runShadow or opts.useRefuge end,ready=function()return work.recoveryReady and work.recoveryReady()or false end,run=work.recoveryTick},
         {key="unlockObjective",enabled=function()return opts.unlockObjectives and(flags.artifacts or flags.chests)and(flags.combat or flags.autoAttack)end,
             ready=function()return work.unlockCandidate()~=nil end,run=work.unlockObjectiveTick},
         {key="travelFood",enabled=function()return (tonumber(opts.travelRation)or 0)>0 end,ready=work.travelFoodReady,run=work.travelFoodTick},
         {key="shareGuns",enabled=function()return flags.shareGuns end,ready=function()return work.gunHandoff~=nil or work.carriedGun()~=nil and work.campDropAnchor()~=nil end,run=work.shareGunsTick},
         {key="takeTeamGuns",enabled=function()return flags.takeTeamGuns end,ready=function()return work.teamGunCandidate()~=nil end,run=work.takeTeamGunTick},
-        {key="exploreMap",enabled=function()return flags.exploreMap end,ready=function()return os.clock()>=(work.nextChunkAt or 0)end,
+        {key="exploreMap",enabled=function()return flags.exploreMap end,ready=function()return work.explorationReady and work.explorationReady()or false end,
             run=function()work.nextChunkAt=os.clock()+.5;return work.exploreMapTick("exploreMap")end},
         {key="roleFallback",enabled=function()return flags.roleFallback end,ready=function()return os.clock()>=(work.nextRoleAt or 0)end,run=work.roleFallbackTick},
         {key="questAcquire",enabled=function()return flags.quest end,ready=work.questAcquireReady,run=work.questAcquireTick},
