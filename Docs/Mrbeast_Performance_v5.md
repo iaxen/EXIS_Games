@@ -1,3 +1,5 @@
+> Team presets, chunk exploration, gun handoff, revival recovery and further survival/performance changes are documented in [Mrbeast_Team_Roles_v6.md](Mrbeast_Team_Roles_v6.md).
+
 # MrBeast performance and chest ESP — v5
 
 Reviewed inputs: all five supplied `20261108_123354_119897` log parts, its report and saved configuration, plus the two supplied late parts of `20261108_114008_3449440`. Native behavior was checked against the extracted ChestClient/ChestService sources. These logs lack frame timings; the code hotspots below are supported explanations, not measured FPS attribution.

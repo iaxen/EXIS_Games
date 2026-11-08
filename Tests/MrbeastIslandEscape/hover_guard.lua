@@ -72,6 +72,7 @@ test('disabling the optional night hold allows routine work instead of anchoring
 end)
 test('the independent heartbeat guard reacts while a native fuel or meal request is yielding',function()
  assert(work.nightHold());local old=r.Position
+ work.observeHealth=function()end
  local callback;connections={};game={GetService=function()return{Heartbeat={Connect=function(_,fn)callback=fn;return{}end}}end}
  safely=function(_,fn)return fn()end;alive=true
  body('    local hoverElapsed=0', '    task.spawn(function()\n        while alive do\n            safely("live status"')
