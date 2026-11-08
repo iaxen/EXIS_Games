@@ -431,6 +431,41 @@ test('routine work queues until seven seconds without progress',function()
  now=6.99;assert(work.checkpoint('chests')and not work.preempted)
  now=7.1;assert(not work.checkpoint('chests')and work.preempted.to=='craft')
 end)
+test('a ready food hunt interrupts lower-priority travel even while movement makes progress',function()
+ loadBody('    function work.checkpoint(', '    function work.pause(')
+ work.active='stockpile';work.currentJob={key='stockpile'};work.jobs={};work.rank=function()return 7.8 end
+ work.nightPaused=function()return false end;motion.owner='stockpile'
+ work.pick=function(_,_,ceiling,urgent)
+  assert(ceiling==7.8)
+  if not urgent then return{key='foodHunt'},3.025 end
+ end
+ motion.cancel=function()motion.serial=motion.serial+1 end
+ work.progressAt=0;now=.05
+ assert(not work.checkpoint('stockpile')and work.preempted.to=='foodHunt')
+ assert(work.pendingHandoff=='foodHunt'and work.suspended.stockpile)
+end)
+test('travel cannot let a routine quest cut a live native interaction short',function()
+ loadBody('    function work.checkpoint(', '    function work.pause(')
+ work.active='chests';work.currentJob={key='chests'};work.jobs={};work.rank=function()return 8 end
+ work.nightPaused=function()return false end;motion.owner='chests';work.interaction={key='chests',untilTime=10}
+ work.pick=function(_,_,_,urgent)assert(urgent,'protected hold must only check emergencies')end
+ motion.cancel=function()error('hold was interrupted')end
+ assert(work.checkpoint('chests')and not work.preempted)
+end)
+test('higher-priority travel uses the production picker and does not reverse the ranking',function()
+ loadBody('    function work.pick(', '    function work.nextQueuedJob(')
+ loadBody('    function work.checkpoint(', '    function work.pause(')
+ local hunt={key='foodHunt',rank=3.025,ready=function()return true end}
+ local quest={key='quest',rank=3.01,ready=function()return true end}
+ work.rank=function(job)return job.rank end;work.jobEnabled=function()return true end
+ work.interruptsInteraction=function()return false end;work.nightPaused=function()return false end
+ work.active='foodHunt';work.currentJob=hunt;work.jobs={hunt,quest};motion.owner='foodHunt'
+ motion.cancel=function()end
+ assert(not work.checkpoint('foodHunt')and work.preempted.to=='quest')
+ work.preempted=nil;work.pendingHandoff=nil;work.nextPriorityCheck=0
+ work.active='quest';work.currentJob=quest;motion.owner='quest';now=.05
+ assert(work.checkpoint('quest')and not work.preempted,'a lower-priority hunt must wait for quest travel')
+end)
 test('known animation with currency-only or empty loot does not wait forever',function()
  local m=chest();local accepted=false
  work.chestDuration=function()return 1 end

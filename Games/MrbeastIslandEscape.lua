@@ -5651,9 +5651,14 @@ local function runIslandEscape()
         work.progressPosition = work.progressPosition or (r and r.Position)
         local interaction = work.interaction
         local protected = interaction and interaction.key == key and now < interaction.untilTime
-        -- Ready routine work queues behind the current action. Only genuine
-        -- survival emergencies interrupt before its receipt/completion.
+        -- Protect native holds and receipts, but travelling is interruptible.
+        -- Movement alone must not keep a lower-priority job ahead of a ready
+        -- food hunt, quest delivery or camp task indefinitely.
         local job, rank = work.pick(work.jobs, now, work.rank(work.currentJob), true)
+        if not job and not protected and motion.owner==key then
+            job,rank=work.pick(work.jobs,now,work.rank(work.currentJob))
+            if job then work.pendingHandoff=job.key end
+        end
         if not job and not protected and not work.isNight() and now-work.progressAt >= 7 then
             work.skipJob = key
             job, rank = work.pick(work.jobs, now)
