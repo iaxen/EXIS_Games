@@ -300,6 +300,121 @@ test('wall job deposits three wood crafts the native output and places the carri
  end
  assert(work.wallReady()and work.wallTick()and #placed==1 and count('Wood Wall')==0)
 end)
+local function fortFixture()
+ local wa=wall();local floor=item('木地板','Wood Floor',{recipeId='floor'});local ramp=item('木楼梯','Wood Slope',{recipeId='ramp'})
+ cfg.freeBuild.byCnId[floor.id]={};cfg.freeBuild.byCnId[ramp.id]={}
+ cfg.recipe.byId.floor={require_wood=3};cfg.recipe.byId.ramp={require_wood=3}
+ cfg.craftingContent.list={{itemName='Wood Wall'},{itemName='Wood Floor'},{itemName='Wood Slope'}}
+ local assets={[wa.id]=wa,[floor.id]={id=floor.id,size=vec(8,.4,8),offset=CFrame.new()},[ramp.id]={id=ramp.id,size=vec(8,4,8),offset=CFrame.new()}}
+ work.wallTemplate=function(id)return assets[id]end
+ work.wallRegion=function()return{{frame=CFrame.new(),size=vec(200,2,200)}},{vec(0,0,0),vec(20,0,20)},0 end
+ work.wallGround=function(p)return vec(p.X,0,p.Z)end
+ work.stationStock={};work.station=function()return{},{}end;work.goalRunnable=function()return true end
+ opts.wallPreset='fort2';return assert(work.wallRecipe()),assets
+end
+local function placeFortStage(plan,stage)
+ for _,slot in ipairs(plan.stages[stage]or{})do
+  local m=object(slot.asset.id);m.attrs.cnId=slot.asset.id;m.BoundingBox={Position=slot.box.Position};placed[#placed+1]=m
+ end
+ work.fortBuiltIndex=nil
+end
+test('two-storey preset resolves real floor and slope recipes through the native crafting catalogue',function()
+ local wall=fortFixture()
+ assert(work.fortRecipe('floor').id=='木地板'and work.fortRecipe('slope').id=='木楼梯')
+ assert(work.fortRecipe('floor').stationKind=='crafting')
+ local plan=assert(work.fortPlan(wall));assert(plan.side>=48 and plan.height>=8)
+ for stage=1,5 do assert(#plan.stages[stage]>0)end
+end)
+test('house has a square lower shell upper walls separate roof and an open stairwell',function()
+ local wall=fortFixture();local plan=assert(work.fortPlan(wall))
+ assert(plan.stages[1][1].box.Position.Y<plan.stages[4][1].box.Position.Y)
+ assert(plan.stages[3][1].box.Position.Y<plan.stages[5][1].box.Position.Y)
+ assert(#plan.stages[3]<#plan.stages[5],'second-floor stair opening must not become a solid ceiling over the ramp')
+ local stair=plan.stages[2][1]
+ for _,floor in ipairs(plan.stages[3])do
+  local p,q=floor.box.Position,stair.box.Position
+  assert(math.abs(p.X-q.X)>=7.9 or math.abs(p.Z-q.Z)>=7.9,'floor must not block the first stair flight')
+ end
+end)
+test('fort builds lower walls then slope stairs then the platform using placed receipts',function()
+ local wall=fortFixture();local plan=assert(work.fortPlan(wall))
+ local goal=assert(work.fortGoal(wall));assert(goal.site.stage==1 and goal.id==wall.id)
+ placeFortStage(plan,1)
+ goal=assert(work.fortGoal(wall));assert(goal.site.stage==2 and goal.id=='木楼梯')
+ placeFortStage(plan,2)
+ goal=assert(work.fortGoal(wall));assert(goal.site.stage==3 and goal.id=='木地板')
+ placeFortStage(plan,3)
+ goal=assert(work.fortGoal(wall));assert(goal.site.stage==4)
+ placeFortStage(plan,4)
+ goal=assert(work.fortGoal(wall));assert(goal.site.stage==5)
+end)
+test('one lower wall request cannot unlock higher wall courses before its supporting wall exists',function()
+ local wall=fortFixture();local plan=assert(work.fortPlan(wall));local upper
+ for _,slot in ipairs(plan.stages[1])do if slot.course==2 then upper=slot;break end end
+ assert(upper and not work.fortSiteValid{fort=plan,box=upper.box,asset=upper.asset,course=2,stage=1})
+end)
+test('stairs never place the second slope before the first slope is confirmed',function()
+ local wall=fortFixture();local plan=assert(work.fortPlan(wall));placeFortStage(plan,1)
+ local second=plan.stages[2][2];assert(second.previous)
+ assert(not work.fortSiteValid{fort=plan,box=second.box,asset=second.asset,previous=second.previous,stage=2})
+end)
+test('a platform below is not mistaken for the higher roof using the same floor item',function()
+ local wall=fortFixture();local plan=assert(work.fortPlan(wall));placeFortStage(plan,3)
+ assert(work.fortOccupied(plan.stages[3][1]))
+ assert(not work.fortOccupied(plan.stages[5][1]))
+end)
+test('completed fort repairs a destroyed lower wall before continuing other levels',function()
+ local wall=fortFixture();local plan=assert(work.fortPlan(wall))
+ for stage=1,5 do placeFortStage(plan,stage)end
+ assert(not work.fortGoal(wall)and work.wallStage:find('FORT COMPLETE',1,true))
+ placed[1].Parent=nil
+ local goal=assert(work.fortGoal(wall));assert(goal.site.stage==1)
+end)
+test('missing floor catalogue is explicitly blocked without substituting an invented item',function()
+ local wall=fortFixture();cfg.freeBuild.byCnId['木地板']=nil
+ assert(not work.fortGoal(wall)and work.wallStage:find('NATIVE FLOOR',1,true))
+end)
+test('native square-corner overlap ignores only known planned fort pieces',function()
+ local wall=fortFixture();local plan=assert(work.fortPlan(wall));placeFortStage(plan,1)
+ local unrelated=object('Other');unrelated.attrs.cnId='Other';unrelated.BoundingBox={Position=vec(0,0,0)};placed[#placed+1]=unrelated
+ work.fortBuiltIndex=nil
+ local ignored=work.fortIgnore{fort=plan};assert(#ignored>0)
+ for _,model in ipairs(ignored)do assert(model~=unrelated)end
+end)
+test('a carried second-floor piece is placed from checked ground and needs the native placement receipt',function()
+ local wall=fortFixture();local plan=assert(work.fortPlan(wall));placeFortStage(plan,1);placeFortStage(plan,2)
+ stock['Wood Floor']=1
+ travel=function(point)assert(point.Y==3,'do not land on the still-unbuilt second floor');return true end
+ call=function(service,method,id,frame)
+  assert(service=='FreeBuild'and method=='requestPlace'and id=='木地板')
+  local model=object(id);model.attrs.cnId=id;model.BoundingBox={Position=frame.Position};placed[#placed+1]=model;stock['Wood Floor']=0
+ end
+ work.await=function(_,fn)return fn()end
+ assert(work.wallTick()and count('Wood Floor')==0)
+end)
+test('fort overlap checks continue past allowed seam pieces to reject an unrelated obstruction',function()
+ fortFixture();local allowed,other=object('Wall'),object('Other')
+ work.fortIgnore=function()return{allowed}end
+ local function part(model)return{Name='BoundingBox',FindFirstAncestorOfClass=function()return model end}end
+ workspace.GetPartBoundsInBox=function()return{part(allowed),part(other)}end
+ assert(work.fortOverlap{fort={},box=CFrame.new(),asset={size=vec(8,4,2)}})
+ workspace.GetPartBoundsInBox=function()return{part(allowed)}end
+ assert(not work.fortOverlap{fort={},box=CFrame.new(),asset={size=vec(8,4,2)}})
+end)
+test('roof floor tiles cover the square shell without an unfilled perimeter strip',function()
+ local wall=fortFixture();local plan=assert(work.fortPlan(wall))
+ local minX,maxX,minZ,maxZ=math.huge,-math.huge,math.huge,-math.huge
+ for _,slot in ipairs(plan.stages[5])do
+  local p,size=slot.box.Position,slot.asset.size
+  minX,maxX=math.min(minX,p.X-size.X/2),math.max(maxX,p.X+size.X/2)
+  minZ,maxZ=math.min(minZ,p.Z-size.Z/2),math.max(maxZ,p.Z+size.Z/2)
+ end
+ assert(math.abs(maxX-minX-plan.side)<.01 and math.abs(maxZ-minZ-plan.side)<.01)
+end)
+test('a square house that cannot fit the loaded dry beach reports the space requirement',function()
+ local wall=fortFixture();work.wallRegion=function()return{{frame=CFrame.new(),size=vec(40,2,40)}},{vec(0,0,0)},0 end
+ assert(not work.fortPlan(wall)and work.wallStage:find('LOADED BEACH TOO NARROW',1,true))
+end)
 test('wall planning readiness survives the immediate queue handoff recheck',function()
  work.wallGoal=function()return{info={displayName='Wood Wall'}}end;stock['Wood Wall']=1
  work.wallSite=function()return{}end
@@ -637,10 +752,10 @@ end)
 test('quick controls reflect partial settings and change only their own group',function()
  body('    work.automationBundles =', '    function work.makeSuiteUI(p)')
  body('    function work.makeSuiteUI(p)', '    local main=page(')
- local controls,buttons={},{}
- group=function(_,name,open)return{name=name,open=open}end
+ local controls,buttons,flagControls={},{},{}
+ group=function(parent,name,open)return{name=name,open=open,parent=parent}end
  switch=function(_,label,get,set)controls[label]={get=get,set=set};return function()end end
- toggle=function()end;number=function()end;work.slider=function()end;text=function()return{}end
+ toggle=function(parent,key,label)flagControls[key]={parent=parent,label=label}end;number=function()end;work.slider=function()end;text=function()return{}end
  button=function(_,label,fn)buttons[label]=fn;return{}end
  make=function()return{Text='',FocusLost={Connect=function()end}}end;corner=function()end
  Color3={fromRGB=function()return{}end};UDim2={new=function()return{}end};Enum.Font={BuilderSans=1}
@@ -652,9 +767,45 @@ test('quick controls reflect partial settings and change only their own group',f
  survival.set(true);assert(survival.get()==true and flags.eat and flags.killShadow and not flags.quest and flags.fish)
  survival.set(false);assert(survival.get()==false and not flags.eat and not flags.killShadow and flags.fish)
  assert(buttons['START LONG RUN • ENABLE ESSENTIALS']==work.applyLongRun)
- local wallControl=assert(controls['AUTO CRAFT & PLACE BEACH WALLS']);wallControl.set(true);assert(flags.greatWall and wallControl.get())
+ assert(flagControls.greatWall.parent.name=='CAMP PROGRESSION')
+ assert(not controls['AUTO CRAFT & PLACE BEACH WALLS'],'wall switch must not be duplicated on Main')
  buttons['ENABLE ALL BEACH STATIONS']();assert(flags.buildCamp and flags.buildCurrent and flags.structureCraft and flags.progression)
  local count=0;for _ in pairs(controls)do count=count+1 end;assert(count>=7)
+end)
+test('complete menu creates exactly ten ordered categories with one owner per feature and Live Run in Diagnostic',function()
+ body('    work.automationBundles =', '    function work.makeSuiteUI(p)')
+ body('    function work.makeSuiteUI(p)', '    local main=page(')
+ local names,parents,counts,groupsSeen={}, {}, {}, {}
+ local function owner(node)return node and(node.owner or node)end
+ page=function(name)local node={owner=name};names[#names+1]=name;return node end
+ group=function(parent,name)assert(parent,'missing parent for '..name);groupsSeen[name]=owner(parent);return{owner=owner(parent),name=name}end
+ text=function(parent,value)return{owner=owner(parent),Text=value}end
+ switch=function(parent,label)return function()end end
+ toggle=function(parent,key)
+  counts[key]=(counts[key]or 0)+1;parents[key]=owner(parent)
+ end
+ number=function()return{}end;work.slider=function()end
+ button=function(parent,label,fn)return{Text=label,owner=owner(parent)}end
+ local function event()return{Connect=function()end}end
+ make=function(_,props,parent)return{Text=props.Text or'',Activated=event(),FocusLost=event(),owner=owner(parent)}end
+ corner=function()end;round=function()end;save=function()end;say=function()end
+ Color3={fromRGB=function()return{}end};UDim2={new=function()return{}end,fromOffset=function()return{}end};UDim={new=function()return{}end}
+ Enum={Font={BuilderSans=1},TextXAlignment={Left=1},TextYAlignment={Top=1}}
+ gui={};viewport={X=1080};toggles={};opts.evadeMove='Teleport';opts.codes='';opts.move='Teleport'
+ assert(load(extract('    local main=page("Main")','    local diag = group(work.diagnosticsPage,')))()
+ local expected={'Main','Explorer','Depender','Gatherer','Builder (crafter)','Survival','Quest','ESP','Settings','Diagnostic'}
+ assert(#names==#expected)
+ for i,name in ipairs(expected)do assert(names[i]==name,names[i])end
+ local expectedOwners={revealMap='Explorer',exploreMap='Explorer',chests='Explorer',artifacts='Explorer',takeTeamGuns='Explorer',
+  combat='Depender',autoAttack='Depender',aura='Depender',autoRevive='Depender',
+  gather='Gatherer',mineIron='Gatherer',bagUpgrade='Gatherer',bulkCollect='Gatherer',shareGuns='Gatherer',huntFood='Gatherer',
+  greatWall='Builder (crafter)',buildCamp='Builder (crafter)',craft='Builder (crafter)',smelt='Builder (crafter)',fuel='Builder (crafter)',
+  eat='Survival',cook='Survival',killShadow='Survival',nightHover='Survival',quest='Quest',choiceRewards='Quest',redeemCodes='Quest',
+  espChests='ESP',espTrees='ESP',antiAfk='Settings',autoExecute='Settings',liveStatus='Diagnostic'}
+ for key,pageName in pairs(expectedOwners)do assert(parents[key]==pageName,key..' belongs to '..tostring(parents[key]))end
+ for key,count in pairs(counts)do assert(count==1,key..' has duplicated/scattered controls')end
+ assert(groupsSeen['LIVE RUN']=='Diagnostic'and groupsSeen['QUEUE / TASK PRIORITIES']=='Diagnostic')
+ assert(groupsSeen['EMERGENCY REFUGE']=='Survival'and groupsSeen['UNLOCK TASKS']=='Explorer')
 end)
 test('station footprints stay wholly on the base beach including shared tile seams',function()
  wall();beach(0).Name='Basic Block';beach(48)

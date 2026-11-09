@@ -53,6 +53,7 @@ local function setup()
   return false
  end
  call=function(service,op,m)requests[#requests+1]=op;if op=='requestSolve'then m.solved=true end;return op=='isSolved'and m.solved==true end
+ body('    function work.hostileWeapon(', '    function work.clearSceneIndex()')
  body('    function work.unlockRule(', '    function work.artifactCandidate()')
 end
 local function goal(kind,trigger,name)
@@ -179,14 +180,14 @@ test('production attack planning selects only the required mob in the required t
  work.combatPosition=function(m)return m.point,10 end;work.stanceScore=function()return 10 end
  built=function()end;opts.guardRadius=14;opts.huntRadius=60;opts.baseRadius=45
  body('    function work.attackPlan(', '    function work.retreat(')
- local target=work.attackPlan('unlockObjective',{toolType='spear',range=11,atkDmg=25,useCd=.57})
+ local target=work.attackPlan('unlockObjective',{toolType='spear',lvl=3,range=11,atkDmg=25,useCd=.57})
  assert(target==wanted)
 end)
 test('production combat finishes a native objective kill and reselects after ammunition runs out',function()
  goal('artifacts','击杀地块内蜘蛛x1');local target=enemy('Spider','A',15);target.human.Health=100
  work.unlockWork=work.unlockCandidate()
  local gun,melee={Parent=player.Character,ammo=1},{Parent=player.Character}
- local gunStats={toolType='gun',atkDmg=50,range=30,capAOE=1};local meleeStats={toolType='spear',atkDmg=50,range=11,capAOE=1}
+ local gunStats={toolType='gun',atkDmg=50,range=30,capAOE=1};local meleeStats={toolType='spear',lvl=3,atkDmg=50,range=11,capAOE=1}
  local equipped,shots={},{}
  equip=function(t)equipped[#equipped+1]=t;return true end
  work.meleeWeapon=function()if gun.ammo>0 then return gun,gunStats end;return melee,meleeStats end
@@ -239,6 +240,40 @@ test('recovery policy keeps food service enabled while preventing renewed option
  flags.cook=true
  body('    function work.jobEnabled(', '    function work.keyEnabled(')
  assert(not work.jobEnabled{key='combat'}and work.jobEnabled{key='cook'})
+end)
+test('recovering keeps safe builder gatherer and exploration jobs enabled instead of a blanket pause',function()
+ h.Health=65;work.recovering=true
+ for _,key in ipairs({'campInfrastructure','campUpgrade','greatWall','structures','stockpile','gather','drops','questAcquire','progression','exploreMap','chests','artifacts','puzzles'})do
+  assert(not work.routineBlocked(key),key)
+ end
+ for _,key in ipairs({'combat','autoAttack','hunt','unlockObjective','shadowHunt'})do assert(work.routineBlocked(key),key)end
+end)
+test('a recovering player at a safe work location is not repeatedly sent back to base',function()
+ h.Health=60;work.recovering=true
+ work.recoveryDestination=function()error('safe work must not force a camp trip')end
+ assert(not work.recoveryReady()and not work.recoveryTick())
+ assert(notes.recovery:find('CONTINUING ENABLED JOBS',1,true))
+end)
+test('unsafe recovery prefers an available safe alternative for the interrupted task',function()
+ h.Health=40;work.safeWorkPoint=function()return false end
+ work.recoveryDestination=function()return vec(60,3,0)end
+ work.retargetEvade=function(key)assert(key=='recovery');return true end
+ assert(work.recoveryReady()and work.recoveryTick())
+ assert(notes.recovery:find('SAFE TASK TARGET',1,true)and moves==0)
+end)
+test('unsafe recovery falls back to a checked relocation without freezing productive jobs',function()
+ h.Health=40;work.safeWorkPoint=function()return false end
+ work.recoveryDestination=function()return vec(60,3,0)end
+ work.retargetEvade=function()return false end;work.tryRefuge=function()return false end
+ assert(work.recoveryReady()and work.recoveryTick()and moves==1)
+ assert(notes.recovery:find('RESUME SAFE JOBS',1,true))
+ work.safeWorkPoint=function()return true end
+ assert(not work.recoveryReady()and not work.routineBlocked('greatWall'))
+end)
+test('recovery hysteresis alone does not label healthy-enough safe work as an urgent meal',function()
+ body('    function work.criticalMeal()', '    function work.autoAttackReady()')
+ h.Health=65;work.recovering=true;assert(not work.criticalMeal())
+ h.Health=20;assert(work.criticalMeal())
 end)
 test('an unlocked guarded artifact can request local threat clearing before its five-second hold',function()
  local m=goal('artifacts','击杀地块内蜘蛛x1');m.prompt.Enabled=true
@@ -318,12 +353,12 @@ test('indoor refuge movement probes down from inside the room instead of landing
 end)
 test('pre-fight damage budget rejects a dangerous close-range boss with a weak weapon',function()
  local m=enemy('Bear','A');m.human.Health=300;cfg.mob.byId.Bear={id='Bear',atkDmg=50,atkCd=1}
- assert(not work.engagementAllowed(m,{range=3,atkDmg=11,useCd=.57,windup=.2}))
+ assert(not work.engagementAllowed(m,{toolType='spear',lvl=3,range=3,atkDmg=11,useCd=.57,windup=.2}))
  assert(work.lastFightDecision:find('UPGRADE / RANGE NEEDED',1,true))
 end)
 test('ranged reach permits fighting a dangerous boss without planning a close-range trade',function()
  local m=enemy('Bear','A');m.human.Health=300;cfg.mob.byId.Bear={id='Bear',atkDmg=50,atkCd=1}
- assert(work.engagementAllowed(m,{range=30,atkDmg=25,useCd=.57,windup=.2}))
+ assert(work.engagementAllowed(m,{toolType='gun',range=30,atkDmg=25,useCd=.57,windup=.2}))
 end)
 test('the hostile damage budget does not block passive food collection',function()
  local m=enemy('Chicken','A');m.human.Health=30
