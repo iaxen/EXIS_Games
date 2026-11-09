@@ -58,7 +58,7 @@ local function setup()
  local threatRows={}
  work={sent=0,artifacts={},needs={},resourceNeeds={},
   models=function(kind)return kind=='drops'and drops or{}end,
-  safeResource=function()return true end,safeWorkPoint=function()return true end,
+  safeResource=function()return true end,safeWorkPoint=function()return true end,insideBorder=function()return true end,
   campDropAnchor=function()return camp end,campDropPoint=function()return vec(32,3,0)end,
   criticalMeal=function()return false end,canCollect=function()return true end,
   roundLost=function()return false end,nightPaused=function()return false end,
@@ -122,6 +122,99 @@ test('disabling one role preserves material jobs needed by another role',functio
  assert(opts.teamRole=='Mixed')
  work.setRole('Gatherer',false);assert(not flags.mineIron and flags.chests and opts.teamRole=='Explorer')
 end)
+test('standalone map toggle pauses every other job and remains usable with master farming paused',function()
+ body('    function work.jobEnabled(', '    function work.keyEnabled(')
+ flags.revealMap=true;flags.autoFarm=false
+ assert(work.jobEnabled{key='revealMap',enabled=function()return true end})
+ for _,key in ipairs({'combat','evade','autoRevive','greatWall','craft','gather','chests','quest','roleFallback'})do
+  assert(not work.jobEnabled{key=key,enabled=function()return true end},key)
+ end
+ flags.revealMap=false;flags.autoFarm=true
+ work.routineBlocked=function()return false end;work.nightPaused=function()return false end
+ assert(work.jobEnabled{key='craft',enabled=function()return true end})
+ assert(not work.jobEnabled{key='revealMap',enabled=function()return false end})
+end)
+test('a twelve-chunk teleport burst spaces arrivals by 300 ms without map network waits',function()
+ flags.revealMap=true
+ local times={};work.exploreMapTick=function(key)assert(key=='revealMap');times[#times+1]=now;return true end
+ assert(work.exploreMapBurst('revealMap')and #times==12)
+ for i=2,#times do assert(math.abs(times[i]-times[i-1]-.3)<.00001)end
+ assert(math.abs(now-3.3)<.00001)
+end)
+test('turning off TP-only stops the burst before another teleport',function()
+ flags.revealMap=true;local visits=0
+ work.exploreMapTick=function()visits=visits+1;flags.revealMap=false;return true end
+ assert(work.exploreMapBurst('revealMap')and visits==1)
+end)
+test('late map receipts confirm in the background and never count mere arrivals',function()
+ buffer={readu8=function(v,i)return v[i+1]end};local snapshot={1}
+ work.mapFrontier={scene=scene,size=1,origin=0,snapshot=snapshot}
+ local row={visited={[1]=0},blocked={}}
+ work.mapArrivals={{scene=scene,probe=vec(25,0,25),row=row,index=1,at=0}}
+ work.confirmMapArrivals();assert(not work.mapVerifiedVisits and #work.mapArrivals==1)
+ snapshot[1]=3;now=2;work.confirmMapArrivals()
+ assert(work.mapVerifiedVisits==1 and #work.mapArrivals==0);work.confirmMapArrivals();assert(work.mapVerifiedVisits==1)
+end)
+test('all-gray maps still produce exploration targets with no black cells',function()
+ local snapshot={1,1,1,1}
+ typeof=function()return 'buffer'end;buffer={len=function(v)return #v end,readu8=function(v,i)return v[i+1]end}
+ local oldRequire=require;require=function()return{client={requestSnapshot=function()return snapshot,2,0 end}}end
+ RS={Engine={World={MapSyncService={}}}};task.spawn=function(fn)fn()end
+ work.boundedRead=function(fn)return fn()end;work.requestMapFrontier();require=oldRequire
+ assert(#work.mapFrontier.active==4 and work.mapCoverageStatus:find('4 gray cells',1,true))
+ work.insideBorder=function()return true end
+ assert(work.chunkDestination())
+end)
+local function fallenMate()
+ flags.autoRevive=true;item('bandage','Bandage');held('Bandage',1)
+ local mate=object('Teammate');mate.Character=object('Body');mate.Character.Humanoid={Health=0}
+ local torso=object('UpperTorso',vec(10,0,0));torso.Position=torso.point
+ local prompt={Enabled=true,MaxActivationDistance=10,HoldDuration=3}
+ torso.FindFirstChildWhichIsA=function()return prompt end;mate.Character.UpperTorso=torso
+ Players={GetPlayers=function()return{player,mate}end};work.sent=0
+ return mate,prompt
+end
+test('auto revive selects a fallen teammate and confirms positive health after the native hold',function()
+ local mate=fallenMate();local target=assert(work.reviveCandidate());assert(target.person==mate)
+ work.interactPrompt=function(_,key)assert(key=='autoRevive');mate.Character.Humanoid.Health=40;return true,true end
+ assert(work.autoReviveTick()and work.teamRevives==1 and #calls==0)
+ assert(log.autoRevive:find('REVIVE CONFIRMED',1,true))
+end)
+test('auto revive waits for bandages and does not open a paid purchase prompt',function()
+ fallenMate();bag={};assert(not work.reviveCandidate()and log.autoRevive:find('NO BANDAGE',1,true))
+ assert(not work.autoReviveTick()and #calls==0)
+end)
+test('interrupted revive holds never send a revive request',function()
+ fallenMate();work.interactPrompt=function()return false,false end
+ assert(not work.autoReviveTick()and #calls==0)
+end)
+test('completed executor holds use the native teammate fallback and require a living receipt',function()
+ local mate=fallenMate();work.interactPrompt=function()return false,true end
+ call=function(service,method,person)
+  assert(service=='ReviveService'and method=='reviveTeammate'and person==mate)
+  mate.Character.Humanoid.Health=30
+ end
+ assert(work.autoReviveTick()and work.teamRevives==1 and work.sent==1)
+end)
+test('an unconfirmed revive backs off instead of spending another bandage immediately',function()
+ fallenMate();work.interactPrompt=function()return true,true end
+ assert(not work.autoReviveTick()and not work.teamRevives)
+ assert(not work.reviveCandidate()and log.autoRevive:find('UNCONFIRMED',1,true))
+end)
+test('revival is deferred while map-only is enabled or the rescuer needs urgent recovery',function()
+ fallenMate();flags.revealMap=true;assert(not work.reviveCandidate())
+ flags.revealMap=false;work.criticalMeal=function()return true end;assert(not work.reviveCandidate())
+ assert(log.autoRevive:find('RECOVER OWN',1,true))
+end)
+test('a late bandage consumption receipt suppresses an extra native revive request',function()
+ fallenMate();work.interactPrompt=function()bag[1].attrs.count=0;return false,true end
+ assert(not work.autoReviveTick()and #calls==0)
+end)
+test('streamed tile and snapshot targets in the same map cell are deduplicated',function()
+ tile('Loaded',25,25);work.mapScene=scene;work.requestMapFrontier=function()end
+ work.mapFrontier={scene=scene,size=2,origin=0,active={{cell=0,probe=vec(25,0,25),tile={Name='Grid'},visited={},blocked={}}}}
+ assert(#work.chunkRows()==1)
+end)
 test('gun handoff preference remains independent of role changes',function()
  flags.shareGuns=true;work.setRole('Builder',true);work.setRole('Explorer',true)
  assert(flags.shareGuns);flags.shareGuns=false;work.setRole('Defender',true);assert(not flags.shareGuns)
@@ -153,14 +246,14 @@ test('native map snapshot adds unknown frontier cells beyond streamed tiles',fun
  work.insideBorder=function()return true end
  local target=assert(work.chunkDestination());assert(target.needsStreaming and target.row.probe)
 end)
-test('water and server boundary cells are excluded from the native map frontier',function()
+test('gray cells remain unrevealed targets while water cells are excluded',function()
  local snapshot={4,1,4,1,3,1,4,1,4}
  typeof=function()return 'buffer'end
  buffer={len=function(v)return #v end,readu8=function(v,i)return v[i+1]end}
  local oldRequire=require;require=function()return{client={requestSnapshot=function()return snapshot,3,0 end}}end
  RS={Engine={World={MapSyncService={}}}};task.spawn=function(fn)fn()end
  work.boundedRead=function(fn)return fn()end;work.requestMapFrontier();require=oldRequire
- assert(#work.mapFrontier.active==0 and work.mapFrontier.rows[4]and not work.mapFrontier.rows[0])
+ assert(#work.mapFrontier.active==4 and work.mapFrontier.rows[4]and not work.mapFrontier.rows[0])
 end)
 test('an unstreamed frontier without safe ground is never visited or teleported to',function()
  work.insideBorder=function()return true end
@@ -195,6 +288,8 @@ test('an arrival without a map receipt remains unconfirmed and backs off for ano
  work.mapScene=scene;work.mapFrontier={scene=scene,size=1,origin=-20,snapshot={0}}
  work.requestMapFrontier=function()end
  assert(work.exploreMapTick()and not work.mapVerifiedVisits)
+ assert(log.exploreMap:find('MAP RECEIPT PENDING',1,true)and #work.mapArrivals==1)
+ now=21;work.confirmMapArrivals()
  assert(log.exploreMap:find('REVEAL UNCONFIRMED',1,true)and not work.chunkDestination())
 end)
 test('an invalid role cannot change a running configuration',function()
