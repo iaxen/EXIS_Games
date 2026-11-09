@@ -5378,7 +5378,9 @@ local function runIslandEscape()
         local pending=work.stationDeposits[stockField]
         if pending and pending.zone~=zone then work.stationDeposits[stockField]=nil;pending=nil end
         if pending then
-            if ((work[stockField]or{})[pending.id]or 0)>=pending.expected then work.stationDeposits[stockField]=nil
+            local funded=true
+            for id,n in pairs(goal.recipe)do if ((work[stockField]or{})[id]or 0)<n then funded=false break end end
+            if funded or ((work[stockField]or{})[pending.id]or 0)>=pending.expected then work.stationDeposits[stockField]=nil
             else
                 if os.clock()>=(pending.requestAt or 0)then
                     work.net(goal.stationKind=="building"and "BuildingStationRequestState"or "CraftingStationRequestState"):FireServer()
@@ -5433,7 +5435,7 @@ local function runIslandEscape()
         work.net(goal.stationKind == "building" and "BuildingStationCraft" or "CraftingStationCraft"):FireServer(goal.id)
         work.sent = work.sent + 1
         local confirmed=work.await(key, function()
-            return player:GetAttribute("bagId") ~= bagId or count(goal.info.displayName) > before
+            return goal.kind=="bag"and player:GetAttribute("bagId") ~= bagId or count(goal.info.displayName) > before
         end, 3)
         note(key,confirmed and "NATIVE CRAFT OUTPUT CONFIRMED"or "CRAFT OUTPUT UNCONFIRMED • CHECK SERVER RECIPE / STOCK")
         return confirmed
@@ -8355,6 +8357,27 @@ local function runIslandEscape()
         end
         return true
     end
+    -- Native catalogues, not the item's placeable type, select the crafting service.
+    function work.recipeStation(id)
+        local c=config()
+        for _,entry in ipairs(c.craftingContent and c.craftingContent.list or{})do
+            local item=c.item.byName[entry.itemName]
+            if item and item.id==id then return "crafting",tonumber(entry.campfireLvl)or 1 end
+        end
+        for _,entry in ipairs(c.freeBuildList and c.freeBuildList.list or{})do
+            if entry.itemId==id then return "building",1 end
+        end
+    end
+    function work.stationAvailable(goal)
+        local building=goal.stationKind=="building"
+        local model,zone
+        if building then model,zone=work.structureStation()else model,zone=work.station()end
+        if not model or not zone then return false,building and "BUILDING STATION / INTAKE NOT LOADED"or "CRAFTING TABLE / INTAKE NOT LOADED"end
+        if not (building and work.buildingSynced or not building and work.stationSynced)then return false,"WAITING FOR STATION STOCK SYNC"end
+        local fire=work.fireState()
+        if (goal.fireLevel or 1)>(fire and fire.level or 1)then return false,"CAMPFIRE LEVEL "..goal.fireLevel.." REQUIRED"end
+        return true
+    end
     function work.structureStation()
         for _, model in ipairs(work.models("stations")) do
             if model.Name == "建筑制作台" then return model, model:FindFirstChild("吸入范围") end
@@ -8372,9 +8395,11 @@ local function runIslandEscape()
                 -- A legacy built furnace/storage already satisfies that utility.
                 if role ~= "other" and not work.findStructure(role) then
                     local recipe, amounts = work.recipeAmounts(item), {}
-                    for id, n in pairs(recipe) do amounts[id] = math.max(0, n - ((work.buildingStock or {})[id] or 0)) end
+                    local stationKind,fireLevel=work.recipeStation(item.id)
+                    local stock=stationKind=="building"and work.buildingStock or work.stationStock
+                    for id, n in pairs(recipe) do amounts[id] = math.max(0, n - ((stock or {})[id] or 0)) end
                     if next(recipe) then candidates[#candidates + 1] = {id=item.id, key="structure:"..item.id, kind="structure", info=item,
-                        free=free, stationKind="building", recipe=recipe, amounts=amounts,
+                        free=free, stationKind=stationKind, fireLevel=fireLevel, recipe=recipe, amounts=amounts,
                         role=role, rank=role=="buildingStation" and -2 or role=="craftingStation" and -1 or role=="storage" and 0 or role=="furnace" and 1 or 2} end
                 end
             end
@@ -8436,11 +8461,11 @@ local function runIslandEscape()
         local goal=work.structureGoal()
         if not goal then return false end
         if count(goal.info.displayName)>0 then return true end
-        return work.buildingSynced and work.structureStation()~=nil and work.goalRunnable(goal) or false
+        return work.stationAvailable(goal) and work.goalRunnable(goal) or false
     end
     function work.structureUnloadPrep(key)
         local goal=work.structureGoal()
-        if not goal or not work.buildingSynced or not work.structureStation() then return false end
+        if not goal or not work.stationAvailable(goal) then return false end
         for id,n in pairs(goal.amounts) do
             local item=config().item.byId[id]
             if n>0 and item and count(item.displayName)>0 then return work.stationTick(goal,key) end
@@ -8486,7 +8511,10 @@ local function runIslandEscape()
             local name=(tostring(id).." "..tostring(item and item.displayName or"").." "..tostring(free.name or"") ):lower()
             if item and item.recipeId and(name:find("wall",1,true)or name:find("围墙",1,true)or name:find("木墙",1,true)or name:find("栅栏",1,true))then
                 local recipe=work.recipeAmounts(item)
-                if next(recipe)then candidates[#candidates+1]={id=id,info=item,free=free,recipe=recipe}end
+                if next(recipe)then
+                    local stationKind,fireLevel=work.recipeStation(id)
+                    candidates[#candidates+1]={id=id,info=item,free=free,recipe=recipe,stationKind=stationKind,fireLevel=fireLevel}
+                end
             end
         end
         table.sort(candidates,function(a,b)
@@ -8792,30 +8820,47 @@ local function runIslandEscape()
         work.wallStatus="BASE BEACH "..tostring(plan.regionTiles).." TILES / "..tostring(plan.stationCount).." STATIONS • "..#plan.slots.." TOTAL SLOTS (ENTRANCE INCLUDED) • LAST BATCH "..checked.." CHECKED / "..occupied.." PRESENT / "..blocked.." BLOCKED • "..tostring(plan.uncoveredStations).." STATIONS OUTSIDE REGION"
     end
     function work.wallGoal()
-        if not flags.greatWall then return end
+        if not flags.greatWall then work.wallStage="OFF"return end
         local recipe=work.wallRecipe()
-        if not recipe then note("greatWall","WALL RECIPE NOT IN LIVE BUILDING CATALOGUE") return end
-        local site=work.wallSite(recipe)
-        if not site then note("greatWall","WAITING FOR A DRY, UNBLOCKED BEACH WALL SITE INSIDE THE BORDER") return end
+        if not recipe then work.wallStage="WALL RECIPE MISSING FROM LIVE CATALOGUE";note("greatWall",work.wallStage)return end
         local amounts={}
-        for id,n in pairs(recipe.recipe)do amounts[id]=math.max(0,n-((work.buildingStock or{})[id]or 0))end
-        return{id=recipe.id,info=recipe.info,recipe=recipe.recipe,site=site,amounts=amounts,
-            key="greatWall:"..recipe.id,kind="structure",stationKind="building"}
+        local stock=recipe.stationKind=="building"and work.buildingStock or work.stationStock
+        for id,n in pairs(recipe.recipe)do amounts[id]=math.max(0,n-((stock or{})[id]or 0))end
+        return{id=recipe.id,info=recipe.info,recipe=recipe.recipe,amounts=amounts,fireLevel=recipe.fireLevel,
+            key="greatWall:"..recipe.id,kind="structure",stationKind=recipe.stationKind}
     end
     function work.wallReady()
         if os.clock()<(work.wallCheckAt or 0)then return work.wallReadyValue==true end
+        work.wallCheckAt=os.clock()+1
         local goal=work.wallGoal()
-        work.wallCheckAt=os.clock()+(work.wallScanMore and .1 or 1)
+        work.wallReadyValue=false
         work.wallHaveItem=goal and count(goal.info.displayName)>0 or false
         work.wallSupplied=goal and goal.amounts and not next(work.missing(goal.amounts))or false
-        work.wallReadyValue=goal and(work.wallHaveItem or work.buildingSynced and work.structureStation()~=nil and work.goalRunnable(goal))or false
+        if not goal then return false end
+        if work.wallHaveItem then
+            goal.site=work.wallSite(goal)
+            work.wallCheckAt=os.clock()+(work.wallScanMore and .1 or 1)
+            work.wallReadyValue=goal.site~=nil
+            work.wallStage=goal.site and "WALL CARRIED • READY TO PLACE"or "WALL CARRIED • WAITING FOR SAFE FREE BEACH SLOT"
+        elseif not goal.stationKind then
+            work.wallStage="WALL NOT IN EITHER NATIVE CRAFTING CATALOGUE"
+        else
+            local available,reason=work.stationAvailable(goal)
+            if not available then work.wallStage=reason
+            else
+                work.wallReadyValue=work.goalRunnable(goal)==true
+                work.wallStage=work.wallReadyValue and(work.wallSupplied and "READY TO CRAFT ONE WALL"or "ACQUIRING WALL MATERIALS")or "WALL MATERIALS / SAFE SOURCE UNAVAILABLE"
+            end
+        end
+        note("greatWall",work.wallStage)
         return work.wallReadyValue
     end
     function work.wallTick()
         local goal,key=work.wallGoal(),"greatWall"
         if not goal then return false end
         if count(goal.info.displayName)>0 then
-            local site=goal.site
+            local site=work.wallSite(goal)
+            if not site then work.wallStage="WALL CARRIED • WAITING FOR SAFE FREE BEACH SLOT";note(key,work.wallStage)return false end
             if not travel(site.box.Position,key,math.max(4,site.asset.size.Magnitude/2))then return false end
             local api=module("FreeBuild")
             if not api or not work.wallFooting(site.box,site.asset)or api.checkOverlap(site.box,site.asset.size,{},.1)or work.wallOccupied(site.box,site.asset)then return false end
@@ -8824,21 +8869,25 @@ local function runIslandEscape()
             local placed=work.await(key,function()return work.wallOccupied(site.box,site.asset)and count(goal.info.displayName)<before end,4)
             work.wallSiteCache=nil;work.wallCheckAt=0
             if not placed then work.wallRetry[site.index]=os.clock()+5 end
-            note(key,placed and"EXI WALL PLACEMENT CONFIRMED"or"WALL PLACEMENT / INVENTORY RECEIPT UNCONFIRMED")
+            work.wallStage=placed and"EXI WALL PLACEMENT CONFIRMED"or"WALL PLACEMENT / INVENTORY RECEIPT UNCONFIRMED"
+            note(key,work.wallStage)
             return placed
         end
+        if not goal.stationKind or not work.stationAvailable(goal)then work.wallCheckAt=0;return false end
         work.activeGoal,work.needs,work.amounts,work.resourceNeeds,work.needTotals=goal,{},{},{},{}
         for id,n in pairs(goal.amounts)do if n>0 then work.needItem(id,n,100)end end
-        if work.batchReady(goal,key)then
+        -- A complete wall recipe goes straight to the station; bulk gathering
+        -- must not defer this single pending segment until an entire bag fills.
+        if not next(work.missing(goal.amounts))or work.batchReady(goal,key)then
             local supplied=not next(work.missing(goal.amounts))
             for id,n in pairs(goal.amounts)do local item=config().item.byId[id];if n>0 and item and count(item.displayName)>0 then supplied=true end end
-            if supplied then return work.stationTick(goal,key)end
+            if supplied then local acted=work.stationTick(goal,key);work.wallCheckAt=0;return acted end
         end
         if work.reclaimStorage(goal,key)then return true end
         return pickups(key,true)or gatherResource(key,true)
     end
     function work.automationReport()
-        local c=config();local rows={"AUTOMATION AUDIT v9 • EXPEDITIONS / CAMP INFRASTRUCTURE"}
+        local c=config();local rows={"AUTOMATION AUDIT v10 • WALL CRAFT / PLACEMENT PIPELINE"}
         rows[#rows+1]="Active jobs: "..table.concat(select(2,work.roleUnion())," + ").." | chunk visits "..tostring(work.chunkVisits or 0).." | revivals resumed "..tostring(work.reviveCount or 0)
         local pending=work.unlockWork or work.unlockPlan
         local campGoal=work.campInfrastructureGoal()
@@ -8868,6 +8917,7 @@ local function runIslandEscape()
         rows[#rows+1]="EXI wall: "..(not flags.greatWall and"OFF"or wall and("NATIVE RECIPE "..wall.id.."; THREE LAYERS; OPEN ENTRANCE")or"BLOCKED: WALL MISSING FROM LIVE CATALOGUE")
         local passive,hostile=0,0
         for _,row in ipairs(work.creatures())do if row.hostile then hostile=hostile+1 else passive=passive+1 end end
+        rows[#rows+1]="Wall job: "..tostring(not flags.greatWall and "OFF"or work.wallStage or "NOT CHECKED").." • station "..tostring(wall and wall.stationKind or "UNRESOLVED")
         rows[#rows+1]="Wall coverage: "..tostring(work.wallStatus or "WAITING FOR LOADED BASE BEACH / WALL CATALOGUE")
         rows[#rows+1]="Loaded living mobs: "..hostile.." hostile / "..passive.." passive; unstreamed mobs unknown"
         rows[#rows+1]="Harvest cycles: "..tostring(work.harvestRequests or 0).." native activations attempted / "..tostring(work.harvestReceipts or 0).." HP/despawn receipts"

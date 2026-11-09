@@ -236,15 +236,80 @@ test('wall ground rays ignore constructed walls so existing segments are not sta
  workspace.Raycast=function(_,_,_,params)assert(params.FilterDescendantsInstances[1]==scene.Tiles and params.FilterDescendantsInstances[2]==workspace.Terrain);return{Position=vec(0,0,0),Normal=vec(0,1,0)}end
  assert(work.wallGround(vec(0,5,0)).Y==0)
 end)
+test('wall crafting follows the regular native catalogue when listed there',function()
+ wall();cfg.craftingContent.list={{itemName='Wood Wall',campfireLvl=2}};cfg.freeBuildList={list={{itemId='木墙'}}}
+ work.stationStock={wood=1};work.buildingStock={wood=99}
+ local goal=work.wallGoal();assert(goal.stationKind=='crafting'and goal.amounts.wood==2 and goal.fireLevel==2)
+end)
+test('building-only wall recipes retain the building service and its stock',function()
+ wall();cfg.freeBuildList={list={{itemId='木墙'}}};work.buildingStock={wood=2};work.stationStock={wood=99}
+ local goal=work.wallGoal();assert(goal.stationKind=='building'and goal.amounts.wood==1)
+end)
+test('an unsupported wall catalogue reports a blocked craft without spending materials',function()
+ wall();assert(not work.wallReady());assert(work.wallStage:find('EITHER NATIVE',1,true))
+end)
+test('a synced stock response does not pretend a missing physical intake exists',function()
+ wall();cfg.freeBuildList={list={{itemId='木墙'}}};work.buildingSynced=true
+ work.structureStation=function()end
+ assert(not work.wallReady());assert(work.wallStage=='BUILDING STATION / INTAKE NOT LOADED')
+end)
+test('a regular table wall is runnable without a separate building station',function()
+ wall();cfg.craftingContent.list={{itemName='Wood Wall',campfireLvl=2}}
+ work.station=function()return{},{}end;work.structureStation=function()error('wrong station')end
+ work.goalRunnable=function()return true end
+ assert(work.wallReady()and work.wallStage=='ACQUIRING WALL MATERIALS')
+end)
+test('wall crafting waits for the native campfire unlock level',function()
+ wall();cfg.craftingContent.list={{itemName='Wood Wall',campfireLvl=3}};work.station=function()return{},{}end
+ assert(not work.wallReady()and work.wallStage=='CAMPFIRE LEVEL 3 REQUIRED')
+end)
+test('one wall can be crafted before a free safe perimeter slot is found',function()
+ wall();cfg.craftingContent.list={{itemName='Wood Wall'}};stock.Wood=3
+ work.station=function()return{},{}end;work.stationStock={};work.goalRunnable=function()return true end
+ work.wallSite=function()error('crafting must not require placement geometry')end
+ assert(work.wallReady())
+ work.needItem=function()end;work.stationTick=function(goal,key)
+  assert(goal.stationKind=='crafting'and key=='greatWall'and goal.recipe.wood==3)
+  stock.Wood=0;stock['Wood Wall']=1;return true
+ end
+ assert(work.wallTick()and count('Wood Wall')==1)
+ work.wallSite=function()end
+ assert(not work.wallReady()and work.wallHaveItem and work.wallStage:find('WAITING FOR SAFE',1,true))
+ work.wallCheckAt=0;work.wallSite=function()return{}end
+ assert(work.wallReady(),'carried wall should resume placement once a slot becomes safe')
+end)
+test('wall job deposits three wood crafts the native output and places the carried segment',function()
+ local asset=wall();beach(0);cfg.craftingContent.list={{itemName='Wood Wall'}}
+ body('    function work.stationTick(', '    function work.choiceScore(')
+ local zone={};work.station=function()return{},zone end;work.stationStock={};stock.Wood=3
+ work.goalRunnable=function()return true end;work.needItem=function()end
+ work.batchReady=function()error('complete wall recipe must not wait for bulk bag fill')end
+ work.insideStation=function()return true end;work.prepareStationDrop=function()return true end
+ work.running=function()return true end;work.await=function(_,fn)return fn()end
+ local wood=object('Wood','Tool');wood.Parent=player.Character;tools=function()return{wood}end
+ travel=function()return true end
+ work.batchDrop=function(tool,n)assert(tool==wood and n==3);stock.Wood=0;work.stationStock.wood=3;return 3 end
+ work.net=function(event)assert(event=='CraftingStationCraft');return{FireServer=function(_,id)
+  assert(id==asset.id);stock['Wood Wall']=1;work.stationStock.wood=0
+ end}end
+ assert(work.wallReady()and work.wallTick()and count('Wood Wall')==1)
+ local site={box=CFrame.new(0,2,0),frame=CFrame.new(0,2,0),asset=asset,index=1}
+ work.wallSite=function()return site end;work.wallRetry={}
+ call=function(_,_,id)
+  assert(id==asset.id);local m=object('Wall');m.attrs.cnId=id;m.BoundingBox={Position=site.box.Position};placed={m};stock['Wood Wall']=0
+ end
+ assert(work.wallReady()and work.wallTick()and #placed==1 and count('Wood Wall')==0)
+end)
 test('wall planning readiness survives the immediate queue handoff recheck',function()
  work.wallGoal=function()return{info={displayName='Wood Wall'}}end;stock['Wood Wall']=1
+ work.wallSite=function()return{}end
  assert(work.wallReady()and work.wallReady())
 end)
 test('wall placement needs both a replicated structure and an inventory deduction',function()
  local asset=wall();beach(0);stock['Wood Wall']=1
  travel=function()return true end;call=function()end;work.await=function(_,fn)return fn()end
  assert(not work.wallTick(),'sending the request is not a placement receipt')
- work.wallRetry={};work.wallGoal=function()return{info={displayName='Wood Wall'},id=asset.id,site={box=CFrame.new(0,2,0),frame=CFrame.new(0,2,0),asset=asset,index=1}}end
+ work.wallRetry={};work.wallSite=function()return{box=CFrame.new(0,2,0),frame=CFrame.new(0,2,0),asset=asset,index=1}end
  call=function()local m=object('Wall');m.attrs.cnId=asset.id;m.BoundingBox={Position=vec(0,2,0)};placed={m};stock['Wood Wall']=0 end
  assert(work.wallTick())
 end)
