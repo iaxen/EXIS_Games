@@ -259,6 +259,24 @@ test('an unconfirmed station deposit is not repeated with the next bag of wood',
  work.net=function(name)return{FireServer=function()assert(name=='BuildingStationCraft');held('Wooden Wall',1);work.buildingStock.wood=0 end}end
  assert(work.stationTick(goal,'greatWall')and sent==3 and count('Wooden Wall')==1)
 end)
+test('shared stock funding the recipe releases an obsolete higher deposit expectation',function()
+ body('    function work.stationTick(', '    function work.choiceScore(')
+ item('wall','Wooden Wall');local zone={}
+ work.buildingStock={wood=3};work.structureStation=function()return{},zone end;work.insideStation=function()return true end
+ work.stationDeposits={buildingStock={id='wood',zone=zone,expected=6}}
+ work.net=function(name)assert(name=='BuildingStationCraft');return{FireServer=function()held('Wooden Wall',1)end}end
+ work.sent=0;work.batchDrop=function()error('funded recipe must not drop more wood')end
+ assert(work.stationTick({id='wall',info=cfg.item.byId.wall,recipe={wood=3},stationKind='building'},'greatWall'))
+ assert(not work.stationDeposits.buildingStock)
+end)
+test('a concurrent bag upgrade does not falsely confirm a crafted wall output',function()
+ body('    function work.stationTick(', '    function work.choiceScore(')
+ item('wall','Wooden Wall');work.buildingStock={wood=3};work.structureStation=function()return{},{}end
+ work.insideStation=function()return true end;work.sent=0
+ local bagId='old';player.GetAttribute=function(_,k)if k=='bagId'then return bagId end end
+ work.net=function(name)assert(name=='BuildingStationCraft');return{FireServer=function()bagId='upgraded' end}end
+ assert(not work.stationTick({id='wall',kind='structure',info=cfg.item.byId.wall,recipe={wood=3},stationKind='building'},'greatWall'))
+end)
 test('unsafe native drop geometry never spends station materials',function()
  body('    function work.stationTick(', '    function work.choiceScore(')
  held('Wood',3);item('wall','Wooden Wall')
@@ -303,7 +321,7 @@ test('a weapon destroyed during EquipTool is handled without crashing the job',f
  assert(equip(tool)==false and not work.attackPlanCache)
 end)
 test('an unavailable structure recipe cannot keep interrupting productive work',function()
- item('storage','Storage');work.structureGoal=function()return{id='storage',info=cfg.item.byId.storage}end
+ item('storage','Storage');work.structureGoal=function()return{id='storage',info=cfg.item.byId.storage,stationKind='building'}end
  work.structureStation=function()return{}end;work.buildingSynced=true;work.goalRunnable=function()return false end
  assert(not work.structureReady());held('Storage',1);assert(work.structureReady())
 end)
