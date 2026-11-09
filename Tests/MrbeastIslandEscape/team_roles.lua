@@ -215,6 +215,120 @@ test('streamed tile and snapshot targets in the same map cell are deduplicated',
  work.mapFrontier={scene=scene,size=2,origin=0,active={{cell=0,probe=vec(25,0,25),tile={Name='Grid'},visited={},blocked={}}}}
  assert(#work.chunkRows()==1)
 end)
+local function soloHelpers()
+ body('    function work.soloMode()', '    function work.rank(job)')
+ Players={GetPlayers=function()return{player}end};opts.soloProgression=true
+ work.foodReserveTarget=function()return 8 end;work.combatUrgent=function()return false end
+ work.gearPriority=function()return false end;work.campSupplyCount=function()return 0 end
+ work.fuelItem=function()return cfg.item.byId.wood end
+end
+test('solo progress ranks dependencies before optional exploration and fort expansion',function()
+ soloHelpers()
+ local ordered={'campInfrastructure','questAcquire','craft','campUpgrade','stockpile','artifacts','exploreMap','greatWall'}
+ for i=2,#ordered do assert(work.rank{key=ordered[i-1]}<work.rank{key=ordered[i]},ordered[i])end
+end)
+test('solo emergency food full bags and ready quest deliveries take precedence over routine construction',function()
+ soloHelpers();work.mealNeeded=function()return true end
+ assert(work.rank{key='foodSupply'}<work.rank{key='campInfrastructure'})
+ work.mealNeeded=function()return false end;work.bagState=function()return 25,25 end
+ assert(work.rank{key='unloadBag'}<work.rank{key='campInfrastructure'})
+ assert(work.rank{key='quest'}<work.rank{key='questAcquire'})
+ work.criticalMeal=function()return true end
+ assert(work.rank{key='eat'}<work.rank{key='recovery'})
+end)
+test('stocked solo supplies yield to building and exploration instead of gathering without a limit',function()
+ soloHelpers();work.campSupplyCount=function()return 100 end
+ assert(work.rank{key='stockpile'}>work.rank{key='greatWall'})
+ assert(work.rank{key='stockpile'}>work.rank{key='exploreMap'})
+end)
+test('solo exploration takes a bounded turn then allows the builder to progress',function()
+ soloHelpers();work.roleLastServed={exploreMap=now}
+ assert(work.rank{key='exploreMap'}>work.rank{key='greatWall'})
+ now=21;assert(work.rank{key='exploreMap'}<work.rank{key='greatWall'})
+end)
+test('a solo session enables all four roles without enabling escape sharing or TP-only mode',function()
+ soloHelpers();work.syncSolo()
+ assert(flags.roleExplorer and flags.roleDefender and flags.roleGatherer and flags.roleBuilder)
+ assert(flags.quest and flags.greatWall and flags.buildCamp and flags.mineIron and flags.cook and flags.autoRevive)
+ assert(not flags.escape and not flags.shareGuns and not flags.revealMap)
+end)
+test('joining a teammate restores previous role choices while preserving a manually disabled task',function()
+ soloHelpers();flags.roleExplorer=true;flags.mineIron=false;work.syncSolo();flags.mineIron=false
+ now=1;Players.GetPlayers=function()return{player,{}}end;work.syncSolo()
+ assert(flags.roleExplorer and not flags.roleBuilder and not flags.roleDefender and not flags.roleGatherer)
+ assert(flags.mineIron==false and not work.soloApplied)
+end)
+test('solo automation can be disabled for custom role selections',function()
+ soloHelpers();opts.soloProgression=false;work.syncSolo()
+ assert(not flags.roleBuilder and not work.soloApplied)
+end)
+test('a long-waiting optional solo job cannot jump ahead of essential stations or a quest delivery',function()
+ soloHelpers();work.roleLastServed={exploreMap=-100,greatWall=-100};now=200
+ assert(work.rank{key='campInfrastructure'}<work.rank{key='exploreMap'})
+ assert(work.rank{key='quest'}<work.rank{key='greatWall'})
+end)
+test('hostile weapon policy accepts iron spears and loaded guns but rejects axes weak spears and empty guns',function()
+ body('    function work.hostileWeapon(', '    function work.clearSceneIndex()')
+ assert(work.hostileWeapon({toolType='spear',lvl=3,atkDmg=30}))
+ assert(not work.hostileWeapon({toolType='spear',lvl=2,atkDmg=20}))
+ assert(not work.hostileWeapon({toolType='axe',lvl=3,atkDmg=40}))
+ local gun=held('Pistol');gun.attrs.ammo=0
+ assert(not work.hostileWeapon({toolType='gun',atkDmg=20},gun));gun.attrs.ammo=1
+ assert(work.hostileWeapon({toolType='gun',atkDmg=20},gun))
+end)
+local function perchFixture()
+ body('    function work.treePerchPosition(', '    function work.combatPosition(')
+ local tree=object('Tree',vec(10,0,0));tree.attrs.resourceId='tree'
+ tree.GetBoundingBox=function()return{Position=vec(10,6,0)},vec(8,12,8)end
+ cfg.worldResource.byId.tree={requireToolType='axe'}
+ work.resourceKind=function()return'tree'end;work.models=function(kind)return kind=='resources'and{tree}or{}end
+ work.enemyReach=function()return 4 end
+ work.stanceScore=function(p,target,stats)if(p-pos(target)).Magnitude<(stats.range or 0)then return 10 end end
+ Enum={RaycastFilterType={Include=1}};RaycastParams={new=function()return{}end}
+ local part={CanCollide=true,Parent=true}
+ workspace.Raycast=function(_,p)return{Position=vec(p.X,12,p.Z),Normal=vec(0,1,0),Instance=part}end
+ local target=object('Zombie',vec(5,0,0));return target,part
+end
+test('guns select a collidable tree perch with supported footing and native range',function()
+ local target=perchFixture();local point=assert(work.treePerchPosition(target,{toolType='gun',range=30}))
+ assert(point.Y==15 and work.gunPerch and work.lastFightDecision:find('TREE PERCH',1,true))
+end)
+test('tree perches reject noncollidable foliage missing footing and out-of-range targets',function()
+ local target,part=perchFixture();part.CanCollide=false
+ assert(not work.treePerchPosition(target,{toolType='gun',range=30}))
+ now=2;part.CanCollide=true
+ assert(not work.treePerchPosition(target,{toolType='gun',range=5}))
+ now=4;local rays=0;workspace.Raycast=function(_,p)rays=rays+1;if rays%2==0 then return end;return{Position=vec(p.X,12,p.Z),Normal=vec(0,1,0),Instance=part}end
+ assert(not work.treePerchPosition(target,{toolType='gun',range=30}))
+end)
+test('tree perches respect a blocked line-of-sight or unsafe stance',function()
+ local target=perchFixture();work.stanceScore=function()end
+ assert(not work.treePerchPosition(target,{toolType='gun',range=30}))
+end)
+test('a destroyed supporting branch invalidates the cached tree perch',function()
+ local target,part=perchFixture();local stats={toolType='gun',range=30}
+ assert(work.treePerchPosition(target,stats));part.Parent=nil
+ assert(not work.treePerchPosition(target,stats))
+end)
+test('combat selects an iron spear instead of a higher-damage axe while food hunting can still use the axe',function()
+ body('    function work.meleeWeapon(', '    function work.clearSceneIndex()')
+ work.danger=function()return 0,nil,0 end
+ held('Axe');cfg.tool.byDisplayName.Axe.atkDmg=100;cfg.tool.byDisplayName.Axe.useCd=1
+ local spear=item('ironSpear','Iron Spear');cfg.tool.byDisplayName[spear.displayName]={toolType='spear',lvl=3,atkDmg=30,useCd=1}
+ local t=held('Iron Spear')
+ assert(work.meleeWeapon('combat')==t)
+ assert(work.meleeWeapon('foodHunt').Name=='Axe')
+ t.Parent=nil;assert(not work.meleeWeapon('combat'))
+end)
+test('gun combat holds a checked tree perch through cooldown instead of kiting back onto the ground',function()
+ body('    function work.kite(', '    function work.activateWeapon(')
+ local target=object('Zombie',vec(0,0,0));r.Position=vec(0,15,0)
+ work.mobInfo=function()return{}end;work.isHostile=function()return true end
+ work.gunPerch={target=target,point=r.Position,part={Parent=true,CanCollide=true},stats={toolType='gun',range=30}}
+ work.stanceScore=function()return 10 end
+ travel=function()error('safe tree perch must not be abandoned after each shot')end
+ assert(not work.kite(target,'combat')and work.lastFightDecision:find('HOLD CHECKED TREE',1,true))
+end)
 test('gun handoff preference remains independent of role changes',function()
  flags.shareGuns=true;work.setRole('Builder',true);work.setRole('Explorer',true)
  assert(flags.shareGuns);flags.shareGuns=false;work.setRole('Defender',true);assert(not flags.shareGuns)

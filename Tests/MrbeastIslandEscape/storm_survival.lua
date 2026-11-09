@@ -376,7 +376,9 @@ end)
 test('repeated melee cycles attack again after cooldown and repositioning',function()
  body('    function work.strike(', '    local function blueprintReady(')
  local defend=assert(load(extract('    local function defend(', '    function work.pickupCandidate(')..'\nreturn defend'))()
- local target=model('Spider');target.Humanoid={Health=30};local t=held('Axe',1);local stats={range=6,toolType='axe',useCd=1,windup=.1,capAOE=1}
+ body('    function work.hostileWeapon(', '    function work.clearSceneIndex()')
+ work.mobInfo=function()return{}end;work.isShadow=function()return false end
+ local target=model('Spider');target.Humanoid={Health=30};local t=held('Iron Spear',1);local stats={range=6,toolType='spear',lvl=3,useCd=1,windup=.1,capAOE=1}
  opts.jobTimeout=15;work.sent=0;work.meleeWeapon=function()return t,stats end
  equip=function()end;work.setSprint=function()end;work.checkpoint=function()return true end;work.recordGuard=function()end;work.personalThreat=function()return nil end
  work.attackPhase=function()return'unknown'end
