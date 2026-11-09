@@ -183,7 +183,7 @@ local function runIslandEscape()
     gui.Parent = pg
     local alive = true
     local connections = {}
-    local flags = {autoFarm = true, quest = true, bagUpgrade = true, combat = true, runShadow = true,
+    local flags = {autoRevive = true, revealMap = false, autoFarm = true, quest = true, bagUpgrade = true, combat = true, runShadow = true,
         liveStatus = true, choiceRewards = true, unloadBag = true, autoAttack = true,
         killFoodOnSight = true, stormStock = true, useStorage = true, scavengeAll = true,
         followFootprints = true, structureCraft = true, autoSprint = true, tidyTools = true}
@@ -1591,7 +1591,7 @@ local function runIslandEscape()
     -- Shared flag sets keep quick controls and the preset consistent. Individual
     -- switches remain available in the collapsed detail sections.
     work.automationBundles = {
-        {id="survival", label="Survival and food", keys={"eat","fuel","cook","cooked","water","stormStock","runShadow","killShadow","holdNight","nightExplore","nightHover"}},
+        {id="survival", label="Survival and food", keys={"autoRevive","eat","fuel","cook","cooked","water","stormStock","runShadow","killShadow","holdNight","nightExplore","nightHover"}},
         {id="combat", label="Defend and hunt food", keys={"combat","autoAttack","hunt","huntFood","killFoodOnSight"}},
         {id="gather", label="Gather and batch loot", keys={"gather","chopTrees","mineStone","mineIron","drops","scavengeAll","bulkCollect"}},
         {id="gear", label="All beach stations and gear", keys={"progression","toolLadder","craft","bagUpgrade","buildCamp","build","buildCurrent","structureCraft","smelt","smeltCollect"}},
@@ -1695,7 +1695,10 @@ local function runIslandEscape()
             local roleName=name
             toggles["role"..name]=switch(roles,work.teamRoles[name].label,function()return flags["role"..roleName]==true end,function(value)work.setRole(roleName,value)end)
         end
-        toggle(roles,"exploreMap","Teleport to chunk centers to register the shared map")
+        toggle(roles,"revealMap","Reveal map — TP ONLY / 0.3s")
+        text(roles,"Optional standalone map sweep. Pauses other jobs without changing role switches; turn it off to resume them.")
+        toggle(roles,"exploreMap","Explore chunks alongside selected roles")
+        toggle(roles,"autoRevive","Auto revive fallen teammates (bandage)")
         toggle(roles,"shareGuns","Leave all guns at camp for the explorer")
         toggle(roles,"takeTeamGuns","Collect useful guns left at camp")
         toggle(roles,"roleFallback","Continue role patrol / exploration when regular tasks are blocked")
@@ -2893,6 +2896,7 @@ local function runIslandEscape()
         end
         local keep=best==tool and 1 or 0
         local reserved=work.questReserved(item.id)
+        if flags.autoRevive and item.id=="bandage"then reserved=math.max(reserved,1)end
         for _,other in ipairs(tools())do
             if other==tool then break end
             if other.Name==tool.Name then reserved=math.max(0,reserved-(tonumber(other:GetAttribute("count"))or 1))end
@@ -2935,6 +2939,7 @@ local function runIslandEscape()
             end
         end
         local reserved=work.questReserved(item.id)
+        if flags.autoRevive and item.id=="bandage"then reserved=math.max(reserved,1)end
         for _,other in ipairs(tools())do
             if other==tool then break end
             if other.Name==tool.Name then reserved=math.max(0,reserved-(tonumber(other:GetAttribute("count"))or 1))end
@@ -6463,7 +6468,8 @@ local function runIslandEscape()
         water = "NO READY COCONUTS OR BAG FULL",
     }
     function work.jobEnabled(job)
-        if flags.autoFarm == false or work.finished then return false end
+        if flags.revealMap then return job.key=="revealMap"and (not job.enabled or job.enabled())and not work.roundLost()end
+        if job.key=="revealMap"or flags.autoFarm == false or work.finished then return false end
         if job.enabled then
             if not job.enabled() then return false end
         elseif flags[job.key]~=true then return false end
@@ -6471,6 +6477,8 @@ local function runIslandEscape()
         return not work.roundLost() and not work.nightPaused(job)
     end
     function work.keyEnabled(key)
+        if flags.revealMap then return key=="revealMap"and not work.roundLost()end
+        if key=="revealMap"then return false end
         if flags.autoFarm == false or work.finished or work.roundLost() then return false end
         if work.routineBlocked and work.routineBlocked(key)then return false end
         if key == "progression" and work.progressionEnabled() then return true end
@@ -6480,6 +6488,8 @@ local function runIslandEscape()
     end
     function work.rank(job)
         local key = job.key
+        if key=="revealMap"then return 0 end
+        if key=="autoRevive"then return 1.8 end
         if key=="exploreMap"or key=="greatWall"or key=="structures"or key=="stockpile"or key=="artifacts"or key=="unlockObjective"or key=="campUpgrade"then
             work.roleLastServed=work.roleLastServed or{}
             work.roleLastServed[key]=work.roleLastServed[key]or os.clock()
@@ -6563,14 +6573,14 @@ local function runIslandEscape()
         return rank[key] or 11
     end
     function work.pick(jobs, now, ceiling, urgentOnly)
-        if flags.autoFarm==false then return end
+        if flags.autoFarm==false and not flags.revealMap then return end
         local best, bestScore
         for _, job in ipairs(jobs) do
             if job.key ~= work.skipJob and now >= (due[job.key] or 0) then
                 local ok, ready, rank = pcall(function()
                     if not work.jobEnabled(job)then return false,math.huge end
                     local rank = work.rank(job)
-                    if work.hover and job.key ~= "nightHold" and job.key ~= "fuel" and job.key ~= "eat" and job.key~="foodCache" then return false,rank end
+                    if work.hover and job.key~="revealMap"and job.key ~= "nightHold" and job.key ~= "fuel" and job.key ~= "eat" and job.key~="foodCache" then return false,rank end
                     if urgentOnly and not work.interruptsInteraction(job) then return false,rank end
                     if (ceiling and rank >= ceiling) or (bestScore and rank >= bestScore) then return false, rank end
                     local previous=work.readinessKey;work.readinessKey=job.key
@@ -6605,6 +6615,8 @@ local function runIslandEscape()
         return work.pick(jobs,now)
     end
     function work.checkpoint(key)
+        if flags.revealMap and key~="revealMap"then return false end
+        if key=="revealMap"and not flags.revealMap then return false end
         if not work.active or not work.currentJob or not work.jobs then return true end
         if work.preempted then return false end
         local held=work.interaction
@@ -8887,7 +8899,7 @@ local function runIslandEscape()
         return pickups(key,true)or gatherResource(key,true)
     end
     function work.automationReport()
-        local c=config();local rows={"AUTOMATION AUDIT v10 • WALL CRAFT / PLACEMENT PIPELINE"}
+        local c=config();local rows={"AUTOMATION AUDIT v11 • CHUNK TELEPORTS / MAP RECEIPTS"}
         rows[#rows+1]="Active jobs: "..table.concat(select(2,work.roleUnion())," + ").." | chunk visits "..tostring(work.chunkVisits or 0).." | revivals resumed "..tostring(work.reviveCount or 0)
         local pending=work.unlockWork or work.unlockPlan
         local campGoal=work.campInfrastructureGoal()
@@ -8898,11 +8910,13 @@ local function runIslandEscape()
         rows[#rows+1]="Combat decision: "..tostring(work.lastFightDecision or "WAITING").." • recovering "..tostring(work.recovering==true).." • recent damage "..tostring(work.damageBurst or 0)
         rows[#rows+1]="Refuge: "..(opts.useRefuge and opts.refuge and "CONFIGURED; SAFETY MONITORED"or "NOT SET").." • keep room locked "..tostring(opts.keepRefugeLocked==true).." • damage events "..tostring(work.refugeDamageEvents or 0)
         rows[#rows+1]="Survival: retreat "..tostring(opts.retreatHealth).."% / eat at "..tostring(opts.health).."% HP • damage events "..tostring(work.damageEvents or 0).." • spatial cache hits "..tostring(work.spatialHits or 0)
+        rows[#rows+1]="Teammate revival: "..(flags.autoRevive and "ENABLED"or "OFF").." • bandages "..work.reviveBandages().." • confirmed "..tostring(work.teamRevives or 0)
         rows[#rows+1]="Travel meals kept: "..tostring(opts.travelRation or 0).." • team roles resume after revival; manual toggles remain saved"
         rows[#rows+1]="Gun handoff: "..(flags.shareGuns and "LEAVE GUNS AT CAMP" or flags.takeTeamGuns and "COLLECT CAMP GUN UPGRADES" or "MANUAL / SOLO")
         local allowance=work.furnaceAllowance and work.furnaceAllowance("both")or 0
         rows[#rows+1]="Furnace: max 6 queued wood • allowance "..tostring(allowance).." • pending "..tostring(work.furnaceWoodPending and work.furnaceWoodPending.count or 0)
         rows[#rows+1]="Map coverage: "..tostring(work.mapCoverageStatus or "WAITING FOR NATIVE SNAPSHOT")
+        rows[#rows+1]="Chunk sweep: "..(flags.revealMap and "TP ONLY"or "ROLE EXPLORATION").." / 0.3s target interval • pending map receipts "..tostring(work.mapArrivals and #work.mapArrivals or 0)
         rows[#rows+1]="Gun ground receipt: "..tostring(work.gunHandoff and(work.gunHandoff.name.." pending")or work.lastGunReceipt or "NONE")
         local torch=work.shadowWeapon()
         rows[#rows+1]="Shadow: "..(not flags.killShadow and"OFF"or torch and"TORCH AVAILABLE; CONFIRMS TorchHits"or"BLOCKED: NO NATIVE LIGHT-SOURCE TOOL")
@@ -9390,6 +9404,63 @@ local function runIslandEscape()
         if cache.count<256 then cache.count=cache.count+1;bucket[key]=result end
         return table.unpack(result,1,result.n)
     end
+    function work.reviveBandages()
+        local item=config().item.byId.bandage
+        return item and count(item.displayName)or 0
+    end
+    function work.reviveCandidate()
+        if not flags.autoRevive or flags.revealMap then return end
+        if work.reviveBandages()<1 then note("autoRevive","NO BANDAGE • REVIVE WAITING")return end
+        if work.criticalMeal()then note("autoRevive","RECOVER OWN HEALTH / FOOD BEFORE RESCUE")return end
+        if os.clock()<(work.reviveSearchAt or 0)then return work.reviveTarget end
+        work.reviveSearchAt=os.clock()+.25;work.reviveTarget=nil
+        local r=root();if not r then return end
+        local best,distance
+        for _,person in ipairs(Players:GetPlayers())do
+            local character=person~=player and person.Character
+            local human=character and character:FindFirstChildOfClass("Humanoid")
+            local torso=character and character:FindFirstChild("UpperTorso")
+            local prompt=torso and torso:FindFirstChildWhichIsA("ProximityPrompt")
+            local retry=work.reviveRetry and work.reviveRetry[person]or 0
+            if human and human.Health<=0 and prompt and prompt.Enabled and os.clock()>=retry
+                and work.safeWorkPoint(torso.Position,2)then
+                local gap=(torso.Position-r.Position).Magnitude
+                if not distance or gap<distance then best={person=person,character=character,torso=torso,prompt=prompt};distance=gap end
+            end
+        end
+        work.reviveTarget=best;return best
+    end
+    function work.autoReviveTick()
+        local target=work.reviveCandidate();local key="autoRevive"
+        if not target then return false end
+        local person=target.person
+        local function stillDown()
+            local human=person.Character and person.Character:FindFirstChildOfClass("Humanoid")
+            return person.Parent and human and human.Health<=0 and person.Character==target.character
+        end
+        if not stillDown()or work.reviveBandages()<1 then work.reviveSearchAt=0;return false end
+        if not travel(target.torso,key,math.max(.5,math.min(4,target.prompt.MaxActivationDistance-1)))then return false end
+        if not stillDown()or work.reviveBandages()<1 or not target.prompt.Enabled then work.reviveSearchAt=0;return false end
+        note(key,"REVIVING "..person.Name.." • HOLDING NATIVE REVIVE PROMPT")
+        local beforeBandages=work.reviveBandages()
+        local triggered,held=work.interactPrompt(target.torso,key)
+        if not triggered and held and not work.preempted and stillDown()and work.reviveBandages()==beforeBandages then
+            -- Executor input can complete the hold without dispatching Triggered.
+            -- Match the native ReviveClient request only after the full hold.
+            call("ReviveService","reviveTeammate",person);work.sent=work.sent+1
+        end
+        if not triggered and not held then work.reviveSearchAt=0;return false end
+        local revived=work.await(key,function()
+            local human=person.Character and person.Character:FindFirstChildOfClass("Humanoid")
+            return person.Parent and human and human.Health>0
+        end,5)
+        work.reviveRetry=work.reviveRetry or setmetatable({}, {__mode="k"})
+        work.reviveRetry[person]=os.clock()+(revived and 1 or 10)
+        work.reviveSearchAt=0;work.reviveTarget=nil
+        if revived then work.teamRevives=(work.teamRevives or 0)+1 end
+        note(key,revived and("TEAMMATE REVIVE CONFIRMED • "..person.Name)or("REVIVE UNCONFIRMED • "..person.Name.." • CHECK BANDAGE / SERVER RECEIPT"))
+        return revived
+    end
     function work.reviveSync()
         local r,human=root()
         local ready=r~=nil and r~=false and human and human.Health>0
@@ -9421,13 +9492,29 @@ local function runIslandEscape()
         end
         return true
     end
+    function work.confirmMapArrivals()
+        local pending=work.mapArrivals or{}
+        for i=#pending,1,-1 do
+            local visit=pending[i]
+            if visit.scene~=world()then table.remove(pending,i)
+            elseif work.mapCellVisible(visit.probe)then
+                work.mapVerifiedVisits=(work.mapVerifiedVisits or 0)+1
+                note(visit.key or "exploreMap","CHUNK ARRIVAL • SERVER MAP VISIBILITY CONFIRMED")
+                table.remove(pending,i)
+            elseif os.clock()-visit.at>=20 then
+                visit.row.visited[visit.index]=nil;visit.row.blocked[visit.index]=os.clock()+10
+                note(visit.key or "exploreMap","CHUNK ARRIVAL • SHARED MAP REVEAL UNCONFIRMED; RETRY LATER")
+                table.remove(pending,i)
+            end
+        end
+    end
     function work.requestMapFrontier()
         local scene=world()
         if work.mapScene~=scene then
-            work.mapScene=scene;work.mapRequestAt=0;work.chunkTarget=nil;work.mapFrontier=nil
+            work.mapScene=scene;work.mapRequestAt=0;work.chunkTarget=nil;work.mapFrontier=nil;work.mapArrivals={}
         end
         if not task.spawn or os.clock()<(work.mapRequestAt or 0)or work.mapRequestBusy then return end
-        work.mapRequestAt=os.clock()+15;work.mapRequestBusy=true
+        work.mapRequestAt=os.clock()+((work.mapArrivals and #work.mapArrivals>0)and 2 or 15);work.mapRequestBusy=true
         task.spawn(function()
             local ok,snapshot,size,origin=pcall(function()
                 local service=require(RS.Engine.World.MapSyncService)
@@ -9443,15 +9530,15 @@ local function runIslandEscape()
                 state={scene=scene,size=size,origin=origin,rows={}};work.mapFrontier=state
             end
             state.snapshot=snapshot;work.mapSnapshotAt=os.clock()
-            local rows,revealed,unknown={},0,0
+            local rows,revealed,unknown,fog={},0,0,0
             for index=0,size*size-1 do
                 local palette=buffer.readu8(snapshot,index)
                 local x,z=index%size,math.floor(index/size)
                 local land=palette==2 or palette==3
                 if palette>=2 then revealed=revealed+1 end
                 local frontier=false
-                if palette==0 then
-                    unknown=unknown+1
+                if palette==0 or palette==1 then
+                    if palette==0 then unknown=unknown+1 else fog=fog+1 end
                     for _,adj in ipairs({{x-1,z},{x+1,z},{x,z-1},{x,z+1}})do
                         if adj[1]>=0 and adj[1]<size and adj[2]>=0 and adj[2]<size then
                             local value=buffer.readu8(snapshot,adj[2]*size+adj[1])
@@ -9459,15 +9546,19 @@ local function runIslandEscape()
                         end
                     end
                 end
+                -- Gray cells are unrevealed, not server boundary markers.
+                -- They remain targets even after the black frontier disappears.
+                if palette==1 then frontier=true end
                 if land or frontier then
                     local row=state.rows[index]or{tile={Name="GRID "..x..","..z},visited={},blocked={}}
                     row.probe=Vector3.new(origin+(x+.5)*50,0,origin+(z+.5)*50)
-                    row.frontier=frontier;state.rows[index]=row
+                    row.cell=index;row.frontier=frontier;state.rows[index]=row
                     if frontier then rows[#rows+1]=row end -- already visible land needs no registration trip
                 end
             end
-            state.active=rows
-            work.mapCoverageStatus=revealed.." server-visible cells • "..#rows.." unrevealed frontier targets • "..unknown.." unknown cells • arrivals confirmed visible "..tostring(work.mapVerifiedVisits or 0)
+            state.active=rows;if work.chunkCache then work.chunkCache.untilTime=0 end;work.chunkReadyUntil=0
+            work.confirmMapArrivals()
+            work.mapCoverageStatus=revealed.." server-visible cells • "..#rows.." unrevealed targets • "..fog.." gray cells / "..unknown.." black cells • arrivals confirmed visible "..tostring(work.mapVerifiedVisits or 0)
         end)
     end
     function work.mapCellVisible(point)
@@ -9480,22 +9571,26 @@ local function runIslandEscape()
     function work.chunkRows()
         work.requestMapFrontier()
         local scene=world();local folder=scene and scene:FindFirstChild("Tiles")
-        if not folder then return {}end
-        local tiles=folder:GetChildren()
+        local tiles=folder and folder:GetChildren()or{}
         local cache=work.chunkCache
         if cache and cache.scene==scene and cache.count==#tiles and os.clock()<cache.untilTime then return cache.rows end
         if not cache or cache.scene~=scene then cache={scene=scene,state=setmetatable({}, {__mode="k"})};work.chunkCache=cache end
-        local rows={}
+        local rows,loadedCells={},{}
+        local frontier=work.mapFrontier
         for _,tile in ipairs(tiles)do
             local box=tile:FindFirstChild("BoundingBox")
             if box and box:IsA("BasePart")then
                 local row=cache.state[tile] or {tile=tile,visited={},blocked={}}
                 row.box=box;cache.state[tile]=row;rows[#rows+1]=row
+                if frontier and frontier.scene==scene then
+                    local p=box.CFrame.Position
+                    local x,z=math.floor((p.X-frontier.origin)/50),math.floor((p.Z-frontier.origin)/50)
+                    loadedCells[z*frontier.size+x]=true
+                end
             end
         end
-        local frontier=work.mapFrontier
         if frontier and frontier.scene==scene then
-            for _,row in ipairs(frontier.active or{})do rows[#rows+1]=row end
+            for _,row in ipairs(frontier.active or{})do if not loadedCells[row.cell]then rows[#rows+1]=row end end
         end
         cache.rows,cache.count,cache.untilTime=rows,#tiles,os.clock()+2
         return rows
@@ -9509,7 +9604,7 @@ local function runIslandEscape()
         for _,row in ipairs(rows)do
             for index,offset in ipairs({{0,0}})do
                 local center=row.probe or row.box.CFrame.Position
-                if not work.mapCellVisible(center)and(not row.visited[index] or now-row.visited[index]>=revisit) and now>=(row.blocked[index]or 0)then
+                if work.insideBorder(center,4)and not work.mapCellVisible(center)and(not row.visited[index] or now-row.visited[index]>=revisit) and now>=(row.blocked[index]or 0)then
                     local point=row.probe or row.box.CFrame:PointToWorldSpace(Vector3.new(row.box.Size.X*offset[1],0,row.box.Size.Z*offset[2]))
                     candidates[#candidates+1]={row=row,index=index,probe=point,age=row.visited[index]or -math.huge,
                         distance=(point-r.Position).Magnitude}
@@ -9530,6 +9625,7 @@ local function runIslandEscape()
         end
     end
     function work.explorationReady()
+        work.confirmMapArrivals()
         if os.clock()<(work.nextChunkAt or 0)then return false end
         if os.clock()<(work.chunkReadyUntil or 0)then return work.chunkReadyValue==true end
         work.chunkReadyValue=work.chunkDestination()~=nil
@@ -9538,7 +9634,7 @@ local function runIslandEscape()
     end
     function work.exploreMapTick(key)
         key=key or "exploreMap"
-        if work.criticalMeal()then note(key,"RECOVER HEALTH / FOOD BEFORE EXPLORING")return false end
+        if key~="revealMap"and work.criticalMeal()then note(key,"RECOVER HEALTH / FOOD BEFORE EXPLORING")return false end
         local target=work.chunkDestination()
         if not target then note(key,"NO SAFE UNREGISTERED CHUNK • WAITING FOR STREAMING / CAMPFIRE UNLOCKS")return false end
         target.scene=world();work.chunkTarget=target
@@ -9549,7 +9645,7 @@ local function runIslandEscape()
             local requested,done=false,false
             if player.RequestStreamAroundAsync then
                 task.spawn(function()pcall(function()player:RequestStreamAroundAsync(target.probe,3)end);done=true end)
-                requested=work.await(key,function()return done end,4)
+                requested=work.await(key,function()return done end,.3)
                 if not requested and work.preempted then return false end
             end
             local r,human=root()
@@ -9564,24 +9660,33 @@ local function runIslandEscape()
             if not work.preempted then target.row.blocked[target.index]=os.clock()+8 end
             return false
         end
-        if not work.pause(key,.15)then return false end
         target.row.visited[target.index]=os.clock()
         work.chunkTarget=nil
         work.chunkVisits=(work.chunkVisits or 0)+1
         work.chunkReadyUntil=0
         if work.mapFrontier and work.mapFrontier.snapshot then
-            work.mapRequestAt=0;work.requestMapFrontier()
-            local visible=work.await(key,function()return work.mapCellVisible(target.probe)end,1.5)
-            if visible then
-                work.mapVerifiedVisits=(work.mapVerifiedVisits or 0)+1
-                note(key,"CHUNK ARRIVAL • SERVER MAP VISIBILITY CONFIRMED")
-            else
-                target.row.visited[target.index]=nil;target.row.blocked[target.index]=os.clock()+10
-                note(key,"CHUNK ARRIVAL • SHARED MAP REVEAL UNCONFIRMED; RETRY LATER")
-            end
+            work.mapArrivals=work.mapArrivals or{}
+            if #work.mapArrivals==0 then work.mapRequestAt=math.min(work.mapRequestAt or 0,os.clock()+2)end
+            work.mapArrivals[#work.mapArrivals+1]={scene=world(),probe=target.probe,row=target.row,index=target.index,at=os.clock(),key=key}
+            note(key,"CHUNK ARRIVAL • MAP RECEIPT PENDING; CONTINUING TELEPORT SWEEP")
+            work.requestMapFrontier();work.confirmMapArrivals()
         else note(key,"CHUNK ARRIVAL • NATIVE MAP SNAPSHOT UNAVAILABLE; REVEAL UNCONFIRMED")end
         work.refreshAt=0
         return true
+    end
+    function work.exploreMapBurst(key)
+        key=key or "exploreMap"
+        local moved=false
+        work.exploreLegUntil=os.clock()+4
+        -- A bounded burst preserves urgent survival handoffs and the other roles.
+        for i=1,12 do
+            if not flags[key]or not work.checkpoint(key)then break end
+            local wait=math.max(0,(work.nextChunkAt or 0)-os.clock())
+            if wait>0 and not work.pause(key,wait)then break end
+            if not work.exploreMapTick(key)then break end
+            moved=true;work.nextChunkAt=os.clock()+.3
+        end
+        return moved
     end
     function work.campPatrol(key)
         local camp=work.campDropAnchor();local center=camp and pos(camp)
@@ -9710,6 +9815,10 @@ local function runIslandEscape()
         return result
     end
     local jobsList = {
+        {key="autoRevive",enabled=function()return flags.autoRevive end,
+            ready=function()return work.reviveCandidate()~=nil end,run=work.autoReviveTick},
+        {key="revealMap",enabled=function()return flags.revealMap end,
+            ready=function()return work.explorationReady()end,run=function()return work.exploreMapBurst("revealMap")end},
         {key="campInfrastructure",enabled=function()return flags.buildCamp or flags.buildCurrent or flags.build end,
             ready=function()return work.campInfrastructureReady and work.campInfrastructureReady()or false end,run=work.campInfrastructureTick},
         {key="campUpgrade",enabled=function()return flags.fuel or flags.buildCamp end,
@@ -9723,7 +9832,7 @@ local function runIslandEscape()
         {key="shareGuns",enabled=function()return flags.shareGuns end,ready=function()return work.gunHandoff~=nil or work.carriedGun()~=nil and work.campDropAnchor()~=nil end,run=work.shareGunsTick},
         {key="takeTeamGuns",enabled=function()return flags.takeTeamGuns end,ready=function()return work.teamGunCandidate()~=nil end,run=work.takeTeamGunTick},
         {key="exploreMap",enabled=function()return flags.exploreMap end,ready=function()return work.explorationReady and work.explorationReady()or false end,
-            run=function()work.nextChunkAt=os.clock()+.5;return work.exploreMapTick("exploreMap")end},
+            run=function()return work.exploreMapBurst()end},
         {key="roleFallback",enabled=function()return flags.roleFallback end,ready=function()return os.clock()>=(work.nextRoleAt or 0)end,run=work.roleFallbackTick},
         {key="questAcquire",enabled=function()return flags.quest end,ready=work.questAcquireReady,run=work.questAcquireTick},
         {key="equipArmour",enabled=function()return flags.progression end,ready=function()return work.armourCandidate()~=nil end,run=work.equipArmour},
@@ -10141,13 +10250,13 @@ local function runIslandEscape()
                 local mode = serverMode()
                 work.bindSuite()
                 work.sessionTick(mode)
-                work.redeemTick()
+                if not flags.revealMap then work.redeemTick()end
                 if mode ~= "match" or flags.autoFarm == false or work.finished or work.roundLost()
-                    or not root()
+                    or not root() or flags.revealMap
                     or (work.hover and work.hover.character ~= player.Character) then work.releaseHover(true)
                 elseif work.hover and not work.shelterNeeded() then work.releaseHover() end
                 modeLabel.Text = mode == "match" and "SERVER: MATCH" or (mode == "lobby" and "SERVER: LOBBY - ENTER A MATCH" or "SERVER: LOADING")
-                claimRewards()
+                if not flags.revealMap then claimRewards()end
                 if mode ~= "match" then
                     for _, job in ipairs(jobsList) do
                         if flags[job.key] then
@@ -10160,7 +10269,7 @@ local function runIslandEscape()
                     return
                 end
                 work.bindFastServices()
-                if flags.autoFarm==false then
+                if flags.autoFarm==false and not flags.revealMap then
                     queueLabel.Text="JOB: MASTER PAUSED"
                     return
                 end
@@ -10169,15 +10278,18 @@ local function runIslandEscape()
                     note("queue","CHARACTER DOWN • ROLE RETAINED; WILL RESUME AFTER REVIVE")
                     return
                 end
-                safely("survival sync", work.survivalSync)
-                safely("material planning", work.refreshNeeds)
-                work.settleCuts()
+                if not flags.revealMap then
+                    safely("survival sync", work.survivalSync)
+                    safely("material planning", work.refreshNeeds)
+                    work.settleCuts()
+                end
                 work.preempted = nil
                 work.nextPriorityCheck = 0
                 local now = os.clock()
                 local job = safely("queue readiness", function()
                     return work.nextQueuedJob(jobsList, now)
                 end)
+                if flags.revealMap and fish.state~="idle"then cancelFishing()end
                 if fish.state ~= "idle" and flags.fish and job and work.rank(job) < work.rank(work.jobsByKey.fish) then
                     cancelFishing()
                     due.fish = os.clock()
@@ -10198,7 +10310,9 @@ local function runIslandEscape()
                 end
                 if not job then
                     queueLabel.Text = "JOB: WAITING"
-                    if flags.roleFallback then
+                    if flags.revealMap then
+                        note("revealMap","NO SAFE UNREVEALED CHUNK IN CURRENT BORDER • WAITING FOR MAP / STREAMING")
+                    elseif flags.roleFallback then
                         note("queue","ROLE "..tostring(opts.teamRole or "Custom"):upper().." RETRYING BLOCKED WORK • SAFE ROUTE / SUPPLIES / RESPAWN NEEDED")
                     else note("queue", "NO SAFE READY JOB; CHECK RESOURCE / UPGRADE STATUS")end
                     return
@@ -10261,7 +10375,7 @@ local function runIslandEscape()
                 safely("diagnostic view", refreshDiagnostics)
                 work.nextDiagnosticAt = os.clock() + 0.5
             end
-            local delay=flags.autoFarm==false and .15 or math.max(0,opts.interval)
+            local delay=flags.revealMap and 0 or flags.autoFarm==false and .15 or math.max(0,opts.interval)
             local wakeAt = os.clock() + delay
             repeat
                 task.wait()
